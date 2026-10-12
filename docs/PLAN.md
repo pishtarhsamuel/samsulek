@@ -180,6 +180,11 @@ Each one ends with a short summary, how to run it, and a stop for your OK.
   `tzdata` (Windows has no built-in timezone database); dev-only `pytest`,
   `hypothesis`, `ruff`, `mypy`, `types-PyYAML`. Managed with `uv`, locked with
   hashes, and never newer than a 14-day supply-chain cooldown.
+- One run at a time (an operating-system lock the OS releases if a run dies);
+  orders last one run, except the kill switch's exits, which no run cancels.
+- Reviewed by two independent adversarial review passes: 41 and then 32
+  confirmed findings, all fixed, with regression tests. The second round's
+  key tests were checked to fail when the bug is put back.
 - **Status: built.** README.md has the Windows steps to run it.
 
 **M2: data pipeline**

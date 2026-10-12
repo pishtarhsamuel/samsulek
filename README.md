@@ -99,9 +99,19 @@ exercise the machinery. **It is not a strategy and has no edge.**
 
 Orders only live for one run. Anything still unfilled at the end of a run is
 cancelled, and any leftover order is cancelled at the start of the next run,
-so orders can never pile up between your twice-a-day checks. While a run is
+so orders can never pile up between your twice-a-day checks. The one exception
+is the kill switch's closing orders: no run ever cancels those. While a run is
 going, orders waiting at the broker count against your cash and position
 limits.
+
+Only one run can trade at a time. A run holds an operating-system lock on
+`state\run.lock`; a second run started meanwhile is skipped with a warning.
+If a run crashes or the computer turns off, Windows releases the lock by
+itself, and the next run warns you that the previous one didn't finish.
+
+You can run every command from the `samsulek` folder or any folder inside it:
+the bot finds its project folder by itself, and its `state` folder is always
+`samsulek\state` (no setting can move it).
 
 ```powershell
 uv run samsulek status
@@ -118,10 +128,19 @@ uv run samsulek kill --flatten
 
 This sets the kill flag **first** (even if other files are damaged), cancels
 every open order, and sells every position. Without `--flatten` it only
-cancels orders and stops trading. A position only counts as closed once the
-broker shows it's gone. Anything still held, including exit orders still
-waiting to fill, is listed so you can close it by hand in the broker app.
-The command ends with exit code 1 when anything is left.
+cancels orders and stops trading. In more detail:
+
+- If a run is in progress, the kill waits up to 20 seconds for it to stop at
+  its next check (the flag is already on, so it sends nothing more). If the run
+  doesn't stop in time, the kill carries on anyway.
+- It still cancels and sells if the bot's own records (`state\ledger.json`)
+  are damaged. It then reports an error, because the records need a look.
+- A position only counts as closed once the broker shows it's gone. Anything
+  still held, including exit orders still waiting to fill, is listed so you
+  can close it by hand in the broker app.
+- It ends with exit code 1 when anything is left or anything failed.
+- Run it from inside the `samsulek` folder. Anywhere else it refuses and
+  changes nothing, so a flag can't land in the wrong folder.
 
 ### Resuming after a halt or kill (only you, at the keyboard)
 
@@ -166,10 +185,13 @@ Remove-Item -Recurse -Force state
 | Hard risk limits | `config\risk.yaml` |
 | Go-live checklist (live mode refuses to start until it's complete) | `ops\go_live_checklist.md` |
 
-Those last two files are always read from exactly these locations: no setting
-can point the bot somewhere else. The checklist's items are fingerprinted, so
-deleting or rewording an item also blocks live mode until the change has been
-reviewed.
+Those last two files, and the `state` folder, are always at exactly these
+locations: no setting can point the bot somewhere else. The checklist's items
+are fingerprinted, so deleting or rewording an item also blocks live mode
+until the change has been reviewed. Paper and live mode only run from the
+folder the project was installed from (with `uv sync --locked`), using that
+folder's own config, so a copy of the project elsewhere with looser limits
+can't trade a real account.
 
 Command results (exit codes): `0` OK, `1` error, `2` halted or blocked, `3`
 refused (e.g. paper/live not available yet).
@@ -189,8 +211,14 @@ refused (e.g. paper/live not available yet).
 
 - `HALT: ON` in `status`: something hit a limit or failed a safety check. The
   reason is shown. Understand it before running `reset-halt`.
-- `STATE UNREADABLE`: a state file is damaged. Trading stays blocked (fail
-  closed). Don't delete files blindly; ask first.
+- `STATE UNREADABLE`, or `HALTED: cannot start`: a state file is damaged.
+  Trading stays blocked (fail closed). The kill switch still works. Don't
+  delete files blindly; ask first.
+- `Run skipped: another run is in progress`: an earlier run is still going
+  (or stuck). Wait a minute and check `status`. If it keeps happening, close
+  the other window or scheduled task.
+- `Refused: paper mode only runs from the project folder`: run the command
+  inside the `samsulek` folder you cloned and installed with `uv sync --locked`.
 - If you use Claude Code on this Windows machine and every command gets
   blocked, the safety hook can't start: make sure Git for Windows is installed
   (it provides `bash`) and that `py -3.12 --version` works, then run `/hooks`

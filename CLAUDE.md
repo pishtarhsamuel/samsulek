@@ -75,10 +75,14 @@ Owner context (drives every design decision):
 - The hook scans whole Bash commands, including heredocs and commit messages:
   use the Edit/Write tools for file content that mentions blocked words, and
   `git commit -F <file>` for commit messages.
-- `config/risk.yaml` and `ops/go_live_checklist.md` are read from fixed paths
-  (not configurable). The checklist items are fingerprinted in
-  `src/samsulek/live_gate.py` (`EXPECTED_CHECKLIST_SHA256`). A reviewed
-  checklist change must update that constant in the same change.
+- `config/risk.yaml`, `ops/go_live_checklist.md` and the `state/` folder are at
+  fixed paths under the project root (not configurable). The checklist items
+  are fingerprinted in `src/samsulek/live_gate.py` (`EXPECTED_CHECKLIST_SHA256`).
+  A reviewed checklist change must update that constant in the same change.
+- Paper and live mode refuse to run unless the project root is the folder the
+  package was installed from (`PACKAGE_PROJECT_ROOT`) and the config is inside
+  it. Tests that exercise those modes must not load that folder's secrets file
+  or build the bot (see the `no_side_effects` fixture).
 - Do not try to work around a block (no path tricks, encodings, or indirection).
   If a block looks wrong, stop and ask the owner.
 - Changes to `.claude/`, limits in `config/risk.yaml`, or
@@ -162,7 +166,9 @@ Development (from the repo root):
 - Strict type check: `uv run mypy`
 - Guardrail hook tests without any dependencies: `python3 -m unittest tests.test_guard_hook`
 
-The bot (sim mode by default; paper arrives in M5, live in M6):
+The bot (sim mode by default; paper arrives in M5, live in M6). Commands find the
+project root from any subfolder; `kill` refuses outside a project folder. One run
+at a time (OS lock on `state/run.lock`, released by the OS if a run dies):
 - `uv run samsulek check-config`: validate config, print the limits in euros
 - `uv run samsulek run`: one trading cycle
 - `uv run samsulek status`: halt / kill switch / daily counters
