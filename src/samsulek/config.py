@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -27,22 +28,35 @@ CHECKLIST_FILE = Path("ops/go_live_checklist.md")
 # The state folder holds the KILL and HALT flags: pointing the bot at another folder
 # would silently drop them, so it is fixed too.
 STATE_DIR = Path("state")
+PROJECT_NAME = "samsulek"
 PROJECT_MARKERS = (Path("pyproject.toml"), Path("config/default.yaml"))
 # The project this code was installed from (uv installs it in editable mode).
 PACKAGE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def is_project_root(path: Path) -> bool:
-    return all((path / m).is_file() for m in PROJECT_MARKERS)
+    """A samsulek project folder: both marker files, and pyproject.toml names this project."""
+    if not all((path / m).is_file() for m in PROJECT_MARKERS):
+        return False
+    try:
+        data = tomllib.loads((path / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    project = data.get("project")
+    return isinstance(project, dict) and project.get("name") == PROJECT_NAME
+
+
+def project_roots_above(start: Path) -> list[Path]:
+    """Every samsulek project folder at or above ``start``, nearest first. More than one
+    means a checkout inside another (e.g. a Claude Code worktree under .claude/worktrees)."""
+    start = start.resolve()
+    return [c for c in (start, *start.parents) if is_project_root(c)]
 
 
 def find_project_root(start: Path) -> Path | None:
-    """The nearest folder at or above ``start`` that looks like this project."""
-    start = start.resolve()
-    for candidate in (start, *start.parents):
-        if is_project_root(candidate):
-            return candidate
-    return None
+    """The nearest folder at or above ``start`` that is this project."""
+    roots = project_roots_above(start)
+    return roots[0] if roots else None
 
 
 class AccountLimits(BaseModel):

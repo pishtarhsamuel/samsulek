@@ -127,20 +127,28 @@ uv run samsulek kill --flatten
 ```
 
 This sets the kill flag **first** (even if other files are damaged), cancels
-every open order, and sells every position. Without `--flatten` it only
-cancels orders and stops trading. In more detail:
+every open order, and sells every position. Without `--flatten` it cancels the
+orders that add risk and stops trading, but keeps any closing (sell) orders
+from an earlier `--flatten` working, and lists them. In more detail:
 
 - If a run is in progress, the kill waits up to 20 seconds for it to stop at
   its next check (the flag is already on, so it sends nothing more). If the run
   doesn't stop in time, the kill carries on anyway.
-- It still cancels and sells if the bot's own records (`state\ledger.json`)
-  are damaged. It then reports an error, because the records need a look.
-- A position only counts as closed once the broker shows it's gone. Anything
-  still held, including exit orders still waiting to fill, is listed so you
-  can close it by hand in the broker app.
+- It still cancels and sells if any of the bot's own files in `state\` are
+  damaged (for example after being opened and saved in Notepad). If the
+  damaged file is `ledger.json` it then reports an error, because the records
+  need a look.
+- A position only counts as closed once the broker shows it's gone. For every
+  position still held, it says whether a sell order is really still working
+  for it, or that **no** sell order is working and you must close it by hand
+  in the broker app.
 - It ends with exit code 1 when anything is left or anything failed.
-- Run it from inside the `samsulek` folder. Anywhere else it refuses and
-  changes nothing, so a flag can't land in the wrong folder.
+- Run it from inside the `samsulek` folder. Outside any samsulek folder it
+  refuses and changes nothing. It prints the exact folder where it set the
+  flag. If the folder is a copy inside another samsulek folder (for example
+  a Claude Code worktree), it sets the flag in both, warns you, and ends with
+  exit code 1: run it again from the folder your bot really runs from, so
+  that bot's orders are cancelled too.
 
 ### Resuming after a halt or kill (only you, at the keyboard)
 
@@ -188,10 +196,13 @@ Remove-Item -Recurse -Force state
 Those last two files, and the `state` folder, are always at exactly these
 locations: no setting can point the bot somewhere else. The checklist's items
 are fingerprinted, so deleting or rewording an item also blocks live mode
-until the change has been reviewed. Paper and live mode only run from the
-folder the project was installed from (with `uv sync --locked`), using that
-folder's own config, so a copy of the project elsewhere with looser limits
-can't trade a real account.
+until the change has been reviewed. Paper and live mode only run when the
+code, the config and the checklist all come from one and the same folder (the
+one installed with `uv sync --locked`). That stops a stray config or checklist
+from somewhere else, but it can't stop a **second full installation** of the
+bot elsewhere with its own looser settings. So keep exactly one copy of the
+bot on your computer. A stronger check, anchored outside the project folder,
+is planned before live trading (M6).
 
 Command results (exit codes): `0` OK, `1` error, `2` halted or blocked, `3`
 refused (e.g. paper/live not available yet).
@@ -211,9 +222,11 @@ refused (e.g. paper/live not available yet).
 
 - `HALT: ON` in `status`: something hit a limit or failed a safety check. The
   reason is shown. Understand it before running `reset-halt`.
-- `STATE UNREADABLE`, or `HALTED: cannot start`: a state file is damaged.
-  Trading stays blocked (fail closed). The kill switch still works. Don't
-  delete files blindly; ask first.
+- `STATE UNREADABLE`, or `HALTED: cannot start`: a state file is damaged, or
+  the `logs` folder can't be written. Trading stays blocked (fail closed). The
+  kill switch still works. Don't delete files blindly; ask first.
+- `A trading run is in progress` from `reconcile`: it waited 20 seconds for the
+  run to finish and then gave up without changing anything. Try again later.
 - `Run skipped: another run is in progress`: an earlier run is still going
   (or stuck). Wait a minute and check `status`. If it keeps happening, close
   the other window or scheduled task.

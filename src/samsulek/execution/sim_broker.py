@@ -101,8 +101,10 @@ class SimBroker:
             }
             self._open = {oid: _OpenOrder(oid, _order_from_json(o)) for oid, o in data["open"].items()}
             self._fills = [_fill_from_json(f) for f in data["fills"]]
-        except (OSError, KeyError, TypeError, ValueError, ArithmeticError) as exc:
-            raise BrokerError(f"simulated broker state {self._path} is unreadable: {exc}") from exc
+        except Exception as exc:  # any damage: the simulated broker is unavailable (fail closed)
+            raise BrokerError(
+                f"simulated broker state {self._path} is unreadable: {type(exc).__name__}: {exc}"
+            ) from exc
 
     # --------------------------------------------------------------- queries
     def _maybe_fail(self) -> None:

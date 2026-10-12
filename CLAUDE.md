@@ -173,6 +173,8 @@ at a time (OS lock on `state/run.lock`, released by the OS if a run dies):
 - `uv run samsulek run`: one trading cycle
 - `uv run samsulek status`: halt / kill switch / daily counters
 - `uv run samsulek reconcile`: compare ledger with broker, halt on mismatch
-- `uv run samsulek kill [--flatten]`: emergency stop (Claude may run this one)
+- `uv run samsulek kill [--flatten]`: emergency stop (Claude may run this one). From a
+  checkout nested in another (e.g. a worktree) it also flags the enclosing project and
+  exits 1: tell the owner to run it in the folder the bot really runs from
 - Owner only, at a real terminal: the `reset-halt` command (flags `--clear-kill`,
   `--rebase-peak`), which asks for a typed code

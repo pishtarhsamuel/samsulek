@@ -67,6 +67,10 @@ def scenario(draw: st.DrawFn) -> tuple[PortfolioSnapshot, dict[str, Quote], dict
             )
         else:
             qty = draw(st.decimals(min_value=Decimal("0.000001"), max_value=Decimal("0.2"), places=6))
+            # Resting buys can sit far below the market (up to -50%): they must still count
+            # at the market price, not their limit, toward position and exposure caps.
+            wide = Decimal(draw(st.integers(min_value=-5000, max_value=100))) / BPS
+            limit = (quotes[sym].price * (1 + wide)).quantize(TICK)
             open_orders.append(
                 OrderRequest(f"open-{i}", Market.STOCKS, sym, Side.BUY, qty, OrderType.LIMIT, limit)
             )

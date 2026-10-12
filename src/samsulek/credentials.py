@@ -5,7 +5,7 @@ Rules enforced here:
   (values are registered for redaction the moment they are read).
 - ``LIVE`` is never taken from the env file: it must be set in the terminal for
   the session, so one factor of the live gate is never permanently "on".
-- Live-only credentials (``*_LIVE_*``) are not loaded unless explicitly allowed,
+- Live-only credentials (any name containing ``LIVE``) are not loaded unless explicitly allowed,
   so sim/paper processes never even hold live keys.
 """
 
@@ -23,9 +23,18 @@ _registered: set[str] = set()
 
 _SECRET_NAME = r"[A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE|MNEMONIC|SEED_PHRASE)[A-Z0-9_]*"  # noqa: S105
 _SECRET_NAME_RE = re.compile(rf"(?i)^{_SECRET_NAME}$")
-# Matches NAME=value / NAME: value where NAME looks secret-ish. The value stops at
-# separators so JSON or query strings around it are not swallowed.
-_KV_SECRET_RE = re.compile(rf"(?i)\b({_SECRET_NAME})(\s*[=:]\s*)(\"[^\"]*\"?|'[^']*'?|[^\s&]+)")
+# Matches NAME=value / NAME: value where NAME looks secret-ish. The value runs to the
+# next space or '&' (query strings), or to the closing quote; an unclosed quote stops
+# at the end of its line, so the rest of a multi-line alert is never swallowed.
+# Exception names (KeyError: ..., MissingSecretError: ...) are not secret names.
+_KV_SECRET_RE = re.compile(
+    rf"(?i)\b(?!\w*(?:Error|Exception)\b)({_SECRET_NAME})(\s*[=:]\s*)(\"[^\"\n]*\"?|'[^'\n]*'?|[^\s&]+)"
+)
+# Obvious placeholder values are not secrets; redacting them would garble ordinary
+# output (e.g. a TELEGRAM_BOT_TOKEN=none would turn "Closed positions: none" into ****).
+_PLACEHOLDERS = frozenset(
+    {"none", "null", "true", "false", "changeme", "change_me", "change-me", "todo", "demo", "test"}
+)
 # Values of non-secret-looking variables are only redacted when long enough to be
 # unambiguous; short ones ("true", "1234") would corrupt unrelated log text.
 _MIN_PLAIN_VALUE_LEN = 12
@@ -39,7 +48,7 @@ class MissingSecretError(KeyError):
 
 
 def register_for_redaction(value: str) -> None:
-    if len(value) >= _MIN_REDACT_LEN:
+    if len(value) >= _MIN_REDACT_LEN and value.strip().lower() not in _PLACEHOLDERS:
         _registered.add(value)
 
 
@@ -109,8 +118,8 @@ def load_env_file(
     """Load NAME=value lines into ``environ`` without overriding existing variables.
 
     Returns the names loaded (never values). Missing file is fine (returns []).
-    ``LIVE`` is always ignored. Names containing a ``LIVE`` word (``T212_LIVE_KEY``,
-    ``KEY_LIVE``) are ignored unless allowed.
+    ``LIVE`` is always ignored. Names containing ``LIVE`` anywhere (``T212_LIVE_KEY``,
+    ``T212LIVE_KEY``) are ignored unless allowed, but their values are still redacted.
     """
     env = os.environ if environ is None else environ
     try:

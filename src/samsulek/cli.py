@@ -24,6 +24,7 @@ from samsulek.config import (
     RiskConfig,
     find_project_root,
     is_project_root,
+    project_roots_above,
 )
 from samsulek.credentials import load_env_file, redact
 from samsulek.cycle import SYNC_ERRORS, halt_and_alert, reconcile_or_halt, run_cycle, sync_ledger
@@ -31,11 +32,13 @@ from samsulek.kill import execute_kill
 from samsulek.live_gate import LiveGateError, authorize_live
 from samsulek.logging_setup import RedactingFilter, setup_logging
 from samsulek.risk.state import RiskStateStore, StateCorruptError
-from samsulek.runlock import RunLock
+from samsulek.runlock import AlreadyRunningError, RunLock
 from samsulek.terminal import TerminalUnavailableError, confirm_phrase, new_code, require_interactive
 from samsulek.types import Mode
 
 EXIT_OK, EXIT_ERROR, EXIT_HALTED, EXIT_REFUSED = 0, 1, 2, 3
+# How long kill and reconcile wait for a running cycle to finish before going ahead / giving up.
+LOCK_WAIT_SECONDS = 20.0
 
 
 def _out(text: str = "") -> None:
@@ -149,14 +152,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     load_env_file(config.env_file, allow_live_secrets=mode is Mode.LIVE)
     try:
         app = build_app(args.root, args.config, mode)
+        setup_logging(app.config.log_dir)
     except NotAvailableError as exc:
         _out(f"Refused: {exc}")
         return EXIT_REFUSED
     except ConfigError:
         raise
-    except Exception as exc:  # incl. a damaged ledger/state file: halt and alert
+    except Exception as exc:  # incl. a damaged ledger/state file or log folder: halt and alert
         return _halt_on_startup_failure(config.state_dir, exc)
-    setup_logging(app.config.log_dir)
     report = run_cycle(app)
     _out(f"Cycle {report.status}: {report.orders_sent} orders sent, {report.orders_rejected} rejected")
     for m in report.messages:
@@ -179,15 +182,29 @@ def cmd_kill(args: argparse.Namespace) -> int:
         return EXIT_ERROR
     try:
         RiskStateStore(state_dir).set_kill(args.reason, SystemClock().now())
-        _out("KILL flag is ON: no new orders will be sent by any run.")
+        _out(f"KILL flag is ON in {state_dir}: no new orders will be sent by runs from {args.root}.")
     except Exception as exc:
         _out(f"COULD NOT SET THE KILL FLAG ({type(exc).__name__}: {exc}).")
         _out("Stop the bot by hand (close its window / scheduled task) and check the broker app.")
+    # A checkout inside another one (e.g. a Claude Code worktree): the real bot may be the
+    # outer one. A kill flag is always safe to set, so set it there too, and say so loudly.
+    outer_roots = [r for r in project_roots_above(args.root) if r != args.root]
+    for outer in outer_roots:
+        try:
+            RiskStateStore(outer / STATE_DIR).set_kill(args.reason, SystemClock().now())
+            _out(f"KILL flag is ALSO ON in {outer / STATE_DIR} (an enclosing samsulek folder).")
+        except Exception as exc:
+            _out(f"COULD NOT SET THE KILL FLAG in {outer / STATE_DIR} ({type(exc).__name__}: {exc}).")
+    if outer_roots:
+        _out(f"WARNING: {args.root} is inside another samsulek folder. If the bot runs from there,")
+        _out("run `samsulek kill` from that folder too, so ITS open orders are cancelled.")
     # 2. Wait briefly for a running cycle BEFORE loading broker/ledger files, so we don't
     #    act on (and later write back) a stale copy of them.
     lock: RunLock | None = None
     try:
-        lock = RunLock(state_dir, SystemClock(), wait_seconds=20).__enter__()
+        lock = RunLock(state_dir, SystemClock(), wait_seconds=LOCK_WAIT_SECONDS).__enter__()
+        if lock.took_over_stale:
+            _out("NOTE: the previous trading run did not finish cleanly (crash or power cut).")
     except Exception as exc:
         _out(f"NOTE: a trading run may still be active ({type(exc).__name__}: {exc}); proceeding anyway.")
     # 3. Cancel orders / close positions. If the app can't even be built, say what to do by hand.
@@ -215,6 +232,8 @@ def cmd_kill(args: argparse.Namespace) -> int:
         _out(f"ERROR: {err}")
     for note in report.notes:
         _out(f"NOTE: {note}")
+    if outer_roots:
+        return EXIT_ERROR  # the owner must check which folder the bot really runs from
     return EXIT_OK if report.complete else EXIT_ERROR
 
 
@@ -252,12 +271,25 @@ def cmd_reset_halt(args: argparse.Namespace) -> int:
 def cmd_reconcile(args: argparse.Namespace) -> int:
     config, _ = load_configs(args.root, args.config)
     try:
+        with RunLock(config.state_dir, SystemClock(), wait_seconds=LOCK_WAIT_SECONDS) as lock:
+            if lock.took_over_stale:
+                ConsoleAlerter().alert(
+                    "warning", "Previous trading run did not finish cleanly", "found by reconcile"
+                )
+            return _reconcile_locked(args, config.state_dir)
+    except AlreadyRunningError:
+        _out("A trading run is in progress: try `samsulek reconcile` again in a minute. Nothing changed.")
+        return EXIT_HALTED
+
+
+def _reconcile_locked(args: argparse.Namespace, state_dir: Path) -> int:
+    try:
         app = build_app(args.root, args.config, Mode.SIM)
+        setup_logging(app.config.log_dir)
     except ConfigError:
         raise
-    except Exception as exc:  # incl. a damaged ledger/state file: halt and alert
-        return _halt_on_startup_failure(config.state_dir, exc)
-    setup_logging(app.config.log_dir)
+    except Exception as exc:  # incl. a damaged ledger/state file or log folder: halt and alert
+        return _halt_on_startup_failure(state_dir, exc)
     try:
         account = sync_ledger(app)
     except SYNC_ERRORS as exc:

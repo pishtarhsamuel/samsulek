@@ -14,7 +14,7 @@ from samsulek.execution.sim_broker import SimBroker
 from samsulek.logging_setup import DecisionLog
 from samsulek.portfolio.ledger import Ledger
 from samsulek.risk.engine import RiskEngine
-from samsulek.risk.state import RiskStateStore, StateCorruptError
+from samsulek.risk.state import RiskStateStore
 from samsulek.strategies.demo import EqualWeightAboveAverageDemo
 from samsulek.types import Market, Mode, Quote
 
@@ -89,10 +89,10 @@ def build_app(
     )
     try:
         ledger = Ledger(config.state_dir)
-    except StateCorruptError as exc:
+    except Exception as exc:
         if not allow_unreadable_ledger:
             raise
-        ledger = Ledger.unreadable(config.state_dir, str(exc))
+        ledger = Ledger.unreadable(config.state_dir, f"{type(exc).__name__}: {exc}")
     engine = RiskEngine(risk_config, store, clock, config.universe, log)
     router = OrderRouter(broker, engine, log, alerter, register_order=ledger.remember_order)
     return App(

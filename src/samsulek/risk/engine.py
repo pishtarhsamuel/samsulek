@@ -66,8 +66,8 @@ class RiskEngine:
         try:
             kill = self._store.read_kill()
             halt = self._store.read_halt()
-        except StateCorruptError as exc:
-            return f"risk state unreadable ({exc}); failing closed"
+        except Exception as exc:  # any read problem blocks new risk; exits stay allowed
+            return f"risk state unreadable ({type(exc).__name__}: {exc}); failing closed"
         if kill.active:
             return "KILL switch is active: " + "; ".join(kill.reasons)
         if halt.active:
@@ -161,9 +161,13 @@ class RiskEngine:
         day = self._store.read_day()
         if day is None:
             day = DayState(day=today, day_start_equity=Decimal(0), last_equity=Decimal(0), trades={})
-        elif day.day != today:
+        elif day.day < today:
             # New day, baseline not observed yet: observe_equity sets it to max(last, first).
             day = DayState(day=today, day_start_equity=Decimal(0), last_equity=day.last_equity, trades={})
+        elif day.day > today:
+            # Clock moved backwards: keep the real day's counts and baseline, and halt
+            # (exits stay allowed). Rolling back would wipe the day's trade count.
+            self.halt(f"clock moved backwards (state day {day.day}, now {today})")
         trades = dict(day.trades)
         trades[TOTAL] = trades.get(TOTAL, 0) + 1
         trades[order.market.value] = trades.get(order.market.value, 0) + 1

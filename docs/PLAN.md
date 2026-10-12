@@ -182,9 +182,9 @@ Each one ends with a short summary, how to run it, and a stop for your OK.
   hashes, and never newer than a 14-day supply-chain cooldown.
 - One run at a time (an operating-system lock the OS releases if a run dies);
   orders last one run, except the kill switch's exits, which no run cancels.
-- Reviewed by two independent adversarial review passes: 41 and then 32
-  confirmed findings, all fixed, with regression tests. The second round's
-  key tests were checked to fail when the bug is put back.
+- Reviewed by three independent adversarial review passes: 41, then 32, then
+  12 confirmed findings, all fixed, with regression tests. The later rounds'
+  tests were checked to fail when the bug is put back.
 - **Status: built.** README.md has the Windows steps to run it.
 
 **M2: data pipeline**
@@ -219,8 +219,16 @@ Each one ends with a short summary, how to run it, and a stop for your OK.
   Telegram alerts with `/kill`, daily summary, dashboard.
 - Compare paper vs backtest on the same days: fills, slippage, trade count,
   PnL.
+- Before the Trading 212 client logs anything: harden redaction for quoted
+  names (`"api_key": "..."`), `Authorization: Bearer/Basic` headers, and encoded
+  forms of each secret (base64 of `key:secret`, URL-encoded). Found in review
+  of M1; nothing in M1 sends a secret anywhere yet.
 
 **M6: go-live checklist**
+- Before live: anchor the one allowed project folder outside the repository
+  (an owner-written setting), so a second installed copy of the bot with looser
+  limits can't trade the real account. M1 only checks that code, config and
+  checklist come from the same folder.
 - You sign off on every item: paper roughly matches the backtest, the kill
   switch was tested for real, halts were tested, reconciliation mismatch was
   tested, and alerts arrive.

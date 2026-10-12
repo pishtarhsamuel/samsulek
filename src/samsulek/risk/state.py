@@ -3,7 +3,8 @@
 Fail-closed rules:
 - Writes are atomic (temp file + fsync + os.replace), so a crash never leaves a
   half-written file.
-- A state file that exists but can't be parsed raises ``StateCorruptError``;
+- A state file that exists but can't be read, decoded or parsed (wrong
+  encoding, flipped bytes, wrong field types) raises ``StateCorruptError``;
   the risk engine treats that as HALTED.
 - Clearing a halt or the kill flag is recorded in ``state_history.jsonl``.
 """
@@ -15,7 +16,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -82,11 +83,11 @@ class RiskStateStore:
             text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        except OSError as exc:
-            raise StateCorruptError(f"cannot read {path}: {exc}") from exc
+        except (OSError, ValueError) as exc:  # ValueError: not UTF-8 (e.g. saved as UTF-16)
+            raise StateCorruptError(f"cannot read {path}: {type(exc).__name__}") from exc
         try:
             data = json.loads(text)
-        except json.JSONDecodeError as exc:
+        except ValueError as exc:
             raise StateCorruptError(f"{path} is not valid JSON") from exc
         if not isinstance(data, dict):
             raise StateCorruptError(f"{path} must contain a JSON object")
@@ -118,7 +119,7 @@ class RiskStateStore:
             if not isinstance(active, bool) or not isinstance(reasons, list):
                 raise TypeError("bad field types")
             since = datetime.fromisoformat(since_raw) if since_raw else None
-        except (KeyError, TypeError, ValueError) as exc:
+        except Exception as exc:  # any damage: corrupt (fail closed), never a crash
             raise StateCorruptError(f"{name} has an invalid structure") from exc
         return FlagState(active=active, reasons=tuple(str(r) for r in reasons), since=since)
 
@@ -127,8 +128,8 @@ class RiskStateStore:
         reason = redact(reason)
         try:
             current = self._read_flag(name)
-        except StateCorruptError:
-            current = FlagState(active=False)  # overwrite corrupt file with a valid ACTIVE flag
+        except Exception:  # any damage: overwrite it with a valid ACTIVE flag
+            current = FlagState(active=False)
         if current.active and reason in current.reasons:
             reasons = current.reasons
         else:
@@ -182,7 +183,7 @@ class RiskStateStore:
                 last_equity=last,
                 trades=dict(trades),
             )
-        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+        except Exception as exc:  # any damage: corrupt (fail closed), never a crash
             raise StateCorruptError(f"{DAY_FILE} has an invalid structure") from exc
 
     def write_day(self, state: DayState) -> None:
@@ -202,7 +203,7 @@ class RiskStateStore:
             return None
         try:
             peak = Decimal(data["peak_equity"])
-        except (KeyError, TypeError, InvalidOperation) as exc:
+        except Exception as exc:  # e.g. Decimal([]) raises ValueError: corrupt, never a crash
             raise StateCorruptError(f"{PEAK_FILE} has an invalid structure") from exc
         if not peak.is_finite() or peak <= 0:
             raise StateCorruptError(f"{PEAK_FILE} has a non-positive peak")

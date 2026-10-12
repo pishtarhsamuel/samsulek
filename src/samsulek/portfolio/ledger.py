@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 
 from samsulek.risk.state import StateCorruptError, atomic_write_text
@@ -65,6 +65,8 @@ class Ledger:
             text = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return
+        except (OSError, ValueError) as exc:  # locked, a folder, not UTF-8 (e.g. saved as UTF-16)
+            raise StateCorruptError(f"{self._path} is unreadable ({type(exc).__name__})") from exc
         try:
             data = json.loads(text)
             self.cash = Decimal(data["cash"])
@@ -83,8 +85,8 @@ class Ledger:
                 not p.quantity.is_finite() or not p.avg_price.is_finite() for p in self.positions.values()
             ):
                 raise ValueError("non-finite number in ledger")
-        except (KeyError, TypeError, ValueError, InvalidOperation, json.JSONDecodeError) as exc:
-            raise StateCorruptError(f"{self._path} is unreadable") from exc
+        except Exception as exc:  # any damage (wrong types, bad numbers): corrupt, never a crash
+            raise StateCorruptError(f"{self._path} is unreadable ({type(exc).__name__})") from exc
 
     def save(self) -> None:
         self._check_usable()
