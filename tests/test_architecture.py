@@ -26,14 +26,57 @@ def modules() -> list[Path]:
     return sorted(SRC.rglob("*.py"))
 
 
-def imported_names(tree: ast.AST) -> set[str]:
+def module_name(path: Path) -> str:
+    rel = path.relative_to(SRC).with_suffix("")
+    parts = [p for p in rel.parts if p != "__init__"]
+    return ".".join(["samsulek", *parts])
+
+
+def imported_names(tree: ast.AST, path: Path) -> set[str]:
+    """Fully-qualified names a module imports, resolving relative imports and `from x import y`."""
+    package = module_name(path) if path.name == "__init__.py" else module_name(path).rsplit(".", 1)[0]
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(a.name for a in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names.add(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base_parts = package.split(".")
+                base_parts = base_parts[: len(base_parts) - (node.level - 1)]
+                base = ".".join(base_parts + ([node.module] if node.module else []))
+            else:
+                base = node.module or ""
+            names.add(base)
+            names.update(f"{base}.{a.name}" for a in node.names)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, (ast.Name, ast.Attribute))
+            and (
+                getattr(node.func, "id", None) == "__import__"
+                or getattr(node.func, "attr", None) == "import_module"
+            )
+        ):
+            names.add("<dynamic import>")
     return names
+
+
+def is_forbidden(name: str) -> bool:
+    return name == "<dynamic import>" or any(
+        name == f or name.startswith(f + ".") for f in FORBIDDEN_FOR_RESEARCH
+    )
+
+
+def test_import_resolver_catches_tricky_forms(tmp_path: Path) -> None:
+    fake = SRC / "strategies" / "x.py"
+    for src in [
+        "from ..execution import router",
+        "from .. import execution",
+        "from samsulek import execution",
+        "import samsulek.risk.engine",
+        "import importlib; importlib.import_module('samsulek.execution.router')",
+    ]:
+        names = imported_names(ast.parse(src), fake)
+        assert any(is_forbidden(n) for n in names), src
 
 
 def test_research_code_cannot_import_execution_machinery() -> None:
@@ -41,8 +84,8 @@ def test_research_code_cannot_import_execution_machinery() -> None:
         for path in (SRC / d).rglob("*.py") if (SRC / d).exists() else []:
             bad = {
                 n
-                for n in imported_names(ast.parse(path.read_text(encoding="utf-8")))
-                if n.startswith(FORBIDDEN_FOR_RESEARCH)
+                for n in imported_names(ast.parse(path.read_text(encoding="utf-8")), path)
+                if is_forbidden(n)
             }
             assert not bad, f"{path.relative_to(SRC)} imports {sorted(bad)}"
 

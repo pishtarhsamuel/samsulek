@@ -118,9 +118,16 @@ class Position:
 
 @dataclass(frozen=True, slots=True)
 class PortfolioSnapshot:
+    """Filled positions and cash, plus orders still OPEN at the broker.
+
+    Open orders matter for risk: a resting buy will consume cash and add exposure
+    the moment it fills, and a resting sell already claims part of a position.
+    """
+
     cash: Decimal
     positions: Mapping[str, Position]
     ts: datetime
+    open_orders: tuple[OrderRequest, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.cash, Decimal) or not self.cash.is_finite():
@@ -130,6 +137,15 @@ class PortfolioSnapshot:
     def quantity(self, symbol: str) -> Decimal:
         pos = self.positions.get(symbol)
         return pos.quantity if pos else Decimal(0)
+
+    def open_quantity(self, symbol: str, side: Side) -> Decimal:
+        return sum(
+            (o.quantity for o in self.open_orders if o.symbol == symbol and o.side is side), Decimal(0)
+        )
+
+    def sellable_quantity(self, symbol: str) -> Decimal:
+        """Held quantity not already claimed by an open sell order."""
+        return self.quantity(symbol) - self.open_quantity(symbol, Side.SELL)
 
     def position_value(self, symbol: str, quotes: Mapping[str, Quote]) -> Decimal:
         qty = self.quantity(symbol)
@@ -188,8 +204,18 @@ class AccountSnapshot:
     open_orders: tuple[BrokerOrder, ...]
     ts: datetime
 
+    def __post_init__(self) -> None:
+        # A cash account can't have negative or non-finite cash: if the broker says so, fail closed.
+        _require_non_negative(self.cash, "broker cash")
+        require_aware(self.ts, "account timestamp")
+
     def to_portfolio(self) -> PortfolioSnapshot:
-        return PortfolioSnapshot(cash=self.cash, positions=dict(self.positions), ts=self.ts)
+        return PortfolioSnapshot(
+            cash=self.cash,
+            positions=dict(self.positions),
+            ts=self.ts,
+            open_orders=tuple(o.request for o in self.open_orders),
+        )
 
 
 @dataclass(frozen=True, slots=True)

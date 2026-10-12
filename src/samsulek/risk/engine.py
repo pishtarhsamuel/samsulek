@@ -116,9 +116,10 @@ class RiskEngine:
         if day is None:
             day = DayState(day=today, day_start_equity=equity, last_equity=equity, trades={})
         elif day.day < today:
-            # New day: measure today's loss from the last equity we saw, so an
-            # overnight gap counts against today's limit.
-            start = day.last_equity if day.last_equity > 0 else equity
+            # New day. Baseline = the HIGHER of the last equity we saw and today's first
+            # observation: an overnight gap DOWN counts against today's limit, and an
+            # overnight gap UP is not credited as extra loss allowance.
+            start = max(day.last_equity, equity) if day.last_equity > 0 else equity
             day = DayState(day=today, day_start_equity=start, last_equity=equity, trades={})
         elif day.day > today:
             reason = f"clock moved backwards (state day {day.day}, now {today})"
@@ -193,6 +194,7 @@ class RiskEngine:
         checks.append("market configured")
 
         held_qty = portfolio.quantity(order.symbol)
+        sellable_qty = portfolio.sellable_quantity(order.symbol)  # minus open sell orders
 
         # 2. Instrument allow-list (exits of a held symbol are always allowed).
         allowed = self._universe.get(order.market, frozenset())
@@ -238,20 +240,25 @@ class RiskEngine:
         if order.reduce_only:
             if order.side is not Side.SELL:
                 reasons.append("reduce_only orders must be sells (long-only account)")
-            if order.quantity > held_qty:
-                reasons.append(f"reduce_only sell of {order.quantity} exceeds position {held_qty}")
+            if order.quantity > sellable_qty:
+                reasons.append(
+                    f"reduce_only sell of {order.quantity} exceeds the sellable position {sellable_qty} "
+                    f"(held {held_qty}, minus open sell orders)"
+                )
             checks.append("reduce-only exit")
             return decision()
 
-        # 7. Value the whole portfolio with fresh prices, then update loss/drawdown state.
-        for symbol, pos in portfolio.positions.items():
-            if pos.quantity == 0 or symbol == order.symbol:
+        # 7. Value the whole portfolio (and every open order) with fresh prices.
+        to_value = {s: p.market for s, p in portfolio.positions.items() if p.quantity != 0}
+        to_value.update({o.symbol: o.market for o in portfolio.open_orders})
+        for symbol, market in to_value.items():
+            if symbol == order.symbol:
                 continue
-            pos_limits = self._config.markets.get(pos.market)
-            if pos_limits is None:
-                reasons.append(f"held symbol {symbol} is in an unconfigured market")
+            sym_limits = self._config.markets.get(market)
+            if sym_limits is None:
+                reasons.append(f"{symbol} is in an unconfigured market")
                 continue
-            held_problem = self._quote_problem(symbol, pos.market, quotes.get(symbol), pos_limits)
+            held_problem = self._quote_problem(symbol, market, quotes.get(symbol), sym_limits)
             if held_problem:
                 reasons.append(f"cannot value portfolio: {held_problem}")
         if reasons:
@@ -309,8 +316,11 @@ class RiskEngine:
                 reasons=reasons,
                 checks=checks,
             )
-        elif order.quantity > held_qty:
-            reasons.append(f"sell of {order.quantity} exceeds position {held_qty} (no short selling)")
+        elif order.quantity > sellable_qty:
+            reasons.append(
+                f"sell of {order.quantity} exceeds the sellable position {sellable_qty} "
+                f"(held {held_qty}, minus open sell orders; no short selling)"
+            )
         return decision()
 
     # ---------------------------------------------------------------- helpers
@@ -331,6 +341,34 @@ class RiskEngine:
             )
         return None
 
+    def _open_buy_value(
+        self,
+        portfolio: PortfolioSnapshot,
+        quotes: Mapping[str, Quote],
+        *,
+        symbol: str | None = None,
+        market: Market | None = None,
+    ) -> tuple[Decimal, Decimal]:
+        """(cash reserved, exposure added) by OPEN buy orders, valued at their worst price.
+
+        Callers have already checked that every open order has a fresh quote.
+        """
+        reserved = Decimal(0)
+        exposure = Decimal(0)
+        for o in portfolio.open_orders:
+            if o.side is not Side.BUY:
+                continue
+            ref = quotes[o.symbol].price
+            if o.limit_price is not None:
+                price = o.limit_price
+            else:
+                o_limits = self._config.limits_for(o.market)
+                price = ref * (1 + o_limits.max_slippage_bps / BPS)
+            if (symbol is None or o.symbol == symbol) and (market is None or o.market is market):
+                reserved += o.quantity * price
+                exposure += o.quantity * max(price, ref)
+        return reserved, exposure
+
     def _check_buy(
         self,
         *,
@@ -345,13 +383,20 @@ class RiskEngine:
         reasons: list[str],
         checks: list[str],
     ) -> None:
-        if notional > portfolio.cash:
+        # Open buys already claim cash and will add exposure when they fill: count them.
+        reserved_all, pending_all = self._open_buy_value(portfolio, quotes)
+        _, pending_symbol = self._open_buy_value(portfolio, quotes, symbol=order.symbol)
+        _, pending_market = self._open_buy_value(portfolio, quotes, market=order.market)
+        available_cash = portfolio.cash - reserved_all
+        if notional > available_cash:
             reasons.append(
-                f"order value EUR {notional:.2f} exceeds cash EUR {portfolio.cash:.2f} (no leverage)"
+                f"order value EUR {notional:.2f} exceeds available cash EUR {available_cash:.2f} "
+                f"(cash EUR {portfolio.cash:.2f} minus EUR {reserved_all:.2f} reserved by open buys; "
+                "no leverage)"
             )
         # Value the added quantity at the worse of limit and reference price.
         added = order.quantity * max(exec_price, quote.price)
-        new_position = portfolio.position_value(order.symbol, quotes) + added
+        new_position = portfolio.position_value(order.symbol, quotes) + pending_symbol + added
         if new_position > limits.max_position_pct * equity:
             reasons.append(
                 f"position would be EUR {new_position:.2f} > {limits.max_position_pct:.0%} of equity "
@@ -359,7 +404,7 @@ class RiskEngine:
             )
         if new_position > limits.max_position_eur:
             reasons.append(f"position would be EUR {new_position:.2f} > cap EUR {limits.max_position_eur}")
-        new_gross_market = portfolio.gross_exposure(quotes, order.market) + added
+        new_gross_market = portfolio.gross_exposure(quotes, order.market) + pending_market + added
         if new_gross_market > limits.max_gross_exposure_pct * equity:
             reasons.append(
                 f"{order.market.value} exposure would be EUR {new_gross_market:.2f} > "
@@ -370,7 +415,7 @@ class RiskEngine:
                 f"{order.market.value} exposure would be EUR {new_gross_market:.2f} > "
                 f"cap EUR {limits.max_gross_exposure_eur}"
             )
-        if portfolio.gross_exposure(quotes) + added > equity:
+        if portfolio.gross_exposure(quotes) + pending_all + added > equity:
             reasons.append("total exposure would exceed equity (no leverage)")
         checks.append("position and exposure caps")
 

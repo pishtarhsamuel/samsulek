@@ -70,7 +70,7 @@ def plan_orders(
         return []
     collar = limits.max_slippage_bps / BPS
     held = {s for s, p in portfolio.positions.items() if p.market is market and p.quantity > 0}
-    symbols = sorted(set(weights) | held)
+    symbols = sorted(set(weights) | held | {o.symbol for o in portfolio.open_orders if o.market is market})
 
     def price(symbol: str) -> Decimal:
         q = quotes.get(symbol)
@@ -87,12 +87,28 @@ def plan_orders(
     def why(symbol: str) -> str:
         return f"rebalance toward {weights.get(symbol, Decimal(0)):.4f} of equity: {targets.reason}"
 
+    # Orders still open at the broker: their cash and exposure are already spoken for
+    # (valued exactly as the risk engine values them).
+    reserved_cash = Decimal(0)
+    pending_value: dict[str, Decimal] = {}
+    pending_market = Decimal(0)
+    for o in portfolio.open_orders:
+        if o.side is not Side.BUY:
+            continue
+        ref_o = price(o.symbol)
+        px = o.limit_price if o.limit_price is not None else ref_o * (1 + collar)
+        reserved_cash += o.quantity * px
+        value = o.quantity * max(px, ref_o)
+        pending_value[o.symbol] = pending_value.get(o.symbol, Decimal(0)) + value
+        if o.market is market:
+            pending_market += value
+
     sells: list[OrderRequest] = []
     buys: list[OrderRequest] = []
     n = 0
 
     for symbol in symbols:
-        qty_held = portfolio.quantity(symbol)
+        qty_held = portfolio.sellable_quantity(symbol)  # minus open sell orders
         if qty_held <= 0:
             continue
         ref = price(symbol)
@@ -131,13 +147,14 @@ def plan_orders(
             )
             remaining -= qty
 
-    cash = portfolio.cash
-    gross = portfolio.gross_exposure(quotes, market)
+    cash = portfolio.cash - reserved_cash
+    gross = portfolio.gross_exposure(quotes, market) + pending_market
     gross_cap = min(limits.max_gross_exposure_pct * equity, limits.max_gross_exposure_eur) * CAP_HEADROOM
     shortfalls = []
     for symbol in symbols:
         ref = price(symbol)
-        gap = target_value(symbol) - portfolio.quantity(symbol) * ref
+        current = portfolio.quantity(symbol) * ref + pending_value.get(symbol, Decimal(0))
+        gap = target_value(symbol) - current
         if gap >= limits.min_order_eur:
             shortfalls.append((gap, symbol, ref))
     for gap, symbol, ref in sorted(shortfalls, key=lambda t: (-t[0], t[1])):

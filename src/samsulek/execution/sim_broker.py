@@ -112,7 +112,9 @@ class SimBroker:
 
     def account(self) -> AccountSnapshot:
         self._maybe_fail()
-        self.match_open_orders()
+        dropped = self.match_open_orders()
+        if dropped:
+            raise BrokerError(f"broker rejected resting orders it could no longer fill: {', '.join(dropped)}")
         orders = tuple(
             BrokerOrder(o.broker_id, o.request, OrderStatus.OPEN, Decimal(0), self._clock.now())
             for o in self._open.values()
@@ -137,6 +139,7 @@ class SimBroker:
             f.client_id == order.client_id for f in self._fills
         ):
             raise BrokerRejected(f"duplicate client order id {order.client_id}")
+        self._check_available(order)
         self._seq += 1
         broker_id = f"SIM-{self._seq:06d}"
         filled = self._try_fill(broker_id, order)
@@ -161,18 +164,62 @@ class SimBroker:
         self._save()
         return ids
 
-    def match_open_orders(self) -> None:
+    def _reserved(self, exclude: str | None = None) -> tuple[Decimal, dict[str, Decimal]]:
+        """Cash reserved by open buys (at their limit, plus fees) and quantity claimed by open sells."""
+        cash = Decimal(0)
+        qty: dict[str, Decimal] = {}
+        for oid, o in self._open.items():
+            if oid == exclude:
+                continue
+            r = o.request
+            if r.side is Side.BUY:
+                px = r.limit_price if r.limit_price is not None else Decimal(0)
+                cash += r.quantity * px * (1 + self._fee_bps / BPS) + self._fee_eur
+            else:
+                qty[r.symbol] = qty.get(r.symbol, Decimal(0)) + r.quantity
+        return cash, qty
+
+    def _check_available(self, order: OrderRequest) -> None:
+        """Like a real broker: an order must be covered by cash/shares not already reserved."""
+        reserved_cash, reserved_qty = self._reserved()
+        if order.side is Side.BUY:
+            if order.limit_price is None:
+                quote = self._prices(order.symbol)
+                if quote is None:
+                    raise BrokerRejected(f"no price for {order.symbol}")
+                px = quote.price * (1 + self._slippage)
+            else:
+                px = order.limit_price
+            need = order.quantity * px * (1 + self._fee_bps / BPS) + self._fee_eur
+            if need > self._cash - reserved_cash:
+                raise BrokerRejected(
+                    f"insufficient cash for {order.client_id}: need {need:.4f}, "
+                    f"available {self._cash - reserved_cash:.4f}"
+                )
+        else:
+            pos = self._positions.get(order.symbol)
+            available = (pos.quantity if pos else Decimal(0)) - reserved_qty.get(order.symbol, Decimal(0))
+            if order.quantity > available:
+                raise BrokerRejected(
+                    f"cannot sell {order.quantity} {order.symbol}: only {available} available"
+                )
+
+    def match_open_orders(self) -> list[str]:
+        """Fill resting orders that are now marketable. Returns ids of orders that had to be dropped."""
         changed = False
+        dropped: list[str] = []
         for oid in list(self._open):
             try:
                 filled = self._try_fill(oid, self._open[oid].request)
             except BrokerRejected:
-                filled = True  # can no longer fill (e.g. cash gone): broker drops it
+                dropped.append(oid)  # never silently: account() reports it as an error
+                filled = True
             if filled:
                 del self._open[oid]
                 changed = True
         if changed:
             self._save()
+        return dropped
 
     def _try_fill(self, broker_id: str, order: OrderRequest) -> bool:
         quote = self._prices(order.symbol)

@@ -38,9 +38,9 @@ class JsonFormatter(logging.Formatter):
             "ts": datetime.fromtimestamp(record.created).astimezone().isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "msg": record.getMessage(),
+            "msg": redact(record.getMessage()),
         }
-        return redact(json.dumps(payload, ensure_ascii=True))
+        return json.dumps(payload, ensure_ascii=True)
 
 
 def setup_logging(log_dir: Path, level: int = logging.INFO) -> None:
@@ -60,18 +60,21 @@ def setup_logging(log_dir: Path, level: int = logging.INFO) -> None:
 
 
 def to_jsonable(obj: Any) -> Any:
+    """Convert to JSON-safe values, redacting every string leaf (before serialisation)."""
+    if isinstance(obj, str):
+        return redact(obj)
     if isinstance(obj, Decimal):
         return str(obj)
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     if isinstance(obj, Enum):
-        return obj.value
+        return to_jsonable(obj.value)
     if isinstance(obj, Path):
-        return str(obj)
+        return redact(str(obj))
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         return {f.name: to_jsonable(getattr(obj, f.name)) for f in dataclasses.fields(obj)}
     if isinstance(obj, dict):
-        return {str(k): to_jsonable(v) for k, v in obj.items()}
+        return {redact(str(k)): to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set, frozenset)):
         return [to_jsonable(v) for v in obj]
     return obj
@@ -92,7 +95,7 @@ class DecisionLog:
         now = self._clock.now()
         record: dict[str, Any] = {"ts": now.isoformat(), "kind": kind}
         record.update(to_jsonable(fields))
-        line = redact(json.dumps(record, ensure_ascii=True, sort_keys=False))
+        line = json.dumps(record, ensure_ascii=True, sort_keys=False)
         path = self.path_for(now.date())
         with path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")

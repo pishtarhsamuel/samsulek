@@ -7,7 +7,7 @@ from pathlib import Path
 
 from samsulek.alerts import ConsoleAlerter
 from samsulek.clock import Clock, SystemClock
-from samsulek.config import AppConfig, RiskConfig, load_app_config, load_risk_config
+from samsulek.config import RISK_FILE, AppConfig, RiskConfig, load_app_config, load_risk_config
 from samsulek.data.synthetic import SyntheticFeed
 from samsulek.execution.router import OrderRouter
 from samsulek.execution.sim_broker import SimBroker
@@ -53,7 +53,7 @@ class App:
 
 def load_configs(root: Path, config_path: Path) -> tuple[AppConfig, RiskConfig]:
     config = load_app_config(config_path if config_path.is_absolute() else root / config_path, root)
-    return config, load_risk_config(config.risk_file)
+    return config, load_risk_config(root / RISK_FILE)
 
 
 def build_app(root: Path, config_path: Path, mode: Mode | None = None, clock: Clock | None = None) -> App:
@@ -80,7 +80,7 @@ def build_app(root: Path, config_path: Path, mode: Mode | None = None, clock: Cl
     )
     ledger = Ledger(config.state_dir)
     engine = RiskEngine(risk_config, store, clock, config.universe, log)
-    router = OrderRouter(broker, engine, log, alerter, register_client_id=ledger.remember_client_id)
+    router = OrderRouter(broker, engine, log, alerter, register_order=ledger.remember_order)
     return App(
         root=root,
         config=config,

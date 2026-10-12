@@ -27,8 +27,11 @@ def _open_console() -> tuple[TextIO, TextIO]:
             fin = open("CONIN$", encoding="utf-8")  # noqa: SIM115
             fout = open("CONOUT$", "w", encoding="utf-8")  # noqa: SIM115
             return fin, fout
-        tty = open("/dev/tty", "r+", encoding="utf-8")  # noqa: SIM115
-        return tty, tty
+        # Separate read and write handles: a text-mode "r+" handle on a TTY is not seekable
+        # and fails on first use.
+        fin = open("/dev/tty", encoding="utf-8")  # noqa: SIM115
+        fout = open("/dev/tty", "w", encoding="utf-8")  # noqa: SIM115
+        return fin, fout
     except OSError as exc:
         raise TerminalUnavailableError("no interactive terminal available") from exc
 

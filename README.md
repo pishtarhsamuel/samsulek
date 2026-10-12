@@ -55,11 +55,12 @@ git checkout claude/trading-system-risk-controls-1d7teg
 ### 3. Install the project's dependencies
 
 ```powershell
-uv sync
+uv sync --locked
 ```
 
-This creates a private `.venv` folder with exactly the pinned versions
-listed in `uv.lock`, checked by hash. It doesn't touch the rest of your computer.
+This creates a private `.venv` folder with exactly the pinned versions listed
+in `uv.lock`, checked by hash. `--locked` refuses to continue if anything
+doesn't match the lock file. It doesn't touch the rest of your computer.
 
 ### 4. Run the tests
 
@@ -96,6 +97,12 @@ This runs one trading cycle on the simulator:
 The demo strategy (`DEMO_EQUITY`, `DEMO_BONDS`, `DEMO_GOLD`) exists only to
 exercise the machinery. **It is not a strategy and has no edge.**
 
+Orders only live for one run. Anything still unfilled at the end of a run is
+cancelled, and any leftover order is cancelled at the start of the next run,
+so orders can never pile up between your twice-a-day checks. While a run is
+going, orders waiting at the broker count against your cash and position
+limits.
+
 ```powershell
 uv run samsulek status
 ```
@@ -109,9 +116,12 @@ today's trade count and equity.
 uv run samsulek kill --flatten
 ```
 
-This sets the kill flag, cancels every open order, and sells every position.
-Without `--flatten` it only cancels orders and stops trading. Anything it
-can't close is listed so you can close it by hand in the broker app.
+This sets the kill flag **first** (even if other files are damaged), cancels
+every open order, and sells every position. Without `--flatten` it only
+cancels orders and stops trading. A position only counts as closed once the
+broker shows it's gone. Anything still held, including exit orders still
+waiting to fill, is listed so you can close it by hand in the broker app.
+The command ends with exit code 1 when anything is left.
 
 ### Resuming after a halt or kill (only you, at the keyboard)
 
@@ -119,9 +129,21 @@ can't close is listed so you can close it by hand in the broker app.
 uv run samsulek reset-halt --clear-kill
 ```
 
-It shows a line like `RESET 482913`. Type it exactly and press Enter. This
-can't be scripted or done by an AI agent. **Before resuming, run
+It shows a line like `RESET 482913`. Type it exactly and press Enter. It
+only works from a real terminal window with a person typing. The Claude Code
+safety hook also blocks Claude from running this command. **Before resuming, run
 `uv run samsulek status` and make sure you understand why it stopped.**
+
+If the halt was a **drawdown** halt (down 15% from your best equity), clearing it
+isn't enough: the next run sees the same drawdown and halts again. That's
+deliberate. If you've decided to accept the loss and continue from the
+current level, add `--rebase-peak`:
+
+```powershell
+uv run samsulek reset-halt --rebase-peak
+```
+
+Do the same after you withdraw money, since a withdrawal looks like a loss.
 
 ### Starting the simulation over
 
@@ -143,6 +165,11 @@ Remove-Item -Recurse -Force state
 | Halt / kill flags, daily counters, ledger, simulated broker | `state\` (never edit by hand while the bot runs) |
 | Hard risk limits | `config\risk.yaml` |
 | Go-live checklist (live mode refuses to start until it's complete) | `ops\go_live_checklist.md` |
+
+Those last two files are always read from exactly these locations: no setting
+can point the bot somewhere else. The checklist's items are fingerprinted, so
+deleting or rewording an item also blocks live mode until the change has been
+reviewed.
 
 Command results (exit codes): `0` OK, `1` error, `2` halted or blocked, `3`
 refused (e.g. paper/live not available yet).

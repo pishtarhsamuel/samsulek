@@ -12,6 +12,7 @@ Non-interactive problems are all reported at once, before any prompt.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable, Mapping
 from datetime import date, timedelta
@@ -22,7 +23,22 @@ from samsulek.types import Mode
 
 LIVE_PHRASE = "I ACCEPT REAL MONEY RISK {code}"
 CHECKLIST_MAX_AGE = timedelta(days=30)
-_BOX_RE = re.compile(r"^\s*[-*]\s*\[( |x|X)\]\s*(.+)$")
+# Any list-item checkbox, including quoted and numbered ones. Only "x"/"X" counts as ticked.
+_BOX_RE = re.compile(r"^\s*(?:>\s*)*(?:[-*+]|\d+[.)])\s*\[([^\]]*)\]\s*(.*)$")
+# Fingerprint of the checklist ITEMS (their wording, ticks ignored). If an item is
+# deleted or reworded, live is refused until this constant is updated in a reviewed
+# change together with the checklist. See checklist_fingerprint().
+EXPECTED_CHECKLIST_SHA256 = "f5152185f07550b8f6a24291984c4ecb3fd0b91cbc2f0f32742c1029cacef056"  # 18 items
+
+
+def checklist_items(text: str) -> list[tuple[str, str]]:
+    """(tick mark, item text) for every checkbox line."""
+    return [(m.group(1), m.group(2).strip()) for line in text.splitlines() if (m := _BOX_RE.match(line))]
+
+
+def checklist_fingerprint(text: str) -> str:
+    items = [" ".join(item.split()) for _, item in checklist_items(text)]
+    return hashlib.sha256("\n".join(items).encode("utf-8")).hexdigest()
 
 
 class LiveGateError(RuntimeError):
@@ -37,12 +53,18 @@ def checklist_problems(path: Path, today: date) -> list[str]:
     except OSError:
         return [f"go-live checklist not found at {path}"]
     problems: list[str] = []
-    boxes = [m for line in text.splitlines() if (m := _BOX_RE.match(line))]
-    if not boxes:
+    items = checklist_items(text)
+    if not items:
         problems.append("go-live checklist has no checkboxes")
-    for m in boxes:
-        if m.group(1) == " ":
-            problems.append(f"checklist item not ticked: {m.group(2).strip()}")
+    if checklist_fingerprint(text) != EXPECTED_CHECKLIST_SHA256:
+        problems.append(
+            "checklist items were changed, added or removed: the checklist must be the reviewed one"
+        )
+    for mark, item in items:
+        if not item:
+            problems.append("checklist has an empty item")
+        elif mark not in ("x", "X"):
+            problems.append(f"checklist item not ticked: {item}")
     signer = re.search(r"^Signed-off-by:[ \t]*(\S.*)$", text, re.MULTILINE)
     if not signer:
         problems.append("checklist is not signed (Signed-off-by: is empty)")

@@ -2,19 +2,22 @@
 """PreToolUse guardrail hook for Claude Code in this repository.
 
 DENY (Claude cannot do these at all):
-  - start the bot in live mode (LIVE=true, --live, --mode live, mode: live, ...)
-  - reset a risk halt or clear the kill switch (owner-only, by hand)
-  - modify bot runtime state (state/: halt flag, kill flag, ledger)
-  - read, write, or search .env files or Solana wallet keypair files
-  - dump environment variables or expand secret-looking variables
+  - start the bot in live mode (LIVE=true in any spelling, persistent Windows
+    user/machine variables, --live, --mode live and its abbreviations, mode: live)
+  - reset a risk halt, clear the kill switch, or touch the risk state API
+  - modify bot runtime state (state/ directory and its files, any spelling/case)
+  - read, write, or search .env files (any case, glob, NTFS stream) or wallet keypairs
+  - dump environment variables or expand secret-looking variables (sh/PowerShell/cmd,
+    python/node/perl/ruby, /proc/*/environ)
   - move funds or create wallets via the Solana CLI
-  - recursive grep that ignores .gitignore, or `git clean -x` (deletes .env/state)
+  - searches that ignore .gitignore, `git clean -x`, `git stash --all`
 
 ASK (the owner must approve in the permission prompt):
   - edit guardrail files: .claude/settings*.json, .claude/hooks/,
     config/risk.yaml (hard risk limits), ops/go_live_checklist.md
 
-Covers bash, PowerShell and cmd spellings (the owner runs Windows).
+Paths are compared case-insensitively with trailing dots/spaces and NTFS stream
+suffixes removed, because the owner runs Windows. Input is decoded as UTF-8.
 Fails closed: malformed input or an internal error results in DENY.
 Standard library only, so it works before any project dependency is installed.
 
@@ -41,50 +44,70 @@ _SECRETISH = r"[A-Za-z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE|MNEMONIC
 
 LIVE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(rf"\b{_VAR}\s*=\s*{_TRUTHY}", re.I), "sets LIVE to a truthy value"),
+    (re.compile(rf"\b{_VAR}\s*=\s*(?:\$\(|`|\$\{{?\w)", re.I), "sets LIVE from a computed value"),
     (re.compile(rf"\bexport\s+{_VAR}\b", re.I), "exports a LIVE variable"),
-    (re.compile(rf"\$env:{_VAR}\b", re.I), "sets LIVE (PowerShell)"),
+    (re.compile(rf"env:[\\/]?{_VAR}\b", re.I), "sets LIVE (PowerShell env: drive)"),
     (re.compile(rf"\bsetx?\s+{_VAR}\b", re.I), "sets LIVE (Windows)"),
+    (re.compile(r"SetEnvironmentVariable", re.I), "sets a persistent environment variable"),
+    (re.compile(r"\breg(?:\.exe)?\s+add\b[^|;&]*\benvironment\b", re.I), "edits the registry environment"),
     (re.compile(r"(?<![\w-])--live(?![\w-])", re.I), "passes --live"),
-    (re.compile(r"--mode(?:\s+|\s*=\s*)[\"']?live\b", re.I), "passes --mode live"),
+    (re.compile(r"(?<![\w-])--m(?:o(?:d(?:e)?)?)?(?:\s+|\s*=\s*)[\"']?live\b", re.I), "passes --mode live"),
     (re.compile(r"\bmode\s*:\s*[\"']?live\b", re.I), "sets mode: live in a config"),
 ]
 
 OWNER_ONLY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\breset-halt\b", re.I), "resets a risk halt"),
     (re.compile(r"--clear-kill\b", re.I), "clears the kill switch"),
+    (
+        re.compile(r"\b(?:RiskStateStore|clear_halt|clear_kill|_clear_flag|write_day|write_peak)\b"),
+        "uses the risk-state API directly",
+    ),
 ]
 
-# A path token that is .env or .env.<anything>. Does not match .venv, .envrc,
-# os.environ, process.env.X, or env.example (the committed template).
-ENV_FILE_RE = re.compile(
-    r"(?:^|[\s/\\'\"=<>(:;|&`,])\.env(?:\.[A-Za-z0-9_.*-]+)?(?=$|[\s'\";|&)<>`,])"
+# .env or .env.<anything> in any case, also followed by glob chars, ':' streams or dots.
+# Does not match .venv, .envrc, os.environ, process.env.X, or env.example.
+ENV_FILE_RE = re.compile(r"(?:^|[^\w.])\.env(?!\w)", re.I)
+# A dot-file token that contains a glob/brace early on, e.g. `.*`, `.e*`, `.[e]nv`, `.?nv`.
+ENV_GLOB_RE = re.compile(
+    r"(?:^|[\s/\\'\"=({,])\.(?=[^\s/\\'\"]{0,8}(?:$|[\s'\";|&)]))[^\s/\\'\"]{0,3}[*?\[{]"
 )
-# Globs that would expand to .env files, e.g. `cat .e*` or `cat .en?`.
-ENV_GLOB_RE = re.compile(r"(?:^|[\s/\\'\"])\.en?[*?\[]")
 
-KEYPAIR_RE = re.compile(
-    r"(?:\.config[/\\]solana|\bid\.json\b|keypair[^\s/\\]*\.json)", re.I
-)
+KEYPAIR_RE = re.compile(r"(?:\.config[/\\]solana|\bid\.json\b|keypair[^\s/\\]*\.json)", re.I)
 
 ENV_DUMP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\bprintenv\b"), "printenv dumps environment variables"),
+    (re.compile(r"\bprintenv\b", re.I), "printenv dumps environment variables"),
     (
         re.compile(
-            r"(?:^|[;&|(`]\s*)(?:env|set|export\s+-p|declare\s+-[a-zA-Z]*x[a-zA-Z]*|compgen\s+-e)"
+            r"(?:^|[;&|(`]\s*)(?:(?:/usr)?/bin/)?"
+            r"(?:set|export|declare|typeset|export\s+-p|declare\s+-[a-zA-Z]*|typeset\s+-[a-zA-Z]*|compgen\s+-[a-zA-Z]*e[a-zA-Z]*)"
             r"\s*(?=$|[;&|)>`])",
             re.I,
         ),
-        "bare env/set/export -p dumps environment variables",
+        "bare set/export/declare dumps environment variables",
+    ),
+    (
+        # `env` is only allowed as `env NAME=value ... command`
+        re.compile(
+            r"(?:^|[;&|(`]\s*)(?:(?:/usr)?/bin/)?env(?=\s|$|[;&|)>`])"
+            r"(?!(?:\s+[A-Za-z_][A-Za-z0-9_]*=\S*)+\s+[^\s=;&|<>-])"
+        ),
+        "env without a command dumps environment variables",
     ),
     (re.compile(r"/proc/[^\s]*/environ"), "reads a process environment"),
     (
-        re.compile(r"(?:Get-ChildItem|gci|dir|ls|Get-Item|gi|Get-Content|gc|type|cat)\s+env:", re.I),
+        re.compile(
+            r"(?:Get-ChildItem|gci|dir|ls|Get-Item|gi|Get-Content|gc|type|cat)\s+"
+            r"(?:-(?:Literal)?Path\s+)?env:",
+            re.I,
+        ),
         "dumps env (PowerShell)",
     ),
     (re.compile(r"\[(?:System\.)?Environment\]::GetEnvironmentVariables?\b", re.I), "reads env vars (.NET)"),
-    (re.compile(r"\bos\.(?:environ|getenv)\b|\bgetenv\s*\("), "reads env vars from code"),
+    (re.compile(r"\benvironb?\b|\bgetenv\b"), "reads env vars from code"),
+    (re.compile(r"\bprocess\.env\b|%ENV\b|\bruby\b[^|;&]*\bENV\b"), "reads env vars from code"),
+    (re.compile(r"\$\{!"), "indirect variable expansion"),
     (re.compile(rf"\$\{{?{_SECRETISH}\}}?", re.I), "expands a secret-looking variable"),
-    (re.compile(rf"\$env:{_SECRETISH}", re.I), "expands a secret-looking variable (PowerShell)"),
+    (re.compile(rf"\$\{{?env:{_SECRETISH}", re.I), "expands a secret-looking variable (PowerShell)"),
     (re.compile(rf"%{_SECRETISH}%", re.I), "expands a secret-looking variable (cmd)"),
 ]
 
@@ -98,12 +121,20 @@ RECURSIVE_SEARCH_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         "rg with ignore-overrides can read .env; use the Grep tool",
     ),
     (
+        re.compile(r"\bgit\s+grep\b[^|;&]*--no-exclude-standard"),
+        "git grep including ignored files can read .env; use the Grep tool",
+    ),
+    (
         re.compile(r"\b(?:Select-String|sls)\b[^|;&]*-Recurse|\bfindstr\b[^|;&]*\s/s\b", re.I),
         "recursive search ignores .gitignore and can read .env; use the Grep tool",
     ),
     (
         re.compile(r"\bgit\s+clean\b[^|;&]*\s-[a-zA-Z]*[xX]", re.I),
         "git clean -x deletes ignored files (secrets, bot state)",
+    ),
+    (
+        re.compile(r"\bgit\s+stash\b[^|;&]*\s(?:-[a-zA-Z]*a[a-zA-Z]*|--all)\b"),
+        "git stash --all removes ignored files (secrets, bot state)",
     ),
 ]
 
@@ -119,22 +150,21 @@ FUNDS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bsolana-keygen\b", re.I), "creates or recovers a wallet"),
 ]
 
-# Commands that write/delete files (bash, PowerShell, cmd spellings).
+# Commands that write/delete files (bash, PowerShell, cmd, interpreter spellings).
 SHELL_WRITE_HINT_RE = re.compile(
-    r"(?:>|\b(?:sed|perl)\b[^|;&]*\s-i"
+    r"(?:>|\b(?:sed|perl)\b[^|;&]*\s-i|\s-delete\b"
     r"|\b(?:rm|rmdir|mv|cp|tee|chmod|chown|truncate|ln|dd|install|unlink|touch|shred)\b"
     r"|\bgit\s+(?:checkout|restore|rm|mv|reset|stash|apply|am)\b"
     r"|\b(?:Remove-Item|Set-Content|Add-Content|Out-File|Copy-Item|Move-Item|Rename-Item|New-Item"
-    r"|Clear-Content|del|erase|rd|ren|move|copy|ri|sc|ac)\b"
-    r"|\b(?:open|write_text|write_bytes|unlink|remove|rmtree)\s*\()",
+    r"|Clear-Content|Clear-Item|del|erase|rd|ren|move|copy|ri|sc|ac)\b"
+    r"|\b(?:open|write_text|write_bytes|unlink|remove|rmtree|replace|rename)\s*\()",
     re.I,
 )
 
 # Bot runtime state (halt/kill flags, ledger): only the bot and the owner touch it.
 STATE_IN_SHELL_RE = re.compile(
-    r"(?:^|[\s/\\'\"=])state[/\\]"
-    r"|\b(?:rm|rmdir|mv|Remove-Item|Move-Item|Rename-Item|del|erase|rd|ri|ren|move)\b[^|;&]*"
-    r"\s[\"']?\.?[/\\]?state[\"']?(?=$|[\s;|&])",
+    r"(?:^|[\s/\\'\"=$(])state(?=$|[\s\"'/\\;|&)])"
+    r"|\b(?:halt|kill|risk_day|equity_peak|ledger|sim_broker|state_history|run)\.(?:json|jsonl|lock)\b",
     re.I,
 )
 
@@ -142,12 +172,13 @@ STATE_IN_SHELL_RE = re.compile(
 PROTECTED_IN_SHELL_RE = re.compile(
     r"(?:\.claude[/\\](?:settings[^\s/\\'\"]*\.json|hooks\b)"
     r"|config[/\\]risk\.ya?ml"
-    r"|ops[/\\]go_live_checklist\.md)"
+    r"|ops[/\\]go_live_checklist\.md)",
+    re.I,
 )
 DISABLE_HOOKS_RE = re.compile(r"disableAllHooks", re.I)
 
 # ---------------------------------------------------------------------------
-# File-tool path patterns
+# File-tool path patterns (applied to normalised, lower-case paths)
 # ---------------------------------------------------------------------------
 
 PROTECTED_PATH_RES = [
@@ -157,24 +188,35 @@ PROTECTED_PATH_RES = [
     re.compile(r"(?:^|/)ops/go_live_checklist\.md$"),
 ]
 STATE_PATH_RE = re.compile(r"(?:^|/)state(?:/|$)")
+PROC_ENVIRON_RE = re.compile(r"^/proc/[^/]+/environ$")
 
 FILE_TOOLS = {"Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "NotebookRead"}
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
-SHELL_TOOLS = {"Bash", "PowerShell"}
+SHELL_TOOLS = {"Bash", "PowerShell", "Monitor"}
+_DRIVE_RE = re.compile(r"^[a-z]:$", re.I)
 
 
 def _norm(path: str) -> str:
-    return path.replace("\\", "/").strip()
+    """Lower-case, forward slashes, no NTFS stream suffix, no trailing dots/spaces per segment."""
+    out: list[str] = []
+    for i, seg in enumerate(path.replace("\\", "/").strip().split("/")):
+        if seg in (".", ".."):
+            out.append(seg)
+            continue
+        if ":" in seg and not (i == 0 and _DRIVE_RE.match(seg)):
+            seg = seg.split(":", 1)[0]
+        out.append(seg.rstrip(" .").lower())
+    return "/".join(out)
 
 
 def is_secret_path(path: str) -> bool:
     p = _norm(path)
-    name = p.rsplit("/", 1)[-1].lower()
+    name = p.rsplit("/", 1)[-1]
     if name == ".env" or name.startswith(".env."):
         return True
     if name == "id.json" or ("keypair" in name and name.endswith(".json")):
         return True
-    return ".config/solana" in p.lower()
+    return ".config/solana" in p or bool(PROC_ENVIRON_RE.match(p))
 
 
 def is_protected_path(path: str) -> bool:
@@ -188,9 +230,9 @@ def is_state_path(path: str) -> bool:
 
 def secret_glob(pattern: str) -> bool:
     """True if a Grep/Glob path or glob could target .env or keypair files."""
-    p = _norm(pattern).lower()
+    p = _norm(pattern)
     return bool(
-        re.search(r"(?:^|/|\{|,)\.e(?:n(?:v)?)?(?:$|[.*?\[{])", p)
+        re.search(r"(?:^|/|\{|,)\.(?:e(?:n(?:v)?)?)?(?:$|[.*?\[{])", p)
         or is_secret_path(p)
         or "keypair" in p
     )
@@ -204,8 +246,8 @@ Decision = tuple[str, str] | None  # ("deny"|"ask", reason) or None = no opinion
 
 
 def check_shell(command: str) -> Decision:
-    # Check the raw command and a variant with quotes/backslashes/backticks
-    # removed, to catch trivial obfuscation such as L\IVE=true or "--li""ve".
+    # Check the raw command and a variant with quotes/escapes removed, to catch
+    # trivial obfuscation such as L\IVE=true, "--li""ve" or PowerShell L`IVE.
     variants = [command, re.sub(r"[\\'\"`^]", "", command)]
     for cmd in variants:
         for pat, why in LIVE_PATTERNS:
@@ -215,7 +257,7 @@ def check_shell(command: str) -> Decision:
             if pat.search(cmd):
                 return ("deny", f"Blocked: command {why}. Only the owner does that, by hand at a terminal.")
         if ENV_FILE_RE.search(cmd) or ENV_GLOB_RE.search(cmd):
-            return ("deny", "Blocked: command touches a .env file. Claude never reads or edits secrets.")
+            return ("deny", "Blocked: command touches (or may glob to) a .env file. Claude never reads secrets.")
         if KEYPAIR_RE.search(cmd):
             return ("deny", "Blocked: command touches a wallet keypair file.")
         for pat, why in ENV_DUMP_PATTERNS:
@@ -242,7 +284,7 @@ def check_file_tool(tool: str, tool_input: dict[str, Any]) -> Decision:
         tool_input.get("file_path") or tool_input.get("notebook_path") or tool_input.get("path") or ""
     )
     if path and is_secret_path(path):
-        return ("deny", "Blocked: .env and wallet keypair files are off-limits to Claude.")
+        return ("deny", "Blocked: .env, wallet keypair and process-environment files are off-limits.")
     if tool in WRITE_TOOLS and path and is_state_path(path):
         return ("deny", "Blocked: bot runtime state (halt/kill flags, ledger) is written only by the bot.")
     if tool in WRITE_TOOLS and path and is_protected_path(path):
@@ -286,7 +328,9 @@ def emit(decision: str, reason: str) -> None:
 
 def main() -> int:
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
+        # Claude Code sends UTF-8. Never decode with the Windows ANSI code page.
+        raw = sys.stdin.buffer.read().decode("utf-8")
+        payload = json.loads(raw or "{}")
         if not isinstance(payload, dict):
             raise ValueError("payload is not an object")
         result = decide(payload)

@@ -73,7 +73,12 @@ Owner context (drives every design decision):
   Editing the guardrail files, `config/risk.yaml` or `ops/go_live_checklist.md`
   needs an approval prompt.
 - The hook scans whole Bash commands, including heredocs and commit messages:
-  use the Edit/Write tools for file content that mentions blocked words.
+  use the Edit/Write tools for file content that mentions blocked words, and
+  `git commit -F <file>` for commit messages.
+- `config/risk.yaml` and `ops/go_live_checklist.md` are read from fixed paths
+  (not configurable). The checklist items are fingerprinted in
+  `src/samsulek/live_gate.py` (`EXPECTED_CHECKLIST_SHA256`). A reviewed
+  checklist change must update that constant in the same change.
 - Do not try to work around a block (no path tricks, encodings, or indirection).
   If a block looks wrong, stop and ask the owner.
 - Changes to `.claude/`, limits in `config/risk.yaml`, or
@@ -151,7 +156,7 @@ site, say so; don't guess from memory.
 ## Commands
 
 Development (from the repo root):
-- Install / update dependencies: `uv sync`
+- Install dependencies exactly as locked: `uv sync --locked`
 - All tests: `uv run pytest`
 - Lint and format: `uv run ruff check src tests` and `uv run ruff format src tests`
 - Strict type check: `uv run mypy`

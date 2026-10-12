@@ -21,14 +21,17 @@ _MIN_REDACT_LEN = 4
 _REDACTED = "****"
 _registered: set[str] = set()
 
-# Matches NAME=value / NAME: value where NAME looks secret-ish.
-_KV_SECRET_RE = re.compile(
-    r"(?i)\b([A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE|MNEMONIC|SEED_PHRASE)[A-Z0-9_]*)"
-    r"(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|\S+)"
-)
+_SECRET_NAME = r"[A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE|MNEMONIC|SEED_PHRASE)[A-Z0-9_]*"  # noqa: S105
+_SECRET_NAME_RE = re.compile(rf"(?i)^{_SECRET_NAME}$")
+# Matches NAME=value / NAME: value where NAME looks secret-ish. The value stops at
+# separators so JSON or query strings around it are not swallowed.
+_KV_SECRET_RE = re.compile(rf"(?i)\b({_SECRET_NAME})(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s\"',;}}&]+)")
+# Values of non-secret-looking variables are only redacted when long enough to be
+# unambiguous; short ones ("true", "1234") would corrupt unrelated log text.
+_MIN_PLAIN_VALUE_LEN = 12
 
 LIVE_VAR = "LIVE"
-_LIVE_ONLY_RE = re.compile(r"(?:^|_)LIVE_")
+_LIVE_ONLY_RE = re.compile(r"(?:^|_)LIVE(?:_|$)")
 
 
 class MissingSecretError(KeyError):
@@ -88,6 +91,15 @@ def is_live_only(name: str) -> bool:
 _LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
 
 
+def _parse_value(raw: str) -> str:
+    """dotenv-style value: quoted -> up to the matching quote; unquoted -> cut at ' #' comment."""
+    if raw[:1] in ("'", '"'):
+        end = raw.find(raw[0], 1)
+        return raw[1:end] if end != -1 else raw[1:]
+    m = re.search(r"\s#", raw)
+    return (raw[: m.start()] if m else raw).strip()
+
+
 def load_env_file(
     path: Path,
     environ: MutableMapping[str, str] | None = None,
@@ -97,7 +109,8 @@ def load_env_file(
     """Load NAME=value lines into ``environ`` without overriding existing variables.
 
     Returns the names loaded (never values). Missing file is fine (returns []).
-    ``LIVE`` is always ignored. ``*_LIVE_*`` names are ignored unless allowed.
+    ``LIVE`` is always ignored. Names containing a ``LIVE`` word (``T212_LIVE_KEY``,
+    ``KEY_LIVE``) are ignored unless allowed.
     """
     env = os.environ if environ is None else environ
     try:
@@ -112,10 +125,12 @@ def load_env_file(
         m = _LINE_RE.match(line)
         if not m:
             continue  # never echo the malformed line: it may contain a secret
-        name, value = m.group(1), m.group(2)
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        if value and name.upper() != LIVE_VAR:
+        name, value = m.group(1), _parse_value(m.group(2))
+        if (
+            value
+            and name.upper() != LIVE_VAR
+            and (_SECRET_NAME_RE.match(name) or is_live_only(name) or len(value) >= _MIN_PLAIN_VALUE_LEN)
+        ):
             register_for_redaction(value)  # even values we skip below must never be logged
         if name.upper() == LIVE_VAR:
             continue

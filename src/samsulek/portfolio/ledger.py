@@ -14,7 +14,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from samsulek.risk.state import StateCorruptError, atomic_write_text
-from samsulek.types import AccountSnapshot, Fill, Market, PortfolioSnapshot, Position, Side
+from samsulek.types import AccountSnapshot, Fill, Market, OrderRequest, PortfolioSnapshot, Position, Side
 
 LEDGER_FILE = "ledger.json"
 
@@ -31,6 +31,10 @@ class Ledger:
         self.positions: dict[str, Position] = {}
         self.last_fill_id: str | None = None
         self.known_client_ids: list[str] = []
+        # Quantity we ordered and quantity filled so far, per client order id. A fill for
+        # an id we never sent, or beyond what we ordered, means someone else traded.
+        self.ordered: dict[str, Decimal] = {}
+        self.filled: dict[str, Decimal] = {}
         self._load()
 
     def _load(self) -> None:
@@ -47,7 +51,13 @@ class Ledger:
             }
             self.last_fill_id = data["last_fill_id"]
             self.known_client_ids = list(data["known_client_ids"])
+            self.ordered = {k: Decimal(v) for k, v in data.get("ordered", {}).items()}
+            self.filled = {k: Decimal(v) for k, v in data.get("filled", {}).items()}
             self.initialized = bool(data["initialized"])
+            if not self.cash.is_finite() or any(
+                not p.quantity.is_finite() or not p.avg_price.is_finite() for p in self.positions.values()
+            ):
+                raise ValueError("non-finite number in ledger")
         except (KeyError, TypeError, ValueError, InvalidOperation, json.JSONDecodeError) as exc:
             raise StateCorruptError(f"{self._path} is unreadable") from exc
 
@@ -61,6 +71,8 @@ class Ledger:
             },
             "last_fill_id": self.last_fill_id,
             "known_client_ids": self.known_client_ids[-5000:],
+            "ordered": {k: str(v) for k, v in list(self.ordered.items())[-5000:]},
+            "filled": {k: str(v) for k, v in list(self.filled.items())[-5000:]},
         }
         atomic_write_text(self._path, json.dumps(data, indent=2, sort_keys=True))
 
@@ -76,13 +88,30 @@ class Ledger:
         self.initialized = True
         self.save()
 
-    def remember_client_id(self, client_id: str) -> None:
-        self.known_client_ids.append(client_id)
+    def remember_order(self, order: OrderRequest) -> None:
+        """Record an order right before it is sent, so its fills (and only its fills) are accepted."""
+        if order.client_id in self.ordered:
+            raise LedgerError(f"client order id {order.client_id} was already used")
+        self.known_client_ids.append(order.client_id)
+        self.ordered[order.client_id] = order.quantity
         self.save()
 
     def apply_fills(self, fills: Iterable[Fill]) -> int:
         n = 0
         for f in fills:
+            ordered = self.ordered.get(f.client_id)
+            if ordered is None:
+                raise LedgerError(
+                    f"fill {f.fill_id} is for order {f.client_id}, which this bot never sent "
+                    "(manual trade or broker error)"
+                )
+            already = self.filled.get(f.client_id, Decimal(0))
+            if already + f.quantity > ordered:
+                raise LedgerError(
+                    f"fill {f.fill_id} would fill {already + f.quantity} of order {f.client_id}, "
+                    f"which was for {ordered} (duplicate execution?)"
+                )
+            self.filled[f.client_id] = already + f.quantity
             pos = self.positions.get(f.symbol)
             held = pos.quantity if pos else Decimal(0)
             if f.side is Side.BUY:
@@ -109,7 +138,10 @@ class Ledger:
             self.save()
         return n
 
-    def snapshot(self, ts: datetime) -> PortfolioSnapshot:
+    def snapshot(self, ts: datetime, open_orders: tuple[OrderRequest, ...] = ()) -> PortfolioSnapshot:
+        """Our view of the account. ``open_orders`` come from the broker (they reserve cash/exposure)."""
         if not self.initialized:
             raise LedgerError("ledger is not initialised")
-        return PortfolioSnapshot(cash=self.cash, positions=dict(self.positions), ts=ts)
+        return PortfolioSnapshot(
+            cash=self.cash, positions=dict(self.positions), ts=ts, open_orders=tuple(open_orders)
+        )

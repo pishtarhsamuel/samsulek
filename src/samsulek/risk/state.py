@@ -19,6 +19,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from samsulek.credentials import redact
 from samsulek.types import require_aware
 
 HALT_FILE = "halt.json"
@@ -94,12 +95,16 @@ class RiskStateStore:
     def _write_json(self, name: str, data: dict[str, Any]) -> None:
         atomic_write_text(self.dir / name, json.dumps(data, indent=2, sort_keys=True))
 
-    def _history(self, event: str, ts: datetime, **fields: Any) -> None:
-        line = json.dumps({"ts": ts.isoformat(), "event": event, **fields}, sort_keys=True)
-        with (self.dir / HISTORY_FILE).open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+    def _history(self, event: str, ts: datetime, **fields: str) -> None:
+        """Append to the audit history. Best effort: the flag file itself is already written."""
+        record = {"ts": ts.isoformat(), "event": event, **{k: redact(v) for k, v in fields.items()}}
+        try:
+            with (self.dir / HISTORY_FILE).open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, sort_keys=True) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError:
+            pass
 
     # ---- flags -----------------------------------------------------------
     def _read_flag(self, name: str) -> FlagState:
@@ -119,11 +124,15 @@ class RiskStateStore:
 
     def _set_flag(self, name: str, reason: str, ts: datetime) -> FlagState:
         require_aware(ts, "flag timestamp")
+        reason = redact(reason)
         try:
             current = self._read_flag(name)
         except StateCorruptError:
             current = FlagState(active=False)  # overwrite corrupt file with a valid ACTIVE flag
-        reasons = (*current.reasons, reason) if current.active else (reason,)
+        if current.active and reason in current.reasons:
+            reasons = current.reasons
+        else:
+            reasons = (*current.reasons, reason) if current.active else (reason,)
         since = current.since if current.active and current.since else ts
         self._write_json(name, {"active": True, "reasons": list(reasons), "since": since.isoformat()})
         self._history(f"set:{name}", ts, reason=reason)
@@ -163,10 +172,14 @@ class RiskStateStore:
                 isinstance(k, str) and isinstance(v, int) and v >= 0 for k, v in trades.items()
             ):
                 raise TypeError("bad trades")
+            start = Decimal(data["day_start_equity"])
+            last = Decimal(data["last_equity"])
+            if not (start.is_finite() and last.is_finite()) or start < 0 or last < 0:
+                raise ValueError("equity values must be finite and >= 0")
             return DayState(
                 day=date.fromisoformat(data["day"]),
-                day_start_equity=Decimal(data["day_start_equity"]),
-                last_equity=Decimal(data["last_equity"]),
+                day_start_equity=start,
+                last_equity=last,
                 trades=dict(trades),
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:

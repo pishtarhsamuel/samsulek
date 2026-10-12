@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from decimal import Decimal
 from pathlib import Path
 
@@ -9,7 +10,17 @@ from helpers import T0, order
 from samsulek.portfolio.ledger import Ledger, LedgerError
 from samsulek.portfolio.reconcile import reconcile
 from samsulek.risk.state import StateCorruptError
-from samsulek.types import AccountSnapshot, BrokerOrder, Fill, Market, OrderStatus, Position, Side
+from samsulek.types import (
+    AccountSnapshot,
+    BrokerOrder,
+    Fill,
+    Market,
+    OrderRequest,
+    OrderStatus,
+    OrderType,
+    Position,
+    Side,
+)
 
 
 def fill(fid: str, side: Side, qty: str, price: str, fee: str = "0", symbol: str = "AAA") -> Fill:
@@ -23,9 +34,18 @@ def account(
     return AccountSnapshot(Decimal(cash), pos, open_orders, T0)
 
 
+def remember(led: Ledger, fid: str, side: Side, qty: str) -> None:
+    """Register the order a test fill belongs to (client id c-<fid>), as the router does."""
+    led.remember_order(
+        OrderRequest(f"c-{fid}", Market.STOCKS, "AAA", side, Decimal(qty), OrderType.LIMIT, Decimal("1"))
+    )
+
+
 def test_ledger_applies_fills_and_persists(tmp_path: Path) -> None:
     led = Ledger(tmp_path)
     led.initialize_from(account("50"), None)
+    for fid, side, qty in [("1", Side.BUY, "0.1"), ("2", Side.BUY, "0.1"), ("3", Side.SELL, "0.2")]:
+        remember(led, fid, side, qty)
     led.apply_fills([fill("1", Side.BUY, "0.1", "100", "0.05"), fill("2", Side.BUY, "0.1", "110")])
     assert led.cash == Decimal("50") - Decimal("10.05") - Decimal("11")
     assert led.positions["AAA"].avg_price == Decimal("105")
@@ -50,10 +70,24 @@ def test_ledger_refuses_overselling_reinit_and_open_orders(tmp_path: Path) -> No
     led.initialize_from(account("50"), None)
     with pytest.raises(LedgerError, match="already initialised"):
         led.initialize_from(account("50"), None)
+    remember(led, "1", Side.SELL, "1")
     with pytest.raises(LedgerError, match="ledger holds"):
         led.apply_fills([fill("1", Side.SELL, "1", "10")])
     with pytest.raises(LedgerError, match="not initialised"):
         Ledger(tmp_path / "other").snapshot(T0)
+
+
+def test_ledger_rejects_fills_it_cannot_explain(tmp_path: Path) -> None:
+    led = Ledger(tmp_path)
+    led.initialize_from(account("50"), None)
+    with pytest.raises(LedgerError, match="never sent"):
+        led.apply_fills([fill("9", Side.BUY, "0.1", "100")])  # a manual trade in the broker app
+    remember(led, "1", Side.BUY, "0.1")
+    led.apply_fills([fill("1", Side.BUY, "0.06", "100")])  # partial fill is fine
+    with pytest.raises(LedgerError, match="duplicate execution"):
+        led.apply_fills([dataclasses.replace(fill("1b", Side.BUY, "0.06", "100"), client_id="c-1")])
+    with pytest.raises(LedgerError, match="already used"):
+        remember(led, "1", Side.BUY, "0.1")
 
 
 def test_corrupt_ledger_fails_closed(tmp_path: Path) -> None:

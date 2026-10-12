@@ -9,6 +9,7 @@ these tests also prove the script starts and fails closed. Stdlib only:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -240,7 +241,7 @@ class OwnerOnlyActionsAndBotState(unittest.TestCase):
             "ls state",
             "uv run samsulek status",
             "uv run samsulek kill --flatten",
-            'git commit -m "add risk state store; move code"',
+            "git commit -F /tmp/commit_message.txt",  # messages go in a file: words in them can't trip rules
             "uv run pytest -q",
             "git clean -n",
         ]:
@@ -276,12 +277,159 @@ class WindowsSpellings(unittest.TestCase):
                 self.assertEqual(decide("PowerShell", command=cmd), "ask")
 
 
-@unittest.skipUnless(shutil.which("bash"), "bash not available")
+class ReviewBypassesAreClosed(unittest.TestCase):
+    """Every bypass found by the M1 adversarial review must now be blocked."""
+
+    def test_env_file_globs_case_and_streams_denied(self) -> None:
+        for cmd in [
+            "cat .env*",
+            "head -n 5 .env?",
+            "cat .[e]nv",
+            "cat .*",
+            "cat {.env,}",
+            "type .ENV",
+            "Get-Content .ENV",
+            "Get-Content .Env.local",
+            "Get-Content .E*",
+            "Get-Content .env::$DATA",
+            "type .env.",
+            "Get-Content -Path .\\.env",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("PowerShell", command=cmd), "deny")
+        for path in [
+            "C:\\Users\\me\\samsulek\\.env::$DATA",
+            "C:\\x\\.ENV",
+            "/x/.env. ",
+            "/proc/self/environ",
+        ]:
+            with self.subTest(path=path):
+                self.assertEqual(decide("Read", file_path=path), "deny")
+
+    def test_state_bypasses_denied(self) -> None:
+        for cmd in [
+            "cd state && rm halt.json kill.json",
+            "rm halt.json",
+            "rm -rf /home/user/samsulek/state",
+            'rm -rf "$PWD/state"',
+            "Remove-Item -Recurse -Force C:\\Users\\me\\samsulek\\state",
+            "Remove-Item -Recurse -Force C:\\Users\\me\\samsulek\\State",
+            "git stash --all",
+            "git stash -a",
+            "find . -name halt.json -delete",
+            'uv run python -c "from samsulek.risk.state import RiskStateStore"',
+            "python -c 'store.clear_halt(now, \"x\")'",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("Bash", command=cmd), "deny")
+        for path in ["C:\\Users\\me\\samsulek\\State\\halt.json", "/x/STATE/kill.json", "state./halt.json"]:
+            with self.subTest(path=path):
+                self.assertEqual(decide("Write", file_path=path, content="{}"), "deny")
+
+    def test_mixed_case_guardrail_paths_ask(self) -> None:
+        for path in ["C:\\x\\Config\\Risk.yaml", "C:\\x\\.Claude\\Settings.json", "OPS/go_live_checklist.md"]:
+            with self.subTest(path=path):
+                self.assertEqual(decide("Edit", file_path=path, old_string="a", new_string="b"), "ask")
+        for cmd in ["Set-Content Config\\Risk.yaml x", "Remove-Item .claude\\Hooks\\guard.py"]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("PowerShell", command=cmd), "ask")
+
+    def test_live_variants_denied(self) -> None:
+        for cmd in [
+            "uv run samsulek run --m live",
+            "uv run samsulek run --mo live",
+            "uv run samsulek run --mod=live",
+            "LIVE=$(echo true) uv run samsulek run",
+            "${env:LIVE}='true'; uv run samsulek run",
+            "Set-Item -Path Env:LIVE -Value true",
+            "New-Item -Path Env:LIVE -Value true",
+            "reg add HKCU\\Environment /v LIVE /d true /f",
+            "[Environment]::SetEnvironmentVariable('LIVE','true','User')",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("PowerShell", command=cmd), "deny")
+
+    def test_env_dump_variants_denied(self) -> None:
+        for cmd in [
+            "export",
+            "declare -p",
+            "typeset -p",
+            "env -0",
+            "env -u PATH",
+            "/usr/bin/env",
+            "Get-ChildItem -Path Env:",
+            "gci -Path env:",
+            "echo ${env:T212_DEMO_API_KEY}",
+            "v=T212_DEMO_API_KEY; echo ${!v}",
+            "node -e 'console.log(process.env)'",
+            "perl -e 'print %ENV'",
+            "ruby -e 'p ENV'",
+            "python3 -c 'from os import environ; print(environ)'",
+            "python3 -c 'import os; print(os.environb)'",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("Bash", command=cmd), "deny")
+
+    def test_monitor_tool_is_guarded(self) -> None:
+        self.assertEqual(decide("Monitor", command="cat .env"), "deny")
+        self.assertEqual(decide("Monitor", command="samsulek run --mode live"), "deny")
+
+    def test_ordinary_development_still_allowed(self) -> None:
+        for cmd in [
+            "uv run pytest -q",
+            "uv run pytest tests/test_risk_engine.py -q 2>&1 | tail -5",
+            "git add src/samsulek/risk/state.py",
+            "uv run ruff check src tests",
+            "uv run samsulek run",
+            "uv run samsulek kill --flatten",
+            "env PYTHONHASHSEED=0 uv run pytest",
+            "cat README.md",
+            "ls -la",
+            "git log --oneline -5",
+            "source .venv/bin/activate",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(decide("Bash", command=cmd))
+
+    def test_utf8_payload_with_greek_text_is_not_denied(self) -> None:
+        payload = json.dumps(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": "docs/el.md", "content": "Ρυθμίσεις κινδύνου ✓"},
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(HOOK)], input=payload, capture_output=True, timeout=10, check=False
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout.strip(), b"")
+
+
+def find_bash() -> str | None:
+    """The bash Claude Code uses: Git Bash on Windows (never WSL's System32\\bash.exe)."""
+    if os.name == "nt":
+        git = shutil.which("git")
+        if git is None:
+            return None
+        for candidate in (
+            Path(git).resolve().parents[1] / "bin" / "bash.exe",
+            Path(git).resolve().parents[1] / "usr" / "bin" / "bash.exe",
+        ):
+            if candidate.exists():
+                return str(candidate)
+        return None
+    return shutil.which("bash")
+
+
 class Launcher(unittest.TestCase):
     def test_run_guard_launcher_finds_python_and_blocks(self) -> None:
+        bash = find_bash()
+        if bash is None:
+            self.fail("bash not found: on Windows install Git for Windows (it provides Git Bash)")
         payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "printenv"}})
         proc = subprocess.run(
-            ["bash", str(HOOK.parent / "run-guard.sh")],
+            [bash, str(HOOK.parent / "run-guard.sh")],
             input=payload,
             capture_output=True,
             text=True,

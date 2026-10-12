@@ -49,7 +49,31 @@ def scenario(draw: st.DrawFn) -> tuple[PortfolioSnapshot, dict[str, Quote], dict
     held = draw(st.lists(st.sampled_from(SYMBOLS), unique=True, max_size=3))
     positions = {s: Position(s, Market.STOCKS, draw(qtys), Decimal(1)) for s in held}
     cash = draw(money)
-    portfolio = PortfolioSnapshot(cash=cash, positions=positions, ts=T0)
+    # Orders still resting at the broker: they must count toward every limit.
+    open_orders: list[OrderRequest] = []
+    for i in range(draw(st.integers(min_value=0, max_value=2))):
+        sym = draw(st.sampled_from(SYMBOLS))
+        offset = Decimal(draw(st.integers(min_value=-100, max_value=100))) / BPS
+        limit = (quotes[sym].price * (1 + offset)).quantize(TICK)
+        if sym in positions and draw(st.booleans()):
+            qty = min(draw(qtys), positions[sym].quantity)
+            open_orders.append(
+                OrderRequest(f"open-{i}", Market.STOCKS, sym, Side.SELL, qty, OrderType.LIMIT, limit)
+            )
+        else:
+            qty = draw(st.decimals(min_value=Decimal("0.000001"), max_value=Decimal("0.2"), places=6))
+            open_orders.append(
+                OrderRequest(f"open-{i}", Market.STOCKS, sym, Side.BUY, qty, OrderType.LIMIT, limit)
+            )
+    # A broker only accepts resting buys that the cash covers.
+    assume(
+        sum(
+            (o.quantity * o.limit_price for o in open_orders if o.side is Side.BUY and o.limit_price),
+            Decimal(0),
+        )
+        <= cash
+    )
+    portfolio = PortfolioSnapshot(cash=cash, positions=positions, ts=T0, open_orders=tuple(open_orders))
     assume(Decimal("1") <= portfolio.equity(quotes) <= Decimal("190"))
     pos_pct = draw(pcts)
     gross_pct = max(pos_pct, draw(pcts))
@@ -101,19 +125,32 @@ def test_approved_orders_never_break_limits(
         equity = portfolio.equity(quotes)
         notional = qty * limit
         assert lim.min_order_eur <= notional <= lim.max_order_eur
+        buys = [o for o in portfolio.open_orders if o.side is Side.BUY]
+        reserved = sum((o.quantity * o.limit_price for o in buys if o.limit_price), Decimal(0))
+        pending = {
+            s: sum(
+                (
+                    o.quantity * max(o.limit_price, quotes[s].price)
+                    for o in buys
+                    if o.symbol == s and o.limit_price
+                ),
+                Decimal(0),
+            )
+            for s in SYMBOLS
+        }
         if side is Side.BUY:
             assert limit <= ref * (1 + lim.max_slippage_bps / BPS)
-            assert notional <= portfolio.cash
+            assert notional <= portfolio.cash - reserved
             added = qty * max(limit, ref)
-            new_pos = portfolio.position_value(symbol, quotes) + added
+            new_pos = portfolio.position_value(symbol, quotes) + pending[symbol] + added
             assert new_pos <= lim.max_position_pct * equity
             assert new_pos <= lim.max_position_eur
-            new_gross = portfolio.gross_exposure(quotes) + added
+            new_gross = portfolio.gross_exposure(quotes) + sum(pending.values(), Decimal(0)) + added
             assert new_gross <= lim.max_gross_exposure_pct * equity
             assert new_gross <= lim.max_gross_exposure_eur
         else:
             assert limit >= ref * (1 - lim.max_slippage_bps / BPS)
-            assert qty <= portfolio.quantity(symbol)
+            assert qty <= portfolio.sellable_quantity(symbol)
 
 
 @given(
@@ -145,7 +182,7 @@ def test_halted_or_killed_only_reduce_only_exits_pass(
         d = engine.evaluate(o, portfolio, quotes)
         if d.approved:
             assert o.reduce_only and o.side is Side.SELL
-            assert o.quantity <= portfolio.quantity(symbol)
+            assert o.quantity <= portfolio.sellable_quantity(symbol)
 
 
 weights = st.dictionaries(
@@ -179,14 +216,18 @@ def test_sizing_output_is_safe(
         assert o.limit_price is not None
         if o.side is Side.SELL:
             assert not seen_buy, "sells must come before buys"
-            assert o.quantity <= portfolio.quantity(o.symbol)
+            assert o.quantity <= portfolio.sellable_quantity(o.symbol)
             assert o.limit_price >= ref * (1 - lim.max_slippage_bps / BPS)
         else:
             seen_buy = True
             assert o.limit_price <= ref * (1 + lim.max_slippage_bps / BPS)
             buy_cost += o.quantity * o.limit_price
             assert o.quantity * o.limit_price <= lim.max_order_eur
-    assert buy_cost <= portfolio.cash
+    reserved = sum(
+        (o.quantity * o.limit_price for o in portfolio.open_orders if o.side is Side.BUY and o.limit_price),
+        Decimal(0),
+    )
+    assert buy_cost <= portfolio.cash - reserved
     assert len({o.client_id for o in orders}) == len(orders)
 
 
@@ -228,4 +269,6 @@ def test_sizing_and_risk_engine_agree(
                     positions.pop(o.symbol)
                 else:
                     positions[o.symbol] = Position(o.symbol, Market.STOCKS, left, Decimal(1))
-            portfolio = PortfolioSnapshot(cash=cash, positions=positions, ts=T0)
+            portfolio = PortfolioSnapshot(
+                cash=cash, positions=positions, ts=T0, open_orders=portfolio.open_orders
+            )

@@ -19,6 +19,13 @@ class ConfigError(ValueError):
     """Configuration is missing or invalid. The bot refuses to start (fail closed)."""
 
 
+# Fixed locations, relative to the project root. They are deliberately NOT configurable:
+# both files are protected by the guard hook, and a config entry pointing elsewhere
+# would bypass that protection (and the live gate).
+RISK_FILE = Path("config/risk.yaml")
+CHECKLIST_FILE = Path("ops/go_live_checklist.md")
+
+
 class AccountLimits(BaseModel):
     model_config = _STRICT
 
@@ -107,12 +114,19 @@ class AppConfig(BaseModel):
     mode: Mode = Mode.SIM
     state_dir: Path
     log_dir: Path
-    risk_file: Path
-    go_live_checklist: Path
     env_file: Path
     universe: dict[Market, list[str]]
     sim: SimConfig
     alerts: AlertsConfig = AlertsConfig()
+
+    @field_validator("mode")
+    @classmethod
+    def _no_live_in_config(cls, v: Mode) -> Mode:
+        if v is Mode.LIVE:
+            raise ValueError(
+                "live mode can't be set in a config file; it needs `--mode live` on the command line"
+            )
+        return v
 
     @field_validator("universe")
     @classmethod
@@ -137,8 +151,6 @@ class AppConfig(BaseModel):
             update={
                 "state_dir": anchor(self.state_dir),
                 "log_dir": anchor(self.log_dir),
-                "risk_file": anchor(self.risk_file),
-                "go_live_checklist": anchor(self.go_live_checklist),
                 "env_file": anchor(self.env_file),
             }
         )

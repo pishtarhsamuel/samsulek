@@ -118,7 +118,7 @@ def test_above_max_order_rejected(store: RiskStateStore, clock: FixedClock) -> N
 
 def test_insufficient_cash_rejected(engine: RiskEngine) -> None:
     d = engine.evaluate(order("BBB", BUY, "1.2", "10"), pf("10", {"AAA": "0.4"}), QUOTES)  # 12 > 10 cash
-    assert not d.approved and "exceeds cash" in reasons(d)
+    assert not d.approved and "exceeds available cash" in reasons(d)
 
 
 def test_position_pct_cap_rejected(engine: RiskEngine) -> None:
@@ -332,7 +332,7 @@ def test_kill_blocks_buys_but_allows_reduce_only_exit(engine: RiskEngine, store:
 def test_reduce_only_rules(engine: RiskEngine) -> None:
     portfolio = pf("40", {"AAA": "0.1"})
     too_much = engine.evaluate(order("AAA", SELL, "0.2", "98", reduce_only=True), portfolio, QUOTES)
-    assert not too_much.approved and "exceeds position" in reasons(too_much)
+    assert not too_much.approved and "exceeds the sellable position" in reasons(too_much)
     buy = engine.evaluate(order("AAA", BUY, "0.01", "100", reduce_only=True), portfolio, QUOTES)
     assert not buy.approved and "must be sells" in reasons(buy)
     too_cheap = engine.evaluate(order("AAA", SELL, "0.1", "97.99", reduce_only=True), portfolio, QUOTES)
