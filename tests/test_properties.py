@@ -6,15 +6,20 @@ Invariants that must hold for EVERY input:
 - while halted or killed, only reduce-only exits are ever approved
 - sizing output is internally safe (rounding direction, cash, caps)
 - sizing and the risk engine agree: applying planned orders in sequence, the engine approves them all
+- orders pushed toward every limit (with orders already resting on the same symbol) obey an
+  oracle written in the test itself, not the portfolio helpers the engine uses
+
+With stocks only and exposure capped at <= 100% of equity, the exposure cap already implies the
+cash check, so the cash check itself is pinned by unit tests (test_review_regressions.py).
 """
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from hypothesis import assume, given
+from hypothesis import assume, event, given, target
 from hypothesis import strategies as st
 
 from helpers import T0, UNIVERSE, make_risk_config
@@ -183,6 +188,124 @@ def test_halted_or_killed_only_reduce_only_exits_pass(
         if d.approved:
             assert o.reduce_only and o.side is Side.SELL
             assert o.quantity <= portfolio.sellable_quantity(symbol)
+
+
+def _held(portfolio: PortfolioSnapshot, symbol: str) -> Decimal:
+    pos = portfolio.positions.get(symbol)
+    return pos.quantity if pos is not None else Decimal(0)
+
+
+def _claimed_by_open_sells(portfolio: PortfolioSnapshot, symbol: str) -> Decimal:
+    return sum(
+        (o.quantity for o in portfolio.open_orders if o.symbol == symbol and o.side is Side.SELL), Decimal(0)
+    )
+
+
+def _reserved_by_open_buys(portfolio: PortfolioSnapshot) -> Decimal:
+    return sum(
+        (o.quantity * o.limit_price for o in portfolio.open_orders if o.side is Side.BUY and o.limit_price),
+        Decimal(0),
+    )
+
+
+@given(
+    scn=scenario(),
+    symbol=st.sampled_from(SYMBOLS),
+    side=st.sampled_from([Side.BUY, Side.SELL]),
+    notional=st.decimals(min_value=Decimal("0.5"), max_value=Decimal("45"), places=2),
+    size_vs_total=st.booleans(),
+    fraction=st.decimals(min_value=Decimal("0.01"), max_value=Decimal("1.2"), places=2),
+    resting_fraction=st.decimals(min_value=Decimal("0"), max_value=Decimal("0.9"), places=2),
+    limit_offset_bps=st.integers(min_value=-80, max_value=80),
+    reduce_only=st.booleans(),
+)
+def test_orders_near_the_limits_obey_an_independent_oracle(
+    scn: tuple[PortfolioSnapshot, dict[str, Quote], dict[str, object]],
+    symbol: str,
+    side: Side,
+    notional: Decimal,
+    size_vs_total: bool,
+    fraction: Decimal,
+    resting_fraction: Decimal,
+    limit_offset_bps: int,
+    reduce_only: bool,
+) -> None:
+    """Orders sized like real ones and pushed toward every limit, checked by arithmetic written
+    here rather than by the PortfolioSnapshot helpers the engine itself uses.
+
+    Often an order of the same side already rests on the same symbol: it must count (shares it
+    claims can't be sold again; cash it reserves can't be spent again; it adds to the position).
+    """
+    portfolio, quotes, overrides = scn
+    ref = quotes[symbol].price
+    limit = (ref * (1 + Decimal(limit_offset_bps) / BPS)).quantize(TICK)
+    held = _held(portfolio, symbol)
+    if side is Side.SELL:
+        free = held - _claimed_by_open_sells(portfolio, symbol)
+        resting = min(held * resting_fraction, free).quantize(STEP, rounding=ROUND_DOWN)
+        resting_limit = ref * 2  # far above the market: it rests
+    else:
+        free_cash = portfolio.cash - _reserved_by_open_buys(portfolio)
+        resting = (free_cash * resting_fraction / ref).quantize(STEP, rounding=ROUND_DOWN)
+        resting_limit = ref
+    if resting > 0:
+        extra = OrderRequest("rest-1", Market.STOCKS, symbol, side, resting, OrderType.LIMIT, resting_limit)
+        portfolio = PortfolioSnapshot(
+            portfolio.cash, portfolio.positions, T0, open_orders=(*portfolio.open_orders, extra)
+        )
+    claimed = _claimed_by_open_sells(portfolio, symbol)
+    reserved = _reserved_by_open_buys(portfolio)
+    if side is Side.BUY:
+        # Half the time size against ALL cash, reserved or not, so over-spending is tried.
+        budget = portfolio.cash * fraction if size_vs_total else notional
+        qty = (budget / limit).quantize(STEP, rounding=ROUND_DOWN)
+        reduce_only = False
+    else:
+        qty = (held * fraction).quantize(STEP, rounding=ROUND_DOWN)  # vs ALL shares, claimed or not
+    assume(qty > 0)
+    o = OrderRequest("p-3", Market.STOCKS, symbol, side, qty, OrderType.LIMIT, limit, reduce_only=reduce_only)
+    with TemporaryDirectory() as tmp:
+        engine = fresh_engine(tmp, overrides)
+        d = engine.evaluate(o, portfolio, quotes)
+    event("approved" if d.approved else "rejected")
+    target(1.0 if d.approved else 0.0, label="approved")
+    if not d.approved:
+        return
+    lim = engine.config.limits_for(Market.STOCKS)
+    values = {s: p.quantity * quotes[s].price for s, p in portfolio.positions.items()}
+    equity = portfolio.cash + sum(values.values(), Decimal(0))
+    if side is Side.SELL:
+        # Steer the search toward the edge: approved sells as large as possible vs free shares.
+        target(float(qty / max(held - claimed, STEP)), label="sell size / free shares")
+        assert qty <= held - claimed, "never sell shares we don't have or already promised"
+        collar = lim.flatten_max_slippage_bps if reduce_only else lim.max_slippage_bps
+        assert limit >= ref * (1 - collar / BPS)
+        if not reduce_only:
+            assert lim.min_order_eur <= qty * limit <= lim.max_order_eur
+        return
+
+    open_buys = [x for x in portfolio.open_orders if x.side is Side.BUY and x.limit_price is not None]
+
+    def pending(x: OrderRequest) -> Decimal:
+        return x.quantity * max(x.limit_price or Decimal(0), quotes[x.symbol].price)
+
+    added = qty * max(limit, ref)
+    new_position = (
+        values.get(symbol, Decimal(0))
+        + sum((pending(x) for x in open_buys if x.symbol == symbol), Decimal(0))
+        + added
+    )
+    new_gross = sum(values.values(), Decimal(0)) + sum((pending(x) for x in open_buys), Decimal(0)) + added
+    position_cap = min(lim.max_position_pct * equity, lim.max_position_eur)
+    gross_cap = min(lim.max_gross_exposure_pct * equity, lim.max_gross_exposure_eur)
+    target(float(qty * limit / max(portfolio.cash - reserved, Decimal("0.01"))), label="cost / free cash")
+    target(float(new_position / position_cap), label="position / cap")
+    target(float(new_gross / gross_cap), label="exposure / cap")
+    assert lim.min_order_eur <= qty * limit <= lim.max_order_eur
+    assert limit <= ref * (1 + lim.max_slippage_bps / BPS)
+    assert qty * limit <= portfolio.cash - reserved, "never spend cash an open buy already reserved"
+    assert new_position <= position_cap
+    assert new_gross <= gross_cap
 
 
 weights = st.dictionaries(
