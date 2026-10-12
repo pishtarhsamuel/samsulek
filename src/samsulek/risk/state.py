@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -21,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from samsulek.credentials import redact
+from samsulek.fsutil import atomic_write_text
 from samsulek.types import require_aware
 
 HALT_FILE = "halt.json"
@@ -28,6 +28,8 @@ KILL_FILE = "kill.json"
 DAY_FILE = "risk_day.json"
 PEAK_FILE = "equity_peak.json"
 HISTORY_FILE = "state_history.jsonl"
+
+__all__ = ["DayState", "FlagState", "RiskStateStore", "StateCorruptError", "atomic_write_text"]
 
 
 class StateCorruptError(RuntimeError):
@@ -50,25 +52,6 @@ class DayState:
 
     def trades_for(self, key: str) -> int:
         return self.trades.get(key, 0)
-
-
-def atomic_write_text(path: Path, text: str, attempts: int = 5) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    last_exc: OSError | None = None
-    for i in range(attempts):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError as exc:  # Windows: target briefly locked (antivirus, reader)
-            last_exc = exc
-            time.sleep(0.05 * (i + 1))
-    tmp.unlink(missing_ok=True)
-    raise last_exc or OSError(f"could not replace {path}")
 
 
 class RiskStateStore:
