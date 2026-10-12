@@ -1,0 +1,41 @@
+# --- Secrets: never commit ---
+.env
+.env.*
+*.pem
+*.key
+id.json
+*keypair*.json
+.config/solana/
+/secrets/
+
+# --- Runtime data, state, logs (root-anchored so src/samsulek/data/ is kept) ---
+/data/
+/state/
+/logs/
+/reports/
+*.parquet
+*.duckdb
+*.duckdb.wal
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# --- Claude Code personal settings ---
+.claude/settings.local.json
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

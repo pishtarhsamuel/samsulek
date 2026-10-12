@@ -1,0 +1,45 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Edit(./.env)",
+      "Edit(./.env.*)",
+      "Edit(**/.env)",
+      "Edit(**/.env.*)",
+      "Read(~/.config/solana/**)",
+      "Read(**/*keypair*.json)",
+      "Read(**/id.json)",
+      "Bash(printenv)",
+      "Bash(printenv *)",
+      "Bash(env)",
+      "Bash(LIVE=*)",
+      "Bash(export LIVE*)",
+      "Bash(solana-keygen *)",
+      "Bash(solana transfer *)",
+      "Bash(spl-token transfer *)"
+    ],
+    "ask": [
+      "Edit(./.claude/**)",
+      "Edit(./config/risk.yaml)",
+      "Edit(./ops/go_live_checklist.md)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\"",
+            "timeout": 10,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  }
+}
