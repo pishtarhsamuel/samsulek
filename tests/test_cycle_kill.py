@@ -15,6 +15,7 @@ from samsulek.app import App, build_app
 from samsulek.clock import FixedClock
 from samsulek.cycle import run_cycle
 from samsulek.kill import execute_kill
+from samsulek.runlock import RunLock
 from samsulek.strategies.base import LookaheadError, StrategyContext
 from samsulek.types import Bar, Market, Quote
 
@@ -127,16 +128,23 @@ def test_stale_bars_halt(root: Path, clock: FixedClock) -> None:
     assert report.status == "halted" and "Stale or missing data" in report.messages[0]
 
 
-def test_concurrent_run_is_blocked_and_stale_lock_taken_over(root: Path, clock: FixedClock) -> None:
+def test_concurrent_run_is_blocked_and_crashed_run_is_reported(root: Path, clock: FixedClock) -> None:
+    holder = RunLock(root / "state", clock)
+    holder.__enter__()  # another process is mid-run
+    try:
+        assert run_cycle(app_at(root, clock)).status == "blocked"
+    finally:
+        holder.__exit__(None, None, None)
     lock = root / "state" / "run.lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text(json.dumps({"pid": 1, "started": T0.isoformat()}), encoding="utf-8")
-    assert run_cycle(app_at(root, clock)).status == "blocked"
-    clock.advance(timedelta(hours=3))
+    # A run that died mid-way leaves "running" behind, but the OS released its lock.
+    lock.write_text(json.dumps({"pid": 1, "status": "running", "at": T0.isoformat()}), encoding="utf-8")
     app = app_at(root, clock)
     assert run_cycle(app).ok
     assert any("stale run lock" in a[1] for a in app.alerter.sent)
-    assert not lock.exists()
+    assert lock.exists(), (
+        "the lock file is never deleted (deleting it would let two runs lock different files)"
+    )
+    assert json.loads(lock.read_text(encoding="utf-8"))["status"] == "finished"
 
 
 def test_strategy_context_rejects_future_bars() -> None:

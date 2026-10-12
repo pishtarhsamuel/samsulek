@@ -406,6 +406,139 @@ class ReviewBypassesAreClosed(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), b"")
 
 
+class VerificationRoundBypassesAreClosed(unittest.TestCase):
+    """Bypasses and false positives found by the fix-verification round."""
+
+    def test_grep_tool_globs_that_could_match_env(self) -> None:
+        for glob in [
+            "*.env",
+            "**/*.env",
+            "*.env*",
+            "*env",
+            "*env*",
+            "?env",
+            "[.]env",
+            "{README.md,.env}",
+            "*",
+        ]:
+            with self.subTest(glob=glob):
+                self.assertEqual(decide("Grep", pattern="T212_", glob=glob), "deny")
+        for glob in ["*.py", "**/*.md", "src/**/*.py", "*.yaml"]:
+            with self.subTest(glob=glob):
+                self.assertIsNone(decide("Grep", pattern="x", glob=glob))
+
+    def test_windows_wildcards_and_brace_forms(self) -> None:
+        for tool, cmd in [
+            ("PowerShell", "Select-String -Path * -Pattern T212"),
+            ("PowerShell", "findstr TOKEN *"),
+            ("PowerShell", "Get-Content *env"),
+            ("PowerShell", "type *env"),
+            ("PowerShell", "Get-ChildItem -File -Force | Get-Content"),
+            ("Bash", "cat {.,}env"),
+            ("Bash", "cat {,.}env"),
+            ("Bash", "cat .[e]nv"),
+            ("Bash", "cat .?nv"),
+            ("Bash", "ls -a | xargs cat"),
+            ("Bash", "find . -type f -exec cat {} +"),
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide(tool, command=cmd), "deny")
+
+    def test_env_dump_wrappers_and_spellings(self) -> None:
+        for cmd in [
+            "cmd /c set",
+            "cmd /c set T212",
+            'cmd.exe /c "set"',
+            "command env",
+            "bash -c env",
+            "sh -c 'env'",
+            "timeout 5 env",
+            "{ env; }",
+            "if true; then env; fi",
+            "awk 'BEGIN{for(k in ENVIRON) print k}'",
+            "jq -n env",
+            "jq -n '$ENV'",
+            "reg query HKCU\\Environment",
+            "Get-ItemProperty HKCU:\\Environment",
+            "Get-CimInstance Win32_Environment",
+            "cat /proc/self/env*",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("Bash", command=cmd), "deny")
+        for path in ["/proc/self/task/123/environ", "/proc//self/environ", "/proc/./self/environ"]:
+            with self.subTest(path=path):
+                self.assertEqual(decide("Read", file_path=path), "deny")
+
+    def test_persistent_live_via_registry_provider(self) -> None:
+        for cmd in [
+            "Set-ItemProperty -Path HKCU:\\Environment -Name LIVE -Value true",
+            "New-ItemProperty -Path 'HKCU:\\Environment' -Name LIVE -Value 'true'",
+            "Set-ItemProperty HKCU:\\Environment LIVE true",
+            "New-Item -Path Env: -Name LIVE -Value true",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("PowerShell", command=cmd), "deny")
+
+    def test_state_globs_and_git_abbreviations(self) -> None:
+        for tool, cmd in [
+            ("Bash", "rm -rf stat*"),
+            ("PowerShell", "Remove-Item -Recurse -Force stat*"),
+            ("Bash", "rm -f st?te/*.json"),
+            ("Bash", "find . -path '*state*' -name '*.json' -delete"),
+            ("Bash", "git stash push --a"),
+            ("Bash", "git stash push --al"),
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide(tool, command=cmd), "deny")
+
+    def test_ordinary_read_only_commands_are_not_blocked(self) -> None:
+        for tool, cmd in [
+            ("Bash", "uv run pytest -k state 2>&1 | tail -20"),
+            ("PowerShell", "uv run pytest -k state 2>&1"),
+            ("Bash", 'uv run pytest tests/test_risk_engine.py -k "halt or state" -q 2>&1 | tail -5'),
+            ("Bash", "ls state 2>/dev/null || echo none"),
+            ("Bash", "git grep -n RiskStateStore"),
+            ("Bash", "uv run pytest -k RiskStateStore"),
+            ("Bash", "git log -S clear_halt"),
+            ("Bash", "jq '.[0]' logs/decisions-2026-10-12.jsonl"),
+            ("Bash", "jq -c '.[] | .reason' logs/decisions-2026-10-12.jsonl"),
+            ("Bash", 'uv pip install -e ".[dev]"'),
+            ("Bash", 'grep -n "LIVE\\|env file" README.md'),
+            ("Bash", "set -euo pipefail; uv run pytest"),
+            ("Bash", "rm -rf build/*.pyc"),
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(decide(tool, command=cmd))
+
+    def test_code_that_calls_the_state_api_is_blocked(self) -> None:
+        for cmd in [
+            "uv run python -c 'from samsulek.risk.state import RiskStateStore'",
+            "python3 - <<'PY'\nstore.clear_kill(now, 'x')\nPY",
+            "echo 'store.write_peak(x)' | python3",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("Bash", command=cmd), "deny")
+
+    def test_utf8_input_is_decoded_as_utf8_whatever_the_locale(self) -> None:
+        payload = json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": 'git commit -m "Διόρθωση ορίων ✓"'}},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        for encoding in ("cp1252", "cp1253"):
+            with self.subTest(encoding=encoding):
+                env = {**os.environ, "PYTHONIOENCODING": encoding}
+                proc = subprocess.run(
+                    [sys.executable, str(HOOK)],
+                    input=payload,
+                    capture_output=True,
+                    timeout=10,
+                    env=env,
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout.strip(), b"")
+
+
 def find_bash() -> str | None:
     """The bash Claude Code uses: Git Bash on Windows (never WSL's System32\\bash.exe)."""
     if os.name == "nt":

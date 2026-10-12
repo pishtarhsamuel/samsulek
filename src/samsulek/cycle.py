@@ -154,9 +154,10 @@ def _run_locked(app: App, report: CycleReport) -> CycleReport:
         return report
 
     # Orders live for one cycle: cancel anything left over, then re-sync (a fill may race the cancel).
-    if account.open_orders:
+    # Reduce-only exits (e.g. from the kill switch) are never cancelled here.
+    if any(not o.request.reduce_only for o in account.open_orders):
         try:
-            cancelled = app.router.cancel_all()
+            cancelled = app.router.cancel_non_exits()
             app.log.write("stale_orders_cancelled", cancelled=cancelled)
             account = sync_ledger(app)
         except SYNC_ERRORS as exc:
@@ -240,11 +241,19 @@ def _run_locked(app: App, report: CycleReport) -> CycleReport:
             return _fail(app, report, "Cannot sync with broker", str(exc))
         portfolio = portfolio_view(app, account)
 
-    # End of cycle: unfilled orders do not survive until the next run.
+    # A limit tripped by the LAST order (inside evaluate) must not end the run as "done".
+    blocked = app.engine.blocked_reason()
+    if blocked and report.status == "done":
+        app.alerter.alert("critical", "Risk limit hit mid-cycle: trading HALTED", blocked)
+        app.router.cancel_risk_adding()
+        report.status = "halted"
+        report.messages.append(blocked)
+
+    # End of cycle: unfilled orders do not survive until the next run (exits keep working).
     try:
         account = sync_ledger(app)
-        if account.open_orders:
-            cancelled = app.router.cancel_all()
+        if any(not o.request.reduce_only for o in account.open_orders):
+            cancelled = app.router.cancel_non_exits()
             app.log.write("unfilled_orders_cancelled", cancelled=cancelled)
             account = sync_ledger(app)
     except SYNC_ERRORS as exc:

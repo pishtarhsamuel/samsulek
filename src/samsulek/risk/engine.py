@@ -14,6 +14,7 @@ Design rules
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Collection, Mapping
 from dataclasses import replace
 from datetime import timedelta
@@ -74,9 +75,10 @@ class RiskEngine:
         return None
 
     def halt(self, reason: str) -> None:
-        self._store.set_halt(reason, self._clock.now())
+        self._store.set_halt(reason, self._clock.now())  # may raise: callers must know
         if self._log:
-            self._log.write("halt", reason=reason)
+            with contextlib.suppress(Exception):  # the halt is persisted; the log line is best effort
+                self._log.write("halt", reason=reason)
 
     def _today(self) -> DayState | None:
         return self._store.read_day()
@@ -126,7 +128,10 @@ class RiskEngine:
             self.halt(reason)
             return [reason]
         else:
-            start = day.day_start_equity if day.day_start_equity > 0 else equity
+            if day.day_start_equity > 0:
+                start = day.day_start_equity
+            else:  # baseline not observed yet today (an exit was counted first)
+                start = max(day.last_equity, equity) if day.last_equity > 0 else equity
             day = replace(day, day_start_equity=start, last_equity=equity)
         self._store.write_day(day)
 
@@ -157,9 +162,8 @@ class RiskEngine:
         if day is None:
             day = DayState(day=today, day_start_equity=Decimal(0), last_equity=Decimal(0), trades={})
         elif day.day != today:
-            day = DayState(
-                day=today, day_start_equity=day.last_equity, last_equity=day.last_equity, trades={}
-            )
+            # New day, baseline not observed yet: observe_equity sets it to max(last, first).
+            day = DayState(day=today, day_start_equity=Decimal(0), last_equity=day.last_equity, trades={})
         trades = dict(day.trades)
         trades[TOTAL] = trades.get(TOTAL, 0) + 1
         trades[order.market.value] = trades.get(order.market.value, 0) + 1

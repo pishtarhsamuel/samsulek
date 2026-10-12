@@ -25,13 +25,13 @@ _SECRET_NAME = r"[A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE|MNEMONIC|
 _SECRET_NAME_RE = re.compile(rf"(?i)^{_SECRET_NAME}$")
 # Matches NAME=value / NAME: value where NAME looks secret-ish. The value stops at
 # separators so JSON or query strings around it are not swallowed.
-_KV_SECRET_RE = re.compile(rf"(?i)\b({_SECRET_NAME})(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s\"',;}}&]+)")
+_KV_SECRET_RE = re.compile(rf"(?i)\b({_SECRET_NAME})(\s*[=:]\s*)(\"[^\"]*\"?|'[^']*'?|[^\s&]+)")
 # Values of non-secret-looking variables are only redacted when long enough to be
 # unambiguous; short ones ("true", "1234") would corrupt unrelated log text.
 _MIN_PLAIN_VALUE_LEN = 12
 
 LIVE_VAR = "LIVE"
-_LIVE_ONLY_RE = re.compile(r"(?:^|_)LIVE(?:_|$)")
+_LIVE_ONLY_RE = re.compile(r"LIVE", re.I)  # fail closed: any name mentioning LIVE
 
 
 class MissingSecretError(KeyError):

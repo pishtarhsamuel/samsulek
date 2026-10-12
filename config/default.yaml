@@ -7,8 +7,8 @@
 # variable set in the terminal, a typed confirmation, and a signed checklist (M6).
 mode: sim
 
-state_dir: state                # halt/kill flags, ledger, simulated broker (never commit)
-log_dir: logs                   # decision log + app log (never commit)
+# The bot's state (halt/kill flags, ledger, simulated broker) always lives in ./state.
+log_dir: logs                  # decision log + app log (never commit)
 env_file: .env                  # your secrets file (never commit, never share)
 
 # What the bot may trade. Anything else is rejected by the risk engine.

@@ -5,6 +5,7 @@ Every line written anywhere passes through ``redact`` first.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -86,7 +87,10 @@ class DecisionLog:
     def __init__(self, log_dir: Path, clock: Clock) -> None:
         self._dir = log_dir
         self._clock = clock
-        self._dir.mkdir(parents=True, exist_ok=True)
+        # Creating the folder may fail (read-only disk): writes will then raise, and callers
+        # on safety paths (kill, halts) treat log writes as best effort.
+        with contextlib.suppress(OSError):
+            self._dir.mkdir(parents=True, exist_ok=True)
 
     def path_for(self, day: date) -> Path:
         return self._dir / f"decisions-{day.isoformat()}.jsonl"

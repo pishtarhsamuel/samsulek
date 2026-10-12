@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from samsulek.app import App
 from samsulek.cycle import sync_ledger
-from samsulek.runlock import AlreadyRunningError, RunLock
+from samsulek.runlock import RunLock
 from samsulek.types import OrderStatus
 
 
@@ -39,7 +39,10 @@ class KillReport:
         return self.flag_set and not self.errors and not self.not_flattened
 
 
-def execute_kill(app: App, *, flatten: bool, reason: str, lock_wait_seconds: float = 20.0) -> KillReport:
+def execute_kill(
+    app: App, *, flatten: bool, reason: str, lock_wait_seconds: float = 20.0, already_locked: bool = False
+) -> KillReport:
+    """``already_locked``: the caller (the CLI) took the run lock BEFORE loading broker/ledger files."""
     report = KillReport()
     try:
         app.store.set_kill(reason, app.clock.now())
@@ -48,15 +51,23 @@ def execute_kill(app: App, *, flatten: bool, reason: str, lock_wait_seconds: flo
         report.errors.append(f"KILL FLAG NOT PERSISTED: {type(exc).__name__}: {exc}")
     _safe_log(app, report, "kill_switch", reason=reason, flatten=flatten)
 
-    lock = RunLock(app.config.state_dir, app.clock, wait_seconds=lock_wait_seconds)
+    lock: RunLock | None = None
+    if not already_locked:
+        try:
+            lock = RunLock(app.config.state_dir, app.clock, wait_seconds=lock_wait_seconds).__enter__()
+        except Exception as exc:  # busy, unreadable, anything: stopping matters more
+            report.notes.append(
+                f"a trading run may still be active ({type(exc).__name__}: {exc}); proceeding"
+            )
     try:
-        lock.__enter__()
-        have_lock = True
-    except (AlreadyRunningError, OSError) as exc:
-        have_lock = False
-        report.notes.append(f"a trading run may still be active ({exc}); proceeding anyway")
-    try:
+        cancel_errors_before = len(report.errors)
         _cancel(app, report)
+        if len(report.errors) > cancel_errors_before:
+            # Cancel-all failed: retry order by order, so resting strategy sells don't
+            # block the exit (the flatten only sells what isn't already claimed).
+            for oid in app.router.cancel_risk_adding():
+                if oid not in report.cancelled:
+                    report.cancelled.append(oid)
         if flatten:
             _flatten(app, report, reason)
         # Second pass: anything risk-adding a racing cycle managed to send. Our own
@@ -71,7 +82,7 @@ def execute_kill(app: App, *, flatten: bool, reason: str, lock_wait_seconds: flo
         if flatten:
             _verify_flat(app, report)
     finally:
-        if have_lock:
+        if lock is not None:
             lock.__exit__(None, None, None)
 
     body = [f"reason: {reason}", f"cancelled orders: {len(report.cancelled)}"]

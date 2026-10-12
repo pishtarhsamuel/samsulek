@@ -109,25 +109,56 @@ def run_cli(root: Path, *args: str) -> int:
     return cli.main(["--root", str(root), *args])
 
 
+@pytest.fixture
+def no_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """For CLI tests that use the REAL project folder: never load its secrets file or build the bot."""
+
+    def must_not_run(*args: object, **kwargs: object) -> None:
+        raise AssertionError("must not get this far")
+
+    monkeypatch.setattr(cli, "load_env_file", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "build_app", must_not_run)
+
+
+@pytest.mark.usefixtures("no_side_effects")
 def test_cli_live_refused_by_gate(
-    root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("LIVE", "true")
-    assert run_cli(root, "run", "--mode", "live") == cli.EXIT_REFUSED
+    assert run_cli(ROOT, "run", "--mode", "live") == cli.EXIT_REFUSED
     assert "live trading refused" in capsys.readouterr().out
-    assert not (root / "state" / "sim_broker.json").exists(), "nothing ran"
 
 
 def test_cli_live_refused_even_if_gate_passes(
-    root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(cli, "authorize_live", lambda **kw: None)
-    assert run_cli(root, "run", "--mode", "live") == cli.EXIT_REFUSED
+    monkeypatch.setattr(cli, "load_env_file", lambda *a, **kw: None)
+    assert run_cli(ROOT, "run", "--mode", "live") == cli.EXIT_REFUSED
     assert "does not exist yet" in capsys.readouterr().out
 
 
-def test_cli_paper_not_available_yet(root: Path) -> None:
-    assert run_cli(root, "run", "--mode", "paper") == cli.EXIT_REFUSED
+@pytest.mark.usefixtures("no_side_effects")
+@pytest.mark.parametrize("mode", ["paper", "live"])
+def test_cli_real_modes_only_run_from_the_project_folder(
+    root: Path, mode: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A copy of the project elsewhere could carry looser limits or a pre-ticked checklist.
+    monkeypatch.setattr(cli, "authorize_live", lambda **kw: None)
+    (root / "pyproject.toml").write_text("[project]\nname = 'copy'\n", encoding="utf-8")
+    assert run_cli(root, "run", "--mode", mode) == cli.EXIT_REFUSED
+    assert "only runs from the project folder" in capsys.readouterr().out
+    # The real folder, but limits/config from somewhere else: also refused.
+    outside = root / "config" / "default.yaml"
+    assert (
+        cli.main(["--root", str(ROOT), "--config", str(outside), "run", "--mode", mode]) == cli.EXIT_REFUSED
+    )
+    assert "only runs from the project folder" in capsys.readouterr().out
+
+
+def test_cli_paper_not_available_yet(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "load_env_file", lambda *a, **kw: None)
+    assert run_cli(ROOT, "run", "--mode", "paper") == cli.EXIT_REFUSED
 
 
 def test_cli_sim_run_status_kill(root: Path, capsys: pytest.CaptureFixture[str]) -> None:

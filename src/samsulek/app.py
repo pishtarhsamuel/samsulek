@@ -14,7 +14,7 @@ from samsulek.execution.sim_broker import SimBroker
 from samsulek.logging_setup import DecisionLog
 from samsulek.portfolio.ledger import Ledger
 from samsulek.risk.engine import RiskEngine
-from samsulek.risk.state import RiskStateStore
+from samsulek.risk.state import RiskStateStore, StateCorruptError
 from samsulek.strategies.demo import EqualWeightAboveAverageDemo
 from samsulek.types import Market, Mode, Quote
 
@@ -56,7 +56,16 @@ def load_configs(root: Path, config_path: Path) -> tuple[AppConfig, RiskConfig]:
     return config, load_risk_config(root / RISK_FILE)
 
 
-def build_app(root: Path, config_path: Path, mode: Mode | None = None, clock: Clock | None = None) -> App:
+def build_app(
+    root: Path,
+    config_path: Path,
+    mode: Mode | None = None,
+    clock: Clock | None = None,
+    *,
+    allow_unreadable_ledger: bool = False,
+) -> App:
+    """``allow_unreadable_ledger``: for the kill switch only. The broker can still be
+    reached to cancel and close positions even if our own records are damaged."""
     config, risk_config = load_configs(root, config_path)
     mode = mode or config.mode
     if mode is Mode.PAPER:
@@ -78,7 +87,12 @@ def build_app(root: Path, config_path: Path, mode: Mode | None = None, clock: Cl
         clock=clock,
         state_path=config.state_dir / SIM_BROKER_FILE,
     )
-    ledger = Ledger(config.state_dir)
+    try:
+        ledger = Ledger(config.state_dir)
+    except StateCorruptError as exc:
+        if not allow_unreadable_ledger:
+            raise
+        ledger = Ledger.unreadable(config.state_dir, str(exc))
     engine = RiskEngine(risk_config, store, clock, config.universe, log)
     router = OrderRouter(broker, engine, log, alerter, register_order=ledger.remember_order)
     return App(

@@ -35,7 +35,30 @@ class Ledger:
         # an id we never sent, or beyond what we ordered, means someone else traded.
         self.ordered: dict[str, Decimal] = {}
         self.filled: dict[str, Decimal] = {}
+        # Client ids from a ledger written before per-order quantities were tracked.
+        self._legacy_ids: set[str] = set()
+        self._broken: str | None = None
         self._load()
+
+    @classmethod
+    def unreadable(cls, state_dir: Path, reason: str) -> Ledger:
+        """A placeholder for a damaged ledger: every use raises LedgerError (fail closed)."""
+        obj = cls.__new__(cls)
+        obj._path = state_dir / LEDGER_FILE
+        obj.initialized = False
+        obj.cash = Decimal(0)
+        obj.positions = {}
+        obj.last_fill_id = None
+        obj.known_client_ids = []
+        obj.ordered = {}
+        obj.filled = {}
+        obj._legacy_ids = set()
+        obj._broken = reason
+        return obj
+
+    def _check_usable(self) -> None:
+        if self._broken is not None:
+            raise LedgerError(f"ledger unreadable: {self._broken}")
 
     def _load(self) -> None:
         try:
@@ -51,6 +74,8 @@ class Ledger:
             }
             self.last_fill_id = data["last_fill_id"]
             self.known_client_ids = list(data["known_client_ids"])
+            if "ordered" not in data:  # written by an older version: trust its known ids
+                self._legacy_ids = set(self.known_client_ids)
             self.ordered = {k: Decimal(v) for k, v in data.get("ordered", {}).items()}
             self.filled = {k: Decimal(v) for k, v in data.get("filled", {}).items()}
             self.initialized = bool(data["initialized"])
@@ -62,6 +87,7 @@ class Ledger:
             raise StateCorruptError(f"{self._path} is unreadable") from exc
 
     def save(self) -> None:
+        self._check_usable()
         data = {
             "initialized": self.initialized,
             "cash": str(self.cash),
@@ -78,6 +104,7 @@ class Ledger:
 
     def initialize_from(self, account: AccountSnapshot, last_fill_id: str | None) -> None:
         """Adopt the broker's account as the starting point. Only for a brand-new ledger."""
+        self._check_usable()
         if self.initialized:
             raise LedgerError("ledger is already initialised; refusing to overwrite it")
         if account.open_orders:
@@ -90,6 +117,7 @@ class Ledger:
 
     def remember_order(self, order: OrderRequest) -> None:
         """Record an order right before it is sent, so its fills (and only its fills) are accepted."""
+        self._check_usable()
         if order.client_id in self.ordered:
             raise LedgerError(f"client order id {order.client_id} was already used")
         self.known_client_ids.append(order.client_id)
@@ -97,9 +125,12 @@ class Ledger:
         self.save()
 
     def apply_fills(self, fills: Iterable[Fill]) -> int:
+        self._check_usable()
         n = 0
         for f in fills:
             ordered = self.ordered.get(f.client_id)
+            if ordered is None and f.client_id in self._legacy_ids:
+                ordered = f.quantity + self.filled.get(f.client_id, Decimal(0))  # pre-upgrade order
             if ordered is None:
                 raise LedgerError(
                     f"fill {f.fill_id} is for order {f.client_id}, which this bot never sent "
@@ -140,6 +171,7 @@ class Ledger:
 
     def snapshot(self, ts: datetime, open_orders: tuple[OrderRequest, ...] = ()) -> PortfolioSnapshot:
         """Our view of the account. ``open_orders`` come from the broker (they reserve cash/exposure)."""
+        self._check_usable()
         if not self.initialized:
             raise LedgerError("ledger is not initialised")
         return PortfolioSnapshot(

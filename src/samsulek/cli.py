@@ -13,15 +13,25 @@ from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
 
+from samsulek.alerts import ConsoleAlerter
 from samsulek.app import NotAvailableError, build_app, load_configs
 from samsulek.clock import SystemClock, trading_day
-from samsulek.config import CHECKLIST_FILE, ConfigError, RiskConfig
+from samsulek.config import (
+    CHECKLIST_FILE,
+    PACKAGE_PROJECT_ROOT,
+    STATE_DIR,
+    ConfigError,
+    RiskConfig,
+    find_project_root,
+    is_project_root,
+)
 from samsulek.credentials import load_env_file, redact
 from samsulek.cycle import SYNC_ERRORS, halt_and_alert, reconcile_or_halt, run_cycle, sync_ledger
 from samsulek.kill import execute_kill
 from samsulek.live_gate import LiveGateError, authorize_live
 from samsulek.logging_setup import RedactingFilter, setup_logging
 from samsulek.risk.state import RiskStateStore, StateCorruptError
+from samsulek.runlock import RunLock
 from samsulek.terminal import TerminalUnavailableError, confirm_phrase, new_code, require_interactive
 from samsulek.types import Mode
 
@@ -70,6 +80,7 @@ def _print_limits(risk: RiskConfig, equity: Decimal) -> None:
 def _halt_on_startup_failure(state_dir: Path, exc: Exception) -> int:
     """The broker or ledger can't even be loaded: we can't know the account, so halt (fail closed)."""
     reason = f"cannot start: {type(exc).__name__}: {exc}"
+    ConsoleAlerter().alert("critical", "Cannot start: trading HALTED", reason)
     try:
         RiskStateStore(state_dir).set_halt(reason, SystemClock().now())
         _out(f"HALTED: {reason}")
@@ -113,6 +124,17 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     config, risk = load_configs(args.root, args.config)
     mode = Mode(args.mode) if args.mode else config.mode
+    if mode in (Mode.PAPER, Mode.LIVE):
+        # Real accounts only from the installed project folder, with its own reviewed
+        # risk limits and checklist (a copy elsewhere could carry looser ones).
+        config_path = args.config if args.config.is_absolute() else args.root / args.config
+        if (
+            args.root != PACKAGE_PROJECT_ROOT
+            or not is_project_root(args.root)
+            or not config_path.resolve().is_relative_to(PACKAGE_PROJECT_ROOT)
+        ):
+            _out(f"Refused: {mode.value} mode only runs from the project folder {PACKAGE_PROJECT_ROOT}.")
+            return EXIT_REFUSED
     if mode is Mode.LIVE:
         try:
             authorize_live(
@@ -130,9 +152,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     except NotAvailableError as exc:
         _out(f"Refused: {exc}")
         return EXIT_REFUSED
-    except (ConfigError, StateCorruptError):
+    except ConfigError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # incl. a damaged ledger/state file: halt and alert
         return _halt_on_startup_failure(config.state_dir, exc)
     setup_logging(app.config.log_dir)
     report = run_cycle(app)
@@ -144,27 +166,45 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_kill(args: argparse.Namespace) -> int:
     # 1. Set the KILL flag before anything that could fail (config, ledger, broker).
-    state_dir = args.root / "state"
+    state_dir = args.root / STATE_DIR
     try:
         config, _ = load_configs(args.root, args.config)
         state_dir = config.state_dir
     except Exception as exc:
         _out(f"WARNING: config could not be loaded ({type(exc).__name__}: {exc}); using {state_dir}")
+    bot_files = ("kill.json", "halt.json", "ledger.json", "sim_broker.json", "risk_day.json")
+    if not is_project_root(args.root) and not any((state_dir / f).exists() for f in bot_files):
+        _out(f"COULD NOT FIND THE BOT: {args.root} is not the samsulek project folder.")
+        _out("Run this command from inside the samsulek folder (or pass --root). Nothing was changed.")
+        return EXIT_ERROR
     try:
         RiskStateStore(state_dir).set_kill(args.reason, SystemClock().now())
         _out("KILL flag is ON: no new orders will be sent by any run.")
     except Exception as exc:
         _out(f"COULD NOT SET THE KILL FLAG ({type(exc).__name__}: {exc}).")
         _out("Stop the bot by hand (close its window / scheduled task) and check the broker app.")
-    # 2. Cancel orders / close positions. If the app can't even be built, say what to do by hand.
+    # 2. Wait briefly for a running cycle BEFORE loading broker/ledger files, so we don't
+    #    act on (and later write back) a stale copy of them.
+    lock: RunLock | None = None
     try:
-        app = build_app(args.root, args.config, Mode.SIM)
-        setup_logging(app.config.log_dir)
-        report = execute_kill(app, flatten=args.flatten, reason=args.reason)
+        lock = RunLock(state_dir, SystemClock(), wait_seconds=20).__enter__()
+    except Exception as exc:
+        _out(f"NOTE: a trading run may still be active ({type(exc).__name__}: {exc}); proceeding anyway.")
+    # 3. Cancel orders / close positions. If the app can't even be built, say what to do by hand.
+    try:
+        app = build_app(args.root, args.config, Mode.SIM, allow_unreadable_ledger=True)
+        try:
+            setup_logging(app.config.log_dir)
+        except Exception as exc:
+            _out(f"WARNING: file logging unavailable ({type(exc).__name__}: {exc}); continuing.")
+        report = execute_kill(app, flatten=args.flatten, reason=args.reason, already_locked=True)
     except Exception as exc:
         _out(f"Could not cancel orders or close positions automatically ({type(exc).__name__}: {exc}).")
         _out("Cancel open orders and close positions BY HAND in the broker app.")
         return EXIT_ERROR
+    finally:
+        if lock is not None:
+            lock.__exit__(None, None, None)
     _out("It stays on until you run `samsulek reset-halt --clear-kill` yourself.")
     _out(f"Cancelled open orders: {len(report.cancelled)}")
     if args.flatten:
@@ -213,9 +253,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     config, _ = load_configs(args.root, args.config)
     try:
         app = build_app(args.root, args.config, Mode.SIM)
-    except (ConfigError, StateCorruptError):
+    except ConfigError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # incl. a damaged ledger/state file: halt and alert
         return _halt_on_startup_failure(config.state_dir, exc)
     setup_logging(app.config.log_dir)
     try:
@@ -234,7 +274,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="samsulek", description="Fail-closed trading research system.", allow_abbrev=False
     )
-    p.add_argument("--root", type=Path, default=Path.cwd(), help="project folder (default: current folder)")
+    p.add_argument(
+        "--root", type=Path, default=None, help="project folder (default: found from the current folder)"
+    )
     p.add_argument("--config", type=Path, default=Path("config/default.yaml"))
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser(
@@ -281,7 +323,7 @@ def _early_logging() -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     _early_logging()
     args = build_parser().parse_args(argv)
-    args.root = args.root.resolve()
+    args.root = (args.root or find_project_root(Path.cwd()) or Path.cwd()).resolve()
     try:
         return COMMANDS[args.command](args)
     except ConfigError as exc:

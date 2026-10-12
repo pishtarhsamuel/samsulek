@@ -176,7 +176,8 @@ def test_decision_log_stays_valid_json_and_escaped_secrets_are_redacted(tmp_path
     assert 'pa\\"ss' not in raw
     record = json.loads(raw.splitlines()[0])  # still valid JSON
     assert record["flag"] is True
-    assert record["text"] == "api_key=****, other=1"
+    # The separator goes too: over-redacting a comma is safe, leaking ",rest-of-secret" is not.
+    assert record["text"] == "api_key=**** other=1"
 
 
 def test_cli_output_and_persisted_reasons_are_redacted(
@@ -278,35 +279,68 @@ def test_real_tty_opener_reads_what_a_person_types() -> None:
 
 
 # ------------------------------------------------- #25 #26: run lock
-def test_lock_owner_token_and_stale_takeover(state_dir: Path, clock: FixedClock) -> None:
+def test_lock_is_exclusive_however_long_a_run_takes(state_dir: Path, clock: FixedClock) -> None:
     a = RunLock(state_dir, clock)
     a.__enter__()
-    clock.advance(timedelta(hours=3))
+    clock.advance(timedelta(days=2))  # a slow run is never "taken over" by the clock
+    with pytest.raises(AlreadyRunningError):
+        RunLock(state_dir, clock).__enter__()
+    a.__exit__(None, None, None)
+    a.__exit__(None, None, None)  # releasing twice is harmless
+    assert (state_dir / "run.lock").exists(), "never deleted: deleting lets two runs lock different files"
     b = RunLock(state_dir, clock)
     b.__enter__()
-    assert b.took_over_stale
-    a.__exit__(None, None, None)  # A must not delete B's lock
-    assert (state_dir / "run.lock").exists()
-    with pytest.raises(AlreadyRunningError):
-        RunLock(state_dir, clock).__enter__()
+    assert not b.took_over_stale, "the previous run finished cleanly"
     b.__exit__(None, None, None)
-    assert not (state_dir / "run.lock").exists()
 
 
-def test_unreadable_lock_is_stale_only_when_old(state_dir: Path, clock: FixedClock) -> None:
+@pytest.mark.parametrize("left_behind", ['{"status": "running"}', "", "\x00\x00 garbage"])
+def test_a_run_that_died_is_reported(state_dir: Path, clock: FixedClock, left_behind: str) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
-    lock = state_dir / "run.lock"
-    lock.write_text("", encoding="utf-8")
-    fresh = (clock.now() + timedelta(minutes=1)).timestamp()
-    os.utime(lock, (fresh, fresh))
-    with pytest.raises(AlreadyRunningError):
-        RunLock(state_dir, clock).__enter__()
-    old = (clock.now() - timedelta(hours=3)).timestamp()
-    os.utime(lock, (old, old))
-    taken = RunLock(state_dir, clock)
-    taken.__enter__()
-    assert taken.took_over_stale
-    taken.__exit__(None, None, None)
+    (state_dir / "run.lock").write_text(left_behind, encoding="utf-8")
+    lock = RunLock(state_dir, clock)
+    lock.__enter__()
+    assert lock.took_over_stale == (left_behind != "")
+    lock.__exit__(None, None, None)
+
+
+def test_os_releases_the_lock_of_a_killed_process(state_dir: Path, clock: FixedClock) -> None:
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, os\n"
+        "from pathlib import Path\n"
+        "from samsulek.clock import FixedClock\n"
+        "from samsulek.runlock import RunLock\n"
+        "from datetime import datetime, UTC\n"
+        "held = RunLock(Path(sys.argv[1]), FixedClock(datetime(2026, 1, 1, tzinfo=UTC)))\n"
+        "held.__enter__()\n"
+        "print('locked', flush=True)\n"
+        "sys.stdin.readline()\n"
+        "os._exit(9)  # die without releasing anything\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, str(state_dir)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None and child.stdin is not None
+        assert child.stdout.readline().strip() == "locked"
+        with pytest.raises(AlreadyRunningError):
+            RunLock(state_dir, clock).__enter__()
+        child.stdin.write("\n")
+        child.stdin.flush()
+        child.wait(timeout=10)
+    finally:
+        if child.poll() is None:
+            child.kill()
+    after = RunLock(state_dir, clock)
+    after.__enter__()
+    assert after.took_over_stale, "the dead run left status 'running' behind"
+    after.__exit__(None, None, None)
 
 
 def test_lock_waits_for_a_finishing_run(state_dir: Path, clock: FixedClock) -> None:
