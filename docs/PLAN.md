@@ -1,32 +1,33 @@
 # Plan: samsulek
 
-Status: **proposal, waiting for the owner's OK.** Nothing below M1 gets built
-until then.
+Status: **approved by the owner (capital raised to EUR 50, Windows machine).
+M1 built; see §6.**
 
 ## 1. Decisions from your answers
 
 | Topic | Decision | Why |
 |---|---|---|
-| Capital | €10 total | Your answer. Shapes everything below. |
-| Broker | **Trading 212** (Invest account, EUR) | EU-regulated and serves Greece. €0 commission, fractional shares, EUR deposits, a free **demo** account with API access for paper trading. IBKR's minimum commission (~€1+/order) would eat 10% of €10 per trade. Alpaca only takes USD deposits, and an international transfer costs more than €10. |
+| Capital | €50 total | Your answer (raised from €10). Shapes everything below. |
+| Broker | **Trading 212** (Invest account, EUR) | EU-regulated and serves Greece. €0 commission, fractional shares, EUR deposits, a free **demo** account with API access for paper trading. IBKR's minimum commission (~€1+/order) would eat 2% of €50 on every trade. Alpaca only takes USD deposits, and an international wire can cost €10-30. |
 | Account type | Cash (Invest), long-only, no leverage | Safest. No margin calls, no shorting. |
 | What we trade first | **Stocks, specifically EUR-listed UCITS ETFs** | EU retail investors generally can't buy US-domiciled ETFs (PRIIPs/KID rules), and EUR listings avoid Trading 212's FX fee. |
-| Memecoins | **Solana, simulation only** | At €10, fees and token-account rent eat most of a real trade. See §2. |
+| Memecoins | **Solana, simulation only** | Even at €50, fees, token-account rent and MEV eat most of a small trade. See §2. |
 | Strategy speed | Daily bars, one scheduled run per trading day | You check twice a day. Nothing should need you watching. |
 | Paper phase | 1 month minimum on Trading 212 demo | Your answer. Extended if too few trades happen to compare. |
 | Data | €0: free daily ETF data + a free Solana recorder we run ourselves | Your budget. Sources confirmed in M2. |
 | Alerts | Telegram bot | Free, reaches your phone, can accept a `/kill` command locked to your chat ID. |
-| Where it runs | Your machine | This cloud session is for building only and never holds live keys. |
+| Where it runs | Your Windows machine (PowerShell; Git for Windows installed) | This cloud session is for building only and never holds live keys. |
 | LLM/AI signals | Not now; the architecture leaves room for them later | Your answer. |
 
 ## 2. Honest assessment (read this one)
 
-- **€10 can't make meaningful money, whatever the strategy.** A very good
-  strategy earning 15% a year makes €1.50 a year. That's fine *if* we're clear
-  about what the €10 is for: an end-to-end test that real orders, real fills,
+- **€50 can't make meaningful money, whatever the strategy.** A very good
+  strategy earning 15% a year makes €7.50 a year. That's fine *if* we're clear
+  about what the €50 is for: an end-to-end test that real orders, real fills,
   reconciliation, and the kill switch all work with real money, at a risk you
   can shrug off. Everything before M6 (research, backtests, paper trading)
-  costs €0.
+  costs €0. What €50 changes vs €10: 3-4 ETF positions of €10-15 each become
+  practical, and the €1 minimum order is 2% of the account instead of 10%.
 - **Likely research outcome:** simple, well-known strategies on ETFs usually
   show a small edge after costs at best, or none. A realistic good outcome is
   trend-following that cuts drawdowns compared with buy-and-hold, not one that
@@ -34,7 +35,7 @@ until then.
   you money.
 - **Memecoins:** for an automated retail system that isn't competing on speed,
   I expect negative expected returns once fees, rugs, MEV, and failed
-  transactions are counted. On top of that, at €10 each new token account
+  transactions are counted. On top of that, at €50 each new token account
   locks a small SOL deposit, and buying SOL then moving it to a wallet costs
   exchange and withdrawal fees. So: we build the safety filter, recorder, and
   simulator properly, test honestly, and **no live memecoin execution code gets
@@ -95,21 +96,25 @@ A trading day (stocks, paper or live):
 
 Stocks/ETFs (`config/risk.yaml`):
 
-| Limit | Default | At €10 |
+| Limit | Default | At €50 |
 |---|---|---|
-| Max position | 30% of equity | €3 |
-| Max total exposure | 100% of equity (no leverage) | €10 |
-| Max order size, absolute | €5 | €5 |
-| Max total exposure, absolute | €12 | €12 |
-| Min order size | €1 | €1 |
-| Max daily loss | 3% → halt until you run `samsulek reset-halt` | €0.30 |
-| Max drawdown from peak | 15% → halt | €1.50 |
-| Max trades per day | 6 | |
-| Max slippage per order | 0.5% from the reference price (limit-price collar) | |
-| Data staleness | latest bar must be the last completed session | |
+| Max position | 30% of equity | €15 |
+| Max position, absolute | €20 | €20 |
+| Max total exposure | 100% of equity (no leverage) | €50 |
+| Max total exposure, absolute | €60 | €60 |
+| Order size, absolute | €1 min, €20 max | |
+| Max daily loss (overnight gaps count) | 3% → halt until you run `samsulek reset-halt` | €1.50 |
+| Max drawdown from peak | 15% → halt | €7.50 |
+| Equity sanity check | equity above €200 → halt (bug, or a deposit you didn't announce) | |
+| Max trades per day | 6 stocks, 8 total | |
+| Max slippage per order | 0.5% from the reference price (limit-price collar); emergency exits 2% | |
+| Price staleness | reference price older than 15 minutes → refuse | |
+| Data staleness | latest daily bar older than 4 days → halt | |
+| Market orders | not allowed (limit orders only) | |
 
-Memecoins (simulation): max position 5% of equity and 0.5% of pool liquidity;
-max slippage 3%. The safety filter rejects by default. Minimum liquidity, token
+Memecoins (simulation): max position 5% of equity (€2.50, cap €5) and 0.5% of
+pool liquidity; max exposure 20%; max slippage 3%; prices older than 30 s are
+stale; every buy needs a passing safety-filter result. The safety filter rejects by default. Minimum liquidity, token
 age, and holder-concentration thresholds are set in M2 from what the recorder
 actually sees.
 
@@ -123,7 +128,7 @@ samsulek/
 ├── env.example                   # names of the env vars you'll set (no values)
 ├── .claude/
 │   ├── settings.json             # deny rules + hook wiring (done)
-│   └── hooks/guard.py            # guardrail hook (done)
+│   └── hooks/                    # guard.py + run-guard.sh launcher, works on Windows (done)
 ├── config/
 │   ├── default.yaml              # mode, universe, schedule, data sources
 │   └── risk.yaml                 # hard limits (owner-approved edits only)
@@ -137,7 +142,7 @@ samsulek/
 ├── src/samsulek/
 │   ├── cli.py                    # run | kill | reset-halt | reconcile | backtest | report | record-solana
 │   ├── config.py                 # typed config (pydantic), secrets as masked values
-│   ├── secrets.py                # env-only secret access + log redaction
+│   ├── credentials.py            # env-only secret access + log redaction
 │   ├── logging_setup.py          # JSONL decision log, redaction filter
 │   ├── clock.py                  # real vs simulated time, exchange calendars
 │   ├── types.py                  # Bar, Signal, TargetWeights, Order, Fill, Position
@@ -171,8 +176,11 @@ Each one ends with a short summary, how to run it, and a stop for your OK.
   each one.
 - Tests: unit and property-based (Hypothesis) tests for limits, sizing,
   rounding, and halt behavior.
-- Dependencies, each checked on PyPI before adding: `pydantic`, `PyYAML`;
-  dev-only `pytest`, `hypothesis`, `ruff`, `mypy`. Managed with `uv`.
+- Dependencies, each checked on PyPI before adding: `pydantic`, `PyYAML`,
+  `tzdata` (Windows has no built-in timezone database); dev-only `pytest`,
+  `hypothesis`, `ruff`, `mypy`, `types-PyYAML`. Managed with `uv`, locked with
+  hashes, and never newer than a 14-day supply-chain cooldown.
+- **Status: built.** README.md has the Windows steps to run it.
 
 **M2: data pipeline**
 - Free daily data for the ETF universe and research proxies, ECB FX rates, and
@@ -211,16 +219,15 @@ Each one ends with a short summary, how to run it, and a stop for your OK.
 - You sign off on every item: paper roughly matches the backtest, the kill
   switch was tested for real, halts were tested, reconciliation mismatch was
   tested, and alerts arrive.
-- Live with tiny sizes, started by you. You make the €10 deposit yourself.
+- Live with tiny sizes, started by you. You make the €50 deposit yourself.
   Scale up only with money you can afford to lose, gradually, based on live
   results.
 
 ## 7. What you'll need to do, and when
 
-- **Now:** OK this plan (or change it), and tell me which OS your machine runs
-  (Windows / macOS / Linux). It affects setup steps and how the daily run gets
-  scheduled.
-- **M1:** install Python 3.12 and `uv` (I'll give exact steps).
+- **Done:** plan approved, Windows confirmed.
+- **M1 (now):** install Git, Python 3.12 and `uv`, then run the tests and a
+  simulated cycle. README.md has exact copy-paste steps.
 - **M5:** open a Trading 212 account and create a **demo** API key, then create
   a Telegram bot. You put both into `.env` yourself, never in chat.
 - **M6:** deposit, switch to live, and run the go-live checklist. All you, by

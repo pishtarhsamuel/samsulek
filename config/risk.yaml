@@ -1,0 +1,65 @@
+# HARD RISK LIMITS. Every order is checked against these by src/samsulek/risk/engine.py.
+#
+# Editing this file needs the owner's explicit approval (guarded by .claude/hooks/guard.py).
+# Never loosen a limit to make a strategy or a test "work".
+#
+# Units:
+#   *_pct  = fraction of current account equity (0.30 means 30%)
+#   *_eur  = absolute euros. These caps hold even if equity is misread by a bug.
+#   *_bps  = basis points (100 bps = 1%)
+#
+# Sized for a EUR 50 account. When you deposit more, raise the *_eur caps and
+# equity_sanity_max_eur deliberately, in small steps, based on live results.
+
+version: 1
+base_currency: EUR
+
+account:
+  # Loss since the start of the trading day (vs. equity at the first check of the day).
+  # Hitting it HALTS trading until the owner runs `samsulek reset-halt` by hand.
+  max_daily_loss_pct: 0.03          # EUR 1.50 at EUR 50
+  # Loss from the highest equity ever recorded. Also HALTS until a manual reset.
+  max_drawdown_pct: 0.15            # EUR 7.50 at EUR 50
+  # Orders submitted per day, all markets combined.
+  max_trades_per_day: 8
+  # If the broker reports more equity than this, something is wrong (a bug, or a
+  # deposit you didn't tell the bot about). Trading HALTS until you check.
+  equity_sanity_max_eur: 200
+  # Timezone that defines "today" for daily limits.
+  risk_day_timezone: Europe/Athens
+
+markets:
+  stocks:
+    max_position_pct: 0.30          # EUR 15 in any one ETF at EUR 50
+    max_gross_exposure_pct: 1.00    # never more than 100% invested: no leverage
+    max_position_eur: 20
+    max_order_eur: 20
+    max_gross_exposure_eur: 60
+    min_order_eur: 1
+    max_trades_per_day: 6
+    # Limit price must be within 0.5% of the reference price.
+    max_slippage_bps: 50
+    # Emergency exits (kill --flatten) may accept up to 2% worse than reference.
+    flatten_max_slippage_bps: 200
+    # Reference price older than this is "stale": refuse to trade (fail closed).
+    max_quote_age_seconds: 900
+    allow_market_orders: false
+    max_pool_liquidity_pct: null    # not used for stocks
+    require_safety_pass: false
+
+  memecoin:                         # SIMULATION ONLY: no live memecoin execution exists
+    max_position_pct: 0.05
+    max_gross_exposure_pct: 0.20
+    max_position_eur: 5
+    max_order_eur: 5
+    max_gross_exposure_eur: 10
+    min_order_eur: 1
+    max_trades_per_day: 5
+    max_slippage_bps: 300
+    flatten_max_slippage_bps: 1000
+    max_quote_age_seconds: 30
+    allow_market_orders: false
+    # Position may be at most 0.5% of the pool's liquidity, so an exit is possible.
+    max_pool_liquidity_pct: 0.005
+    # Every buy needs a passing safety-filter result (mint/freeze authority, LP, holders, honeypot).
+    require_safety_pass: true

@@ -1,0 +1,32 @@
+# Main settings. Hard risk limits are NOT here: they live in config/risk.yaml.
+
+# sim   = local simulated broker (default, no account needed)
+# paper = Trading 212 demo account (available from milestone M5)
+# live  = real money (milestone M6). Also needs LIVE=true in the terminal, a typed
+#         confirmation at startup, and a fully signed ops/go_live_checklist.md.
+mode: sim
+
+state_dir: state                # halt/kill flags, ledger, simulated broker (never commit)
+log_dir: logs                   # decision log + app log (never commit)
+risk_file: config/risk.yaml
+go_live_checklist: ops/go_live_checklist.md
+env_file: .env                  # your secrets file (never commit, never share)
+
+# What the bot may trade. Anything else is rejected by the risk engine.
+# DEMO_* are synthetic placeholder instruments for M1 plumbing tests only.
+# Real UCITS ETF tickers are chosen in M2 after checking the broker's instrument list.
+universe:
+  stocks: [DEMO_EQUITY, DEMO_BONDS, DEMO_GOLD]
+  memecoin: []
+
+sim:
+  starting_cash_eur: 50
+  fee_eur: 0                    # Trading 212 charges no commission on EUR ETFs
+  fee_bps: 0
+  slippage_bps: 10              # pessimistic 0.10% per fill in simulation
+  quantity_step: "0.000001"     # fractional shares
+  price_tick: "0.0001"
+  seed: 7
+
+alerts:
+  telegram_enabled: false       # set up in M5

@@ -12,9 +12,12 @@ blow up the account. Optimize for risk-adjusted returns and survival, not
 headline returns.
 
 Owner context (drives every design decision):
-- Capital at risk: **€10 total**. Greek (EU) resident. Beginner at coding and
+- Capital at risk: **€50 total**. Greek (EU) resident. Beginner at coding and
   trading: explain in plain language, give exact copy-paste commands, say what
   can go wrong.
+- Owner's machine: **Windows** (PowerShell; Git for Windows, Python 3.12 from
+  python.org, uv). Keep CLI output ASCII-only, keep LF line endings, and make
+  sure paths, encodings and console handling work on Windows.
 - Stock broker: **Trading 212** (Invest account, EUR). Paper = its demo
   environment. Its public API is beta: verify current docs before integrating.
 - Checks in twice a day → **daily-bar strategies only**, one scheduled run per
@@ -63,9 +66,14 @@ Owner context (drives every design decision):
 ## Enforcement, not just guidance
 
 - `.claude/settings.json` (permission deny rules) and `.claude/hooks/guard.py`
-  (PreToolUse hook) block: starting the bot in live mode, reading or writing
-  `.env*` and keypair files, dumping environment variables, moving funds via
-  CLI, and (with an approval prompt) editing the guardrail files themselves.
+  (PreToolUse hook, launched by `run-guard.sh` on any OS) block: starting the
+  bot in live mode, resetting a halt or clearing the kill switch, writing to
+  the bot's `state/` directory, `git clean -x`, reading or writing `.env*` and
+  keypair files, dumping environment variables, and moving funds via CLI.
+  Editing the guardrail files, `config/risk.yaml` or `ops/go_live_checklist.md`
+  needs an approval prompt.
+- The hook scans whole Bash commands, including heredocs and commit messages:
+  use the Edit/Write tools for file content that mentions blocked words.
 - Do not try to work around a block (no path tricks, encodings, or indirection).
   If a block looks wrong, stop and ask the owner.
 - Changes to `.claude/`, limits in `config/risk.yaml`, or
@@ -142,5 +150,18 @@ site, say so; don't guess from memory.
 
 ## Commands
 
-- Guardrail hook tests (stdlib only): `python3 -m unittest discover -s tests -v`
-- (More commands are added here as each milestone lands.)
+Development (from the repo root):
+- Install / update dependencies: `uv sync`
+- All tests: `uv run pytest`
+- Lint and format: `uv run ruff check src tests` and `uv run ruff format src tests`
+- Strict type check: `uv run mypy`
+- Guardrail hook tests without any dependencies: `python3 -m unittest tests.test_guard_hook`
+
+The bot (sim mode by default; paper arrives in M5, live in M6):
+- `uv run samsulek check-config`: validate config, print the limits in euros
+- `uv run samsulek run`: one trading cycle
+- `uv run samsulek status`: halt / kill switch / daily counters
+- `uv run samsulek reconcile`: compare ledger with broker, halt on mismatch
+- `uv run samsulek kill [--flatten]`: emergency stop (Claude may run this one)
+- Owner only, at a real terminal: the `reset-halt` command (flags `--clear-kill`,
+  `--rebase-peak`), which asks for a typed code

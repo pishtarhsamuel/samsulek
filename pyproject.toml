@@ -1,0 +1,63 @@
+[project]
+name = "samsulek"
+version = "0.1.0"
+description = "Honest research pipeline and fail-closed execution for a tiny ETF / memecoin trading system"
+readme = "README.md"
+requires-python = ">=3.12"
+# Exact pins. Each package was checked on PyPI (name, maintainer, source repo,
+# release history) before being added. Hashes live in uv.lock.
+dependencies = [
+  "pydantic==2.13.5",
+  "PyYAML==6.0.3",
+  "tzdata==2026.4",          # timezone database; Windows has none built in
+]
+
+[project.scripts]
+samsulek = "samsulek.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest==9.1.1",
+  "hypothesis==6.168.2",
+  "ruff==0.16.9",
+  "mypy==2.3.1",
+  "types-PyYAML==6.0.12.20260906",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv]
+# Supply-chain cooldown: never resolve a release newer than this date.
+# Bump deliberately (and re-verify packages) when upgrading.
+exclude-newer = "2026-09-28T00:00:00Z"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "DTZ", "PT", "PL"]
+ignore = [
+  "PLR0911", "PLR0912", "PLR0913", "PLR0915",  # risk checks are long by nature
+  "PLR2004",                                    # magic values are fine in checks/tests
+  "S311",                                       # random is used for simulation, not crypto
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S603", "S607", "S108", "PLC0415", "PLR0917", "PT009", "PT018"]
+".claude/hooks/guard.py" = ["S", "PLW"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["samsulek"]
+plugins = ["pydantic.mypy"]
+warn_unreachable = true

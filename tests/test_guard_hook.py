@@ -9,6 +9,7 @@ these tests also prove the script starts and fails closed. Stdlib only:
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import unittest
@@ -67,7 +68,7 @@ class LiveModeIsBlocked(unittest.TestCase):
         for cmd in [
             "samsulek run --mode paper",
             "samsulek kill --flatten",
-            "samsulek reset-halt",
+            "samsulek status",
             "python3 -m pytest -q",
             "grep -n LIVE CLAUDE.md",
             "echo is alive=1",
@@ -112,7 +113,13 @@ class SecretsAreBlocked(unittest.TestCase):
                 self.assertEqual(decide("Bash", command=cmd), "deny")
 
     def test_gitignore_bypassing_search_denied(self) -> None:
-        for cmd in ["grep -r API_KEY .", "grep -Rn secret", "rg --no-ignore TOKEN", "rg -uu KEY", "rg --hidden x"]:
+        for cmd in [
+            "grep -r API_KEY .",
+            "grep -Rn secret",
+            "rg --no-ignore TOKEN",
+            "rg -uu KEY",
+            "rg --hidden x",
+        ]:
             with self.subTest(cmd=cmd):
                 self.assertEqual(decide("Bash", command=cmd), "deny")
 
@@ -199,6 +206,90 @@ class GuardrailEditsNeedOwnerApproval(unittest.TestCase):
         for cmd in ["cat .claude/settings.json", "head config/risk.yaml", "git diff .claude/"]:
             with self.subTest(cmd=cmd):
                 self.assertIsNone(decide("Bash", command=cmd))
+
+
+class OwnerOnlyActionsAndBotState(unittest.TestCase):
+    def test_halt_reset_and_kill_clear_denied(self) -> None:
+        for cmd in ["uv run samsulek reset-halt", "samsulek reset-halt --clear-kill", "x --clear-kill"]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("Bash", command=cmd), "deny")
+
+    def test_state_tampering_denied(self) -> None:
+        for cmd in [
+            "rm -rf state/",
+            "rm -rf state",
+            "rm state/halt.json",
+            "echo {} > state/halt.json",
+            "Remove-Item state\\kill.json",
+            "del state\\halt.json",
+            "python3 -c \"open('state/halt.json','w')\"",
+            "mv state/kill.json /tmp/",
+            "git clean -fdx",
+            "git clean -xfd",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("Bash", command=cmd), "deny")
+        for path in ["state/halt.json", "C:\\Users\\me\\samsulek\\state\\kill.json", "/x/state/ledger.json"]:
+            for tool in ("Write", "Edit"):
+                with self.subTest(tool=tool, path=path):
+                    self.assertEqual(decide(tool, file_path=path, content="{}"), "deny")
+
+    def test_reading_state_and_normal_work_allowed(self) -> None:
+        for cmd in [
+            "cat state/halt.json",
+            "ls state",
+            "uv run samsulek status",
+            "uv run samsulek kill --flatten",
+            'git commit -m "add risk state store; move code"',
+            "uv run pytest -q",
+            "git clean -n",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(decide("Bash", command=cmd))
+        self.assertIsNone(decide("Read", file_path="state/halt.json"))
+        self.assertIsNone(
+            decide("Edit", file_path="src/samsulek/risk/state.py", old_string="a", new_string="b")
+        )
+
+
+class WindowsSpellings(unittest.TestCase):
+    def test_powershell_and_cmd_secret_reads_denied(self) -> None:
+        for cmd in [
+            "echo $env:T212_API_KEY",
+            "Write-Output $env:TELEGRAM_BOT_TOKEN",
+            "[Environment]::GetEnvironmentVariable('T212_API_SECRET')",
+            "[System.Environment]::GetEnvironmentVariables()",
+            "gc env:T212_API_KEY",
+            "Get-Item env:SECRET_X",
+            "echo %T212_API_SECRET%",
+            "Get-Content .env",
+            "type .env",
+            "Select-String -Path * -Pattern KEY -Recurse",
+            "findstr /s KEY *",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("PowerShell", command=cmd), "deny")
+
+    def test_powershell_guardrail_edits_ask(self) -> None:
+        for cmd in ["Remove-Item .claude\\hooks\\guard.py", "Set-Content config\\risk.yaml x"]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("PowerShell", command=cmd), "ask")
+
+
+@unittest.skipUnless(shutil.which("bash"), "bash not available")
+class Launcher(unittest.TestCase):
+    def test_run_guard_launcher_finds_python_and_blocks(self) -> None:
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "printenv"}})
+        proc = subprocess.run(
+            ["bash", str(HOOK.parent / "run-guard.sh")],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
 
 
 class FailsClosed(unittest.TestCase):

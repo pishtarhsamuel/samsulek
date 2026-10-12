@@ -1,0 +1,6 @@
+# Keep LF line endings on every OS. Windows Git would otherwise convert to CRLF,
+# which breaks bash scripts (the Claude Code guard hook) with "\r" errors.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
