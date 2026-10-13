@@ -206,6 +206,11 @@ Each one ends with a short summary, how to run it, and a stop for your OK.
   verified free source yet**: every option checked so far either forbids
   automated downloads or couldn't be reached from the build environment, so
   the owner is checking Stooq from their own PC.
+- Reviewed: each source adapter by a second, skeptical pass; then M2 as a
+  whole by independent reviewers (point-in-time correctness, fail-closed
+  behaviour, security, then Windows and weeks-long running, plus a check of
+  the fixes): 25 confirmed issues, all fixed with tests. The tests were checked
+  to fail when each fix is undone (44 deliberate re-introductions, all caught).
 
 **M3: backtester**
 - Event-driven, reusing M1's strategy, risk, and sim-broker code. Decisions at
