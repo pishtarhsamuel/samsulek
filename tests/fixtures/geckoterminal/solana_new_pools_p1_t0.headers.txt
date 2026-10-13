@@ -1,0 +1,28 @@
+HTTP/1.1 200 Connection Established
+
+HTTP/2 200 
+date: Mon, 12 Oct 2026 21:13:49 GMT
+content-type: application/json; charset=utf-8
+content-length: 35466
+x-frame-options: SAMEORIGIN
+x-xss-protection: 1; mode=block
+x-content-type-options: nosniff
+x-download-options: noopen
+x-permitted-cross-domain-policies: none
+referrer-policy: strict-origin-when-cross-origin
+cache-control: max-age=30, public, must-revalidate, s-maxage=60
+vary: Accept, Origin, accept-encoding
+etag: W/"9469f6d0dfc0b8733105adf357a2677c"
+x-gt-env: qa-3tm
+x-request-id: 1aa2fe97-36c6-43da-99f5-a9d105f049ca
+x-runtime: 0.308032
+x-content-digest: e203fd69d8977588928bc7bd7823af7f3b30d81a
+x-rack-cache: stale, invalid, ignore, store
+accept-ranges: bytes
+age: 23
+cf-cache-status: HIT
+speculation-rules: "/cdn-cgi/speculation"
+server: cloudflare
+cf-ray: a4991c526d8c15b7-IAD
+alt-svc: h3=":443"; ma=86400
+

@@ -1,0 +1,31 @@
+requested_at_utc: 2026-10-12T21:29:56Z
+url: https://api.mainnet-beta.solana.com
+method: getTokenLargestAccounts
+http_status: 429
+latency_s: 0.496
+bytes: 107
+user_agent: samsulek-research/0.1 (M2 data-source check; low volume)
+
+content-type: application/json
+retry-after: 10
+access-control-max-age: 86400
+access-control-allow-origin: *
+cache-control: no-cache
+content-length: 107
+access-control-allow-methods: POST, GET, OPTIONS
+x-rpc-node: pit186
+x-ratelimit-tier: free
+x-ratelimit-method-limit: 0
+x-ratelimit-method-remaining: -1
+x-ratelimit-rps-limit: 250
+x-ratelimit-rps-remaining: 234
+x-ratelimit-endpoint-limit: unlimited
+x-ratelimit-endpoint-remaining: -26304
+x-ratelimit-conn-limit: 40
+x-ratelimit-conn-remaining: 39
+x-ratelimit-connrate-limit: 40
+x-ratelimit-connrate-remaining: 39
+x-ratelimit-pubsub-limit: 10
+x-ratelimit-pubsub-remaining: 10
+alt-svc: h3=":443"; ma=60
+connection: close

@@ -17,6 +17,12 @@ id.json
 *.duckdb
 *.duckdb.wal
 
+# --- Recorded provider data kept out of the public repo (see tests/withheld.py) ---
+/tests/fixtures/geckoterminal/solana_new_pools_p1_r2.json
+/tests/fixtures/geckoterminal/solana_new_pools_p1_t0.json
+/tests/fixtures/geckoterminal/solana_new_pools_p2_r5.json
+/tests/fixtures/dexscreener/pairs_solana_batch30_new_gt.json
+
 # --- Python ---
 __pycache__/
 *.py[cod]

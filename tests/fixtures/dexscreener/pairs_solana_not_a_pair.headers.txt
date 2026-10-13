@@ -1,0 +1,18 @@
+HTTP/1.1 200 Connection Established
+
+HTTP/2 200 
+date: Mon, 12 Oct 2026 21:22:36 GMT
+content-type: application/json; charset=utf-8
+set-cookie: __cf_bm=REDACTED; HttpOnly; SameSite=None; Secure; Path=/; Domain=dexscreener.com; Expires=Mon, 12 Oct 2026 21:52:36 GMT
+access-control-allow-origin: *
+access-control-allow-credentials: true
+etag: W/"32-O/CojxxRW41D074XHef5GUMKuyY"
+vary: Accept-Encoding
+vary: Accept-Encoding
+expires: Mon, 12 Oct 2026 21:23:06 GMT
+cache-control: public, max-age=30
+cf-cache-status: REVALIDATED
+server: cloudflare
+cf-ray: a49929343fcf0de2-IAD
+alt-svc: h3=":443"; ma=86400
+
