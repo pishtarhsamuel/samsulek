@@ -124,6 +124,18 @@ def test_retry_after_is_honoured_and_too_long_waits_raise() -> None:
     assert sleeps3 == [2.0]
 
 
+def test_api_keys_in_the_url_never_reach_logs_or_errors(caplog: pytest.LogCaptureFixture) -> None:
+    keyed = f"https://{HOST}/SECRETPATHTOKEN/rpc?api-key=SECRETQUERY"
+    caplog.set_level("INFO", logger="samsulek.net.http")
+    script = Script(*[http_error(503) for _ in range(4)])
+    with pytest.raises(HttpError) as err:
+        client(script, []).post_json(keyed, {"jsonrpc": "2.0"})
+    assert "retrying POST" in caplog.text, "the retry log line itself is kept"
+    for text in (caplog.text, str(err.value), err.value.url, repr(err.value.args)):
+        assert "SECRET" not in text
+    assert err.value.url == f"https://{HOST}"
+
+
 def test_gives_up_after_the_retry_budget() -> None:
     script = Script(*[http_error(429) for _ in range(4)])
     with pytest.raises(RateLimitedError, match="gave up after 4 attempts") as err:

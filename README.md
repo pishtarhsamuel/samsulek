@@ -9,11 +9,13 @@ the account.
 - The non-negotiable rules: [CLAUDE.md](CLAUDE.md)
 - Hard risk limits: [config/risk.yaml](config/risk.yaml)
 
-**Status: milestone M1.** The safety skeleton is done: risk engine, kill switch,
-halts, ledger, reconciliation, live-mode gate, and tests. It trades **fake
-instruments with fake prices** in a local simulator. There is no real data
-yet (M2), no strategy research yet (M3/M4), no broker connection yet (M5), and
-no live trading (M6).
+**Status: milestone M2 (data).** The safety skeleton from M1 is done: risk
+engine, kill switch, halts, ledger, reconciliation, live-mode gate, and tests.
+It trades **fake instruments with fake prices** in a local simulator. M2 adds
+real research data: euro exchange rates and a recorder for new Solana tokens
+(simulation research only). ETF prices are still missing (no verified free
+source yet). There is no strategy research yet (M3/M4), no broker connection
+yet (M5), and no live trading (M6).
 
 ---
 
@@ -183,6 +185,79 @@ Remove-Item -Recurse -Force state
 
 ---
 
+## Research data (M2): nothing here can trade
+
+### Exchange rates
+
+```powershell
+uv run samsulek data update
+uv run samsulek data status
+```
+
+`data update` downloads the European Central Bank's daily euro rates (USD, GBP,
+CHF) since 1999. The first run takes about a minute; later runs only fetch the
+last 30 days, so a correction by the ECB is kept as a new version. If a
+download fails, nothing from that attempt is stored, and it says so.
+
+### The Solana recorder
+
+Memecoin research needs data that includes every token, the ones that
+collapsed within minutes too. Nobody gives that away for free, so the recorder
+writes it down as it happens, from now on:
+
+- every new pool that GeckoTerminal's free feed shows,
+- for a random quarter of them, a DexScreener snapshot 5 min, 15 min, 1 h, 4 h,
+  24 h and 72 h after launch,
+- facts about each token from the Solana network itself (who can still mint
+  more tokens or freeze wallets), pump.fun bonding-curve states, and holder
+  lists for a smaller sample,
+- every gap: when the recorder was off, when a source was down, and when the
+  feed moved faster than it could read it.
+
+Start it in its own PowerShell window and leave that window open:
+
+```powershell
+uv run samsulek record solana
+```
+
+It prints a short progress line every 30 minutes. **Stop it with Ctrl+C**
+(wait for `Recorder stopped`). To try it for a few minutes first:
+`uv run samsulek record solana --minutes 5`.
+
+To see what it did in the last 24 hours, from any other window:
+
+```powershell
+uv run samsulek record status
+```
+
+What to expect:
+
+- It only records while it runs. If your PC sleeps or is switched off, that
+  time is lost for good (there is no free way to fetch it later), and the gap
+  is written down. In Windows Settings > System > Power, set "When plugged in,
+  put my device to sleep after" to **Never** while you record.
+- Disk space: roughly 100-300 MB per day of recording (estimated from a short
+  test run; it depends on how many tokens are launched). The newest 7 days stay
+  as plain text, so expect up to about 2 GB. Older days are packed into Parquet
+  files several times smaller, automatically once a day (or run
+  `uv run samsulek record compact` while the recorder is stopped).
+- `GAP discovery_overrun` is normal: Solana creates new pools faster than the
+  free feed lets us read them, so discovery is incomplete. `record status`
+  shows how many pump.fun launches it caught.
+- `SOURCE DOWN` means a provider is failing; the recorder pauses it and tries
+  again by itself (30 s, then longer, up to 10 minutes).
+- `TASK SWITCHED OFF` means a provider answered with something the code doesn't
+  recognise, or blocked us. That part stays off until you restart the
+  recorder: it never guesses. Send me the `record status` output.
+- If the Solana part keeps failing with "Tunnel" or "403" errors, the network
+  is blocking the official RPC address. You can switch to the older address
+  by adding this to `config\default.yaml` under `data:` and restarting:
+  `recorder: {solana_rpc_url: "https://api.mainnet-beta.solana.com"}`
+- DexScreener's terms forbid passing its data on: keep the recordings to
+  yourself (the `data` folder is never uploaded).
+
+---
+
 ## Where things are
 
 | What | Where |
@@ -190,6 +265,8 @@ Remove-Item -Recurse -Force state
 | Every decision and its reason, one JSON line each | `logs\decisions-YYYY-MM-DD.jsonl` |
 | App log | `logs\samsulek.log` |
 | Halt / kill flags, daily counters, ledger, simulated broker | `state\` (never edit by hand while the bot runs) |
+| Research data: exchange rates, Solana recordings | `data\` (never uploaded; don't share the recordings) |
+| What each dataset contains and misses | `research\data_notes.md` |
 | Hard risk limits | `config\risk.yaml` |
 | Go-live checklist (live mode refuses to start until it's complete) | `ops\go_live_checklist.md` |
 

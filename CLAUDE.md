@@ -178,3 +178,10 @@ at a time (OS lock on `state/run.lock`, released by the OS if a run dies):
   exits 1: tell the owner to run it in the folder the bot really runs from
 - Owner only, at a real terminal: the `reset-halt` command (flags `--clear-kill`,
   `--rebase-peak`), which asks for a typed code
+
+Research data (M2; nothing here can trade):
+- `uv run samsulek data update` / `data status`: ECB FX rates into the point-in-time store
+- `uv run samsulek record solana [--minutes N]`: the Solana new-pool recorder, until
+  Ctrl+C (one at a time; lock on `data/solana/run.lock`)
+- `uv run samsulek record status`: the last 24 hours (gaps, outages, switched-off tasks)
+- `uv run samsulek record compact`: journal days older than 7 days into Parquet

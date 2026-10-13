@@ -43,7 +43,7 @@ class HttpError(RuntimeError):
 
     def __init__(self, message: str, *, url: str, status: int | None = None, body: str = "") -> None:
         super().__init__(message)
-        self.url = url
+        self.url = redact_url(url)  # scheme and host only: paths and queries can carry API keys
         self.status = status
         self.body = body  # first 2 KB of an error response, for callers that must read it
 
@@ -179,7 +179,7 @@ class HttpClient:
         if host not in self.allowed_hosts:
             raise HttpError(f"host {host!r} is not on this client's allow-list", url=url)
         if parts.username or parts.password:
-            raise HttpError("credentials in URLs are not allowed", url=_strip_userinfo(url))
+            raise HttpError("credentials in URLs are not allowed", url=url)
         return host
 
     def _request(self, method: str, url: str, body: bytes | None, headers: Mapping[str, str]) -> Response:
@@ -213,7 +213,7 @@ class HttpClient:
                         url=url,
                         status=exc.status,
                     ) from exc
-                log.info("retrying %s %s in %.1fs: %s", method, url, wait, exc)
+                log.info("retrying %s %s in %.1fs: %s", method, redact_url(url), wait, exc)
                 self.sleep(wait)
                 continue
             return response
@@ -304,9 +304,14 @@ def _excerpt(body: bytes, limit: int = 200) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
-def _strip_userinfo(url: str) -> str:
-    parts = urllib.parse.urlsplit(url)
-    netloc = parts.hostname or ""
-    if parts.port:
-        netloc += f":{parts.port}"
-    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+def redact_url(url: str) -> str:
+    """``https://host[:port]`` only. RPC providers put API keys in the path or the query
+    string, so neither may reach a log line or an error message."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        netloc = parts.hostname or ""
+        if parts.port:
+            netloc += f":{parts.port}"
+    except ValueError:
+        return "<unparseable url>"
+    return f"{parts.scheme}://{netloc}"

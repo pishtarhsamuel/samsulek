@@ -59,6 +59,7 @@ def _parse(ts: object) -> datetime | None:
 @dataclass
 class Health:
     last_beat: datetime | None = None
+    stopped_at: datetime | None = None  # a clean stop after the latest start
     counts: dict[str, int] = field(default_factory=dict)
     gap_count: dict[str, int] = field(default_factory=dict)
     gap_seconds: dict[str, float] = field(default_factory=dict)
@@ -66,14 +67,21 @@ class Health:
     disabled: list[str] = field(default_factory=list)
     pump_launches: int = 0
     pump_pools_found: int = 0
+    unreadable_mints: int = 0
 
     def running(self, now: datetime) -> bool:
-        return self.last_beat is not None and now - self.last_beat < RUNNING_IF_BEAT_WITHIN
+        return (
+            self.stopped_at is None
+            and self.last_beat is not None
+            and now - self.last_beat < RUNNING_IF_BEAT_WITHIN
+        )
 
     def lines(self, now: datetime) -> list[str]:
         out: list[str] = []
         if self.last_beat is None:
             out.append("Recorder: never ran (no heartbeat yet).")
+        elif self.stopped_at is not None:
+            out.append(f"Recorder: STOPPED cleanly at {self.stopped_at:%Y-%m-%d %H:%M} UTC")
         else:
             state = "RUNNING" if self.running(now) else "NOT RUNNING"
             age = int((now - self.last_beat).total_seconds())
@@ -91,6 +99,11 @@ class Health:
             out.append(f"  SOURCE DOWN (not recovered yet): {outage}")
         for task in self.disabled:
             out.append(f"  TASK SWITCHED OFF in the current run: {task}")
+        if self.unreadable_mints:
+            out.append(
+                f"  MINT FACTS UNREADABLE for {self.unreadable_mints} token(s) (each rejected);"
+                " many of them means the provider's format changed"
+            )
         if self.pump_launches:
             share = self.pump_pools_found / self.pump_launches
             out.append(
@@ -128,7 +141,10 @@ def health(root: Path, now: datetime) -> Health:
         event = r.get("event")
         if event == "start":
             last_start = _parse(r.get("recorded_at"))
+            h.stopped_at = None
             down.clear()
+        elif event == "stop":
+            h.stopped_at = _parse(r.get("recorded_at"))
         elif event == "gap":
             kind = str(r.get("kind"))
             h.gap_count[kind] = h.gap_count.get(kind, 0) + 1
@@ -152,7 +168,12 @@ def health(root: Path, now: datetime) -> Health:
         if not r.get("baseline")
     )
     h.pump_pools_found = sum(1 for r in recent["pools"] if r.get("dex_id") == PUMP_FUN_DEX)
+    h.unreadable_mints = sum(1 for r in recent["mint_facts"] if _unreadable(r.get("facts")))
     return h
+
+
+def _unreadable(facts: object) -> bool:
+    return isinstance(facts, dict) and str(facts.get("reason", "")).startswith("unreadable")
 
 
 def _int(value: object) -> int:

@@ -32,12 +32,20 @@ from samsulek.clock import Clock
 from samsulek.data.recorder.coverage import Coverage
 from samsulek.data.recorder.journal import Journal
 from samsulek.data.recorder.schedule import Due, SnapshotSchedule, in_sample
+from samsulek.data.sources.solana_rpc import SolanaRpcError
 from samsulek.net.http import HttpError
 
 log = logging.getLogger(__name__)
 
 MINUTE = timedelta(minutes=1)
 PUMP_FUN_DEX = "pump-fun"  # GeckoTerminal's dex id for pump.fun bonding curves
+# JSON-RPC errors that only mean "ask again shortly" (verified 2026-10-13): -32005 node is
+# behind (docs, getHealth), -32016 minimum context slot not reached (agave CHANGELOG). Any
+# other RPC error code switches the task off: never guess past an error we don't know.
+TRANSIENT_RPC_CODES = frozenset({-32005, -32016})
+# A source that fails transiently is left alone for 30 s, then 1, 2, 4, 8 and at most 10 min.
+SOURCE_PAUSE_FIRST = timedelta(seconds=30)
+SOURCE_PAUSE_MAX = timedelta(minutes=10)
 
 
 # --------------------------------------------------------------- source shapes
@@ -220,6 +228,8 @@ class SolanaRecorder:
         self._last_creation_sig: str | None = None
         self._last_creation_check: datetime | None = None
         self._next: dict[str, datetime] = {}
+        self._source_pause: dict[str, timedelta] = {}  # source -> current pause after failures
+        self._source_retry_at: dict[str, datetime] = {}
         self.disabled: dict[str, str] = {}
 
     # ----------------------------------------------------------- bookkeeping
@@ -227,7 +237,11 @@ class SolanaRecorder:
         self._journal.append(stream, record)
 
     def _due(self, task: str, now: datetime) -> bool:
-        return task not in self.disabled and self._next.get(task, now) <= now
+        return (
+            task not in self.disabled
+            and self._next.get(task, now) <= now
+            and self._source_retry_at.get(SOURCE_OF[task], now) <= now
+        )
 
     def _run(self, task: str, now: datetime, fn: Callable[[], None], every: timedelta) -> None:
         """Run one task. Transient HTTP problems: retry later (a coverage gap is open
@@ -240,13 +254,29 @@ class SolanaRecorder:
             if exc.status in (401, 403):  # blocked / not allowed: don't hammer
                 self._disable(task, f"{type(exc).__name__}: {exc}")
             else:
-                self._coverage.source_failed(source, f"{type(exc).__name__}: {exc}")
+                self._source_down(source, f"{type(exc).__name__}: {exc}")
+        except SolanaRpcError as exc:
+            if exc.code in TRANSIENT_RPC_CODES:
+                self._source_down(source, f"{type(exc).__name__}: {exc}")
+            else:
+                self._disable(task, f"{type(exc).__name__}: {exc}")
         except Exception as exc:
             self._disable(task, f"{type(exc).__name__}: {exc}")
         else:
+            self._source_pause.pop(source, None)
+            self._source_retry_at.pop(source, None)
             self._coverage.source_ok(source)
         finally:
             self._next[task] = now + every
+
+    def _source_down(self, source: str, error: str) -> None:
+        """Pause every task of a failing source, longer each time, so one dead provider
+        (whose calls block while they retry) can't starve the others."""
+        pause = self._source_pause.get(source)
+        pause = SOURCE_PAUSE_FIRST if pause is None else min(pause * 2, SOURCE_PAUSE_MAX)
+        self._source_pause[source] = pause
+        self._source_retry_at[source] = self._clock.now() + pause
+        self._coverage.source_failed(source, error)
 
     def _disable(self, task: str, reason: str) -> None:
         self.disabled[task] = reason
@@ -275,11 +305,7 @@ class SolanaRecorder:
             self._run("creations", now, self._count_creations, self.s.creation_count_interval)
         if self._mint_queue and self._due("mints", now):
             self._run("mints", now, self._fetch_mint_facts, self.s.mint_batch_interval)
-        if (
-            "snapshots" not in self.disabled
-            and (nxt := self.schedule.next_due_at()) is not None
-            and nxt <= now
-        ):
+        if self._due("snapshots", now) and (nxt := self.schedule.next_due_at()) is not None and nxt <= now:
             self._run("snapshots", now, self._snapshot_due, timedelta(0))
         if self._curve_queue and self._due("curves", now):
             self._run("curves", now, self._fetch_curves, self.s.curve_batch_interval)
@@ -306,14 +332,30 @@ class SolanaRecorder:
             return timedelta(seconds=5)
         return min(max(min(wake) - now, timedelta(milliseconds=200)), timedelta(seconds=5))
 
-    def run(self, sleep: Callable[[float], None], should_stop: Callable[[], bool]) -> None:
+    def start(self) -> None:
         self._coverage.start()
+
+    def stop(self) -> None:
+        """Record what was still waiting (it is not carried over to the next run), then stop."""
+        for task, queue in (
+            ("mints", self._mint_queue),
+            ("curves", self._curve_queue),
+            ("holders", self._holder_queue),
+        ):
+            if queue:
+                self._write(
+                    "tasks", {"event": "queue_dropped", "task": task, "items": len(queue), "reason": "stop"}
+                )
+        self._coverage.stop()
+
+    def run(self, sleep: Callable[[float], None], should_stop: Callable[[], bool]) -> None:
+        self.start()
         try:
             while not should_stop():
                 pause = self.step()
                 sleep(pause.total_seconds())
         finally:
-            self._coverage.stop()
+            self.stop()
 
     # ------------------------------------------------------------ discovery
     def _discover(self) -> None:
@@ -343,7 +385,9 @@ class SolanaRecorder:
                 overlapped = True
             for p in new:
                 self._on_new_pool(p, page)
-            if page.pools and old == len(page.pools):
+            if not page.pools:
+                break  # the feed ended: later pages are empty too
+            if old == len(page.pools):
                 break  # a page of pools we already knew: older pages hold nothing new
         if not overlapped and previous_newest is not None and oldest_this_round is not None:
             # Every pool on every page was new: pools created between the last round's
@@ -566,6 +610,11 @@ class SolanaRecorder:
         )
 
     # --------------------------------------------------------------- restart
+    @property
+    def restore_window(self) -> timedelta:
+        """How far back restore() needs the journal: the oldest snapshot age plus slack."""
+        return self.s.snapshot_ages[-1] + timedelta(hours=2)
+
     def restore(
         self,
         pools: Sequence[Mapping[str, Any]],
@@ -574,12 +623,15 @@ class SolanaRecorder:
         creations: Sequence[Mapping[str, Any]],
     ) -> None:
         """Rebuild state from the journal after a restart (records in file order)."""
-        horizon = self._clock.now() - self.s.snapshot_ages[-1] - timedelta(hours=1)
-        done: dict[str, int] = {}
+        horizon = self._clock.now() - self.restore_window + timedelta(hours=1)
+        # Ages already handled per pool. Distinct ages, not records: one age can leave two
+        # records (a snapshot, then a holder list skipped because the queue was full).
+        handled: dict[str, set[object]] = {}
         for r in snapshot_records:
             pool = r.get("pool")
             if isinstance(pool, str):
-                done[pool] = done.get(pool, 0) + 1
+                handled.setdefault(pool, set()).add(r.get("target_age_minutes"))
+        done = {pool: len(ages) for pool, ages in handled.items()}
         for r in mint_facts:
             facts = r.get("facts")
             if isinstance(facts, dict) and isinstance(facts.get("owner"), str):

@@ -48,6 +48,9 @@ def test_health_summarises_the_last_24_hours(tmp_path: Path) -> None:
         cov.source_ok("dexscreener")  # a closed 10-minute outage
         cov.source_failed("solana_rpc", "HTTP 403: blocked")  # still failing
         j.append("tasks", {"event": "task_disabled", "task": "holders", "reason": "403"})
+        j.append("mint_facts", {"mint": "M1", "facts": {"reason": "unreadable: empty extensions list"}})
+        j.append("mint_facts", {"mint": "M2", "facts": {"reason": "a token account, not a mint"}})
+        j.append("mint_facts", {"mint": "M3", "facts": None})
         cov.beat()
     now = clock.now() + timedelta(seconds=30)
     h = health(tmp_path, now)
@@ -65,6 +68,7 @@ def test_health_summarises_the_last_24_hours(tmp_path: Path) -> None:
     assert "SOURCE DOWN (not recovered yet): solana_rpc" in text
     assert "TASK SWITCHED OFF in the current run: holders" in text
     assert "found by discovery: 2 (29%)" in text
+    assert h.unreadable_mints == 1 and "MINT FACTS UNREADABLE for 1 token(s)" in text
     assert text.isascii()
 
 
@@ -97,6 +101,22 @@ def test_a_stale_or_damaged_heartbeat_reads_as_not_running(tmp_path: Path) -> No
     assert health(tmp_path, later).last_beat is None
     (tmp_path / maintenance.HEARTBEAT).write_text('["not a dict"]', encoding="utf-8")
     assert health(tmp_path, later).last_beat is None
+
+
+def test_a_clean_stop_is_reported_as_stopped_not_running(tmp_path: Path) -> None:
+    clock = FixedClock(T0)
+    with Journal(tmp_path, clock) as j:
+        cov = Coverage(j, tmp_path, clock, "solana")
+        cov.start()
+        clock.advance(timedelta(minutes=5))
+        cov.stop()  # also writes a last heartbeat
+    now = clock.now() + timedelta(seconds=20)
+    h = health(tmp_path, now)
+    assert not h.running(now)
+    assert h.lines(now)[0] == "Recorder: STOPPED cleanly at 2026-10-01 08:05 UTC"
+    with Journal(tmp_path, clock) as j:
+        Coverage(j, tmp_path, clock, "solana").start()
+    assert health(tmp_path, now).running(now), "started again"
 
 
 def test_odd_values_in_records_do_not_crash_the_summary(tmp_path: Path) -> None:

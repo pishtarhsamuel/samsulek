@@ -29,6 +29,7 @@ from samsulek.config import (
 from samsulek.credentials import load_env_file, redact
 from samsulek.cycle import SYNC_ERRORS, halt_and_alert, reconcile_or_halt, run_cycle, sync_ledger
 from samsulek.data.market import MarketData, UpdateReport, log_update
+from samsulek.data.recorder import maintenance, runner
 from samsulek.data.recorder.journal import Journal, read_stream
 from samsulek.data.sources import ecb
 from samsulek.kill import execute_kill
@@ -372,6 +373,58 @@ def _data_status(root: Path) -> int:
     return EXIT_OK
 
 
+def cmd_record(args: argparse.Namespace) -> int:
+    config, _ = load_configs(args.root, args.config)
+    root = runner.recorder_root(config.data.data_dir)
+    clock = SystemClock()
+    if args.record_command == "status":
+        now = clock.now()
+        for line in maintenance.health(root, now).lines(now):
+            _out(line)
+        days = sorted(p.stem for p in root.glob("*/*.parquet"))
+        if days:
+            _out(f"Compacted: {len(days)} stream-days, oldest {days[0]}")
+        return EXIT_OK
+    try:
+        lock = RunLock(root, clock).__enter__()
+    except AlreadyRunningError:
+        _out("The Solana recorder is already running in another window. Only one at a time.")
+        return EXIT_HALTED
+    try:
+        if args.record_command == "compact":
+            report = maintenance.compact(root, clock.now())
+            _out(f"Compacted {len(report.days_written)} stream-days ({report.files_removed} hour files).")
+            for line in report.skipped:
+                _out(f"  kept as raw text: {line}")
+            return EXIT_OK
+        setup_logging(config.log_dir)
+        rec_cfg = config.data.recorder
+        http = runner.build_http(config.data.user_agent, rec_cfg.solana_rpc_url)
+        with Journal(root, clock) as journal:
+            rec = runner.build_recorder(root, rec_cfg, http, journal, clock)
+            _out("Solana recorder (research only, nothing is traded). Stop it with Ctrl+C.")
+            runner.run_recorder(root, rec, clock, _say, minutes=args.minutes)
+        _out("Recorder stopped. See what it recorded: uv run samsulek record status")
+        return EXIT_OK
+    finally:
+        lock.__exit__(None, None, None)
+
+
+def _say(text: str) -> None:
+    _out(text)
+    sys.stdout.flush()
+
+
+def _positive_minutes(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("minutes must be a number") from exc
+    if not 0 < value <= 60 * 24 * 365:
+        raise argparse.ArgumentTypeError("minutes must be more than 0 (and at most a year)")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     # allow_abbrev=False everywhere: an abbreviated option must never silently mean `--mode`.
     p = argparse.ArgumentParser(
@@ -405,6 +458,16 @@ def build_parser() -> argparse.ArgumentParser:
     data_sub = data.add_subparsers(dest="data_command", required=True)
     data_sub.add_parser("update", help="download the latest market data (FX for now)", allow_abbrev=False)
     data_sub.add_parser("status", help="what market data is stored", allow_abbrev=False)
+    record = sub.add_parser("record", help="research recorders (simulation data only)", allow_abbrev=False)
+    record_sub = record.add_subparsers(dest="record_command", required=True)
+    solana = record_sub.add_parser("solana", help="record new Solana pools until Ctrl+C", allow_abbrev=False)
+    solana.add_argument(
+        "--minutes", type=_positive_minutes, default=None, help="stop after this many minutes"
+    )
+    record_sub.add_parser("status", help="what the recorder did in the last 24 hours", allow_abbrev=False)
+    record_sub.add_parser(
+        "compact", help="pack journal days older than a week into Parquet", allow_abbrev=False
+    )
     return p
 
 
@@ -416,6 +479,7 @@ COMMANDS = {
     "reset-halt": cmd_reset_halt,
     "reconcile": cmd_reconcile,
     "data": cmd_data,
+    "record": cmd_record,
 }
 
 

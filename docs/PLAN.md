@@ -196,6 +196,16 @@ Each one ends with a short summary, how to run it, and a stop for your OK.
   over plain JSON-RPC/HTTP. No Solana SDK, so less supply-chain risk. It needs
   your machine to stay on; gaps get recorded as gaps.
 - Survivorship notes for every dataset.
+- **Status: built except ETF prices.** Done: the point-in-time store
+  (DuckDB/Parquet, one new dependency: `duckdb`), the Xetra calendar, ECB FX
+  rates (`samsulek data update`), data-quality checks, and the Solana recorder
+  (`samsulek record solana`): GeckoTerminal new pools for discovery,
+  DexScreener for snapshots, Solana RPC for mint facts, pump.fun bonding
+  curves, holder lists and a launch counter that measures what discovery
+  misses. Dataset notes: `research/data_notes.md`. **ETF daily prices have no
+  verified free source yet**: every option checked so far either forbids
+  automated downloads or couldn't be reached from the build environment, so
+  the owner is checking Stooq from their own PC.
 
 **M3: backtester**
 - Event-driven, reusing M1's strategy, risk, and sim-broker code. Decisions at

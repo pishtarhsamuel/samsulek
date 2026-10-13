@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -15,6 +16,7 @@ from samsulek.clock import FixedClock
 from samsulek.data.recorder.coverage import Coverage
 from samsulek.data.recorder.journal import Journal, read_stream
 from samsulek.data.recorder.solana import PumpFun, RecorderSettings, SolanaRecorder
+from samsulek.data.sources.solana_rpc import SolanaRpcError
 from samsulek.net.http import HttpError
 
 T0 = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
@@ -200,7 +202,7 @@ def test_discovery_records_every_new_pool_once_and_queues_its_facts(tmp_path: Pa
     pools = r.stream("pools")
     assert [p["pool_address"] for p in pools] == ["P2", "P1"]
     assert pools[0]["snapshot_sampled"] is True and pools[0]["discovered_at"] == T0.isoformat()
-    assert r.discovery.calls == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "first round reads every page"
+    assert r.discovery.calls == [1, 2], "the first round reads on until the feed ends (an empty page)"
     assert r.chain.mint_calls == [["M2", "M1"]]
     assert {m["mint"] for m in r.stream("mint_facts")} == {"M1", "M2"}
     r.clock.advance(timedelta(seconds=150))
@@ -294,8 +296,29 @@ def test_transient_errors_open_and_close_a_coverage_gap(tmp_path: Path) -> None:
     assert gap["kind"] == "source_down" and gap["source"] == "geckoterminal"
 
 
+@pytest.mark.parametrize("code", [-32005, -32016])
+def test_a_node_that_is_behind_is_an_outage_not_a_shutdown(tmp_path: Path, code: int) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0, dex="meteora")]}
+    r.chain.mints_fail = SolanaRpcError(code, "Node is behind by 42 slots", "getMultipleAccounts")
+    r.rec.step()
+    assert "mints" not in r.rec.disabled
+    assert r.rec.backlog()["mints"] == 1, "the batch waits for the next try"
+    r.chain.mints_fail = None
+    r.clock.advance(timedelta(seconds=30))
+    r.rec.step()
+    assert r.chain.mint_calls[0] == r.chain.mint_calls[1]
+    gaps = [g for g in r.stream("coverage") if g.get("event") == "gap"]
+    assert [(g["kind"], g["source"]) for g in gaps] == [("source_down", "solana_rpc")]
+
+
 @pytest.mark.parametrize(
-    "error", [ValueError("unexpected schema"), HttpError("HTTP 403 blocked", url="x", status=403)]
+    "error",
+    [
+        ValueError("unexpected schema"),
+        HttpError("HTTP 403 blocked", url="x", status=403),
+        SolanaRpcError(-32602, "Invalid params", "getMultipleAccounts"),
+    ],
 )
 def test_a_format_change_or_block_switches_the_task_off_and_the_rest_keeps_going(
     tmp_path: Path, error: Exception
@@ -372,6 +395,64 @@ def test_restart_resumes_from_the_journal(tmp_path: Path) -> None:
     assert again.stream("snapshot_skipped") == [], "done ages are not re-scheduled (and then skipped)"
     assert again.chain.sig_calls == ["s9"]
     assert not [p for p in again.stream("pools") if p["pool_address"] == "P1"][1:], "not re-recorded"
+
+
+def test_a_failing_source_is_paused_longer_each_time_and_the_others_keep_going(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.fail = HttpError("HTTP 503", url="x", status=503)
+    attempts: list[datetime] = []
+    real = r.discovery.new_pools
+
+    def timed(page: int) -> Page:
+        attempts.append(r.clock.now())
+        return real(page)
+
+    r.discovery.new_pools = timed  # type: ignore[method-assign]
+    for _ in range(40 * 12):  # 40 minutes in 5-second steps
+        r.rec.step()
+        r.clock.advance(timedelta(seconds=5))
+    waits = [(b - a).total_seconds() for a, b in itertools.pairwise(attempts)]
+    # Pauses 30, 60, 120 s are shorter than the normal 150 s interval; then 240, 480, 600 (cap).
+    assert waits == [150, 150, 150, 240, 480, 600, 600]
+    assert len(r.chain.sig_calls) == 40, "the chain's creation counter kept its 60-second rhythm"
+    r.discovery.fail = None
+    r.clock.advance(timedelta(minutes=10))
+    r.rec.step()
+    r.clock.advance(timedelta(seconds=150))
+    attempts.clear()
+    r.rec.step()
+    assert len(attempts) == 1, "after a success the source runs on its normal schedule again"
+    gaps = [g for g in r.stream("coverage") if g.get("event") == "gap"]
+    assert [(g["kind"], g["source"]) for g in gaps] == [("source_down", "geckoterminal")]
+
+
+def test_restart_counts_ages_not_records(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    created = T0 - 6 * M
+    pools = [{"pool_address": "P1", "pool_created_at": created.isoformat(), "dex_id": "x", "base_mint": "M1",
+              "snapshot_sampled": True}]  # fmt: skip
+    handled = [
+        {"pool": "P1", "target_age_minutes": 5.0},  # the snapshot ...
+        {
+            "pool": "P1",
+            "target_age_minutes": 5.0,
+            "reason": "holder_queue_full",
+        },  # ... and its skipped holders
+    ]
+    r.rec.restore(pools, handled, [], [])
+    assert r.rec.schedule.next_due_at() == created + 15 * M, "one age done, not two"
+
+
+def test_stopping_records_the_work_left_waiting(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0, dex="meteora"), pool(2, T0, dex="meteora")]}
+    r.chain.mints_fail = HttpError("HTTP 503", url="x", status=503)
+    r.rec.start()
+    r.rec.step()
+    r.rec.stop()
+    (dropped,) = [t for t in r.stream("tasks") if t["event"] == "queue_dropped"]
+    assert dropped == {**dropped, "task": "mints", "items": 2, "reason": "stop"}
+    assert r.stream("coverage")[-1]["event"] == "stop"
 
 
 def test_the_loop_never_spins(tmp_path: Path) -> None:
