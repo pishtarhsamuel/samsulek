@@ -91,6 +91,17 @@ def test_rates_are_foreign_per_euro_and_public_from_17h_frankfurt() -> None:
     assert available_at(date(2026, 1, 15)) == datetime(2026, 1, 15, 16, 0, tzinfo=UTC)  # CET
 
 
+def test_old_history_marks_holidays_with_an_empty_value() -> None:
+    rows = parse_csv(body("chf_1999-12_empty_value_rows.csv").decode(), FETCHED)
+    assert [r.obs_date.isoformat() for r in rows] == [
+        "1999-12-28",
+        "1999-12-29",
+        "1999-12-30",
+        "2000-01-03",
+        "2000-01-04",
+    ], "1999-12-31 had no rate: skipped, not an error and not a zero"
+
+
 def test_full_format_and_updated_after_format_both_parse() -> None:
     full = parse_csv(body("usd_gbp_2026-09_full.csv").decode(), FETCHED)
     assert len(full) == 44 and {r.currency for r in full} == {"USD", "GBP"}

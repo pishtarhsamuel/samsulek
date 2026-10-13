@@ -29,3 +29,15 @@ sim:
 
 alerts:
   telegram_enabled: false       # set up in M5
+
+# Research data (M2). Downloaded data and recordings live in ./data (never commit).
+data:
+  data_dir: data
+  user_agent: "samsulek/0.1 (personal research)"   # sent to every data provider
+  fx_currencies: [USD, GBP, CHF]  # ECB euro reference rates to keep
+  recorder:                     # Solana new-pool recorder (simulation research only)
+    solana_rpc_url: https://api.mainnet.solana.com   # the public endpoint the docs name
+    discovery_pages: 10         # GeckoTerminal serves at most 10 pages of new pools
+    discovery_interval_seconds: 150   # 10 pages every 150 s = 4 calls/min (free limit ~10)
+    snapshot_per_mille: 250     # follow 25% of new pools (random by address) with snapshots
+    holders_per_mille: 50       # 5% also get top-holder lists

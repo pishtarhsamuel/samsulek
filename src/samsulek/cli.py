@@ -28,9 +28,13 @@ from samsulek.config import (
 )
 from samsulek.credentials import load_env_file, redact
 from samsulek.cycle import SYNC_ERRORS, halt_and_alert, reconcile_or_halt, run_cycle, sync_ledger
+from samsulek.data.market import MarketData, UpdateReport, log_update
+from samsulek.data.recorder.journal import Journal, read_stream
+from samsulek.data.sources import ecb
 from samsulek.kill import execute_kill
 from samsulek.live_gate import LiveGateError, authorize_live
 from samsulek.logging_setup import RedactingFilter, setup_logging
+from samsulek.net.http import HttpClient, HttpError
 from samsulek.risk.state import RiskStateStore, StateCorruptError
 from samsulek.runlock import AlreadyRunningError, RunLock
 from samsulek.terminal import TerminalUnavailableError, confirm_phrase, new_code, require_interactive
@@ -301,6 +305,73 @@ def _reconcile_locked(args: argparse.Namespace, state_dir: Path) -> int:
     return EXIT_OK if ok else EXIT_HALTED
 
 
+def cmd_data(args: argparse.Namespace) -> int:
+    config, _ = load_configs(args.root, args.config)
+    if args.data_command == "status":
+        return _data_status(config.data.data_dir)
+    return _data_update(config.data.data_dir, config.data.user_agent, config.data.fx_currencies)
+
+
+def _data_update(root: Path, user_agent: str, currencies: list[str]) -> int:
+    clock = SystemClock()
+    try:
+        lock = RunLock(root / "market", clock, wait_seconds=LOCK_WAIT_SECONDS).__enter__()
+    except AlreadyRunningError:
+        _out("Another data update is running. Nothing changed; try again in a minute.")
+        return EXIT_HALTED
+    md = MarketData(root, clock)
+    journal = Journal(root / "market" / "journal", clock)
+    try:
+        http = HttpClient(
+            user_agent=user_agent, allowed_hosts=frozenset({ecb.HOST}), limiters={ecb.HOST: ecb.limiter()}
+        )
+        report = UpdateReport("fx")
+        try:
+            report = md.update_fx(ecb.EcbSource(http), currencies)
+        except (HttpError, ecb.EcbFormatError, OSError) as exc:
+            log_update(journal, report, ok=False, error=f"{type(exc).__name__}: {exc}")
+            _out(f"FX update FAILED ({type(exc).__name__}): {exc}")
+            _out("Nothing was stored from this attempt. Check your internet connection and try again.")
+            return EXIT_ERROR
+        log_update(journal, report, ok=True)
+        _out(
+            f"FX (ECB): {report.fetched} rates downloaded, {report.new} new, {len(report.revised)} corrected."
+        )
+        for ccy, last in sorted(report.latest.items()):
+            _out(f"  {ccy}: newest rate {last}")
+        for line in report.revised[:10]:
+            _out(f"  CORRECTED by the source: {line}")
+        for warning in report.warnings:
+            _out(f"  WARNING: {warning}")
+        _out("ETF prices: not downloaded yet (waiting for a verified free source).")
+        return EXIT_OK
+    finally:
+        journal.close()
+        md.close()
+        lock.__exit__(None, None, None)
+
+
+def _data_status(root: Path) -> int:
+    clock = SystemClock()
+    md = MarketData(root, clock)
+    try:
+        fx = md.status()
+    finally:
+        md.close()
+    if not fx:
+        _out("No market data yet. Run: uv run samsulek data update")
+    for ccy, info in sorted(fx.items()):
+        _out(f"FX {ccy}: {info['rows']} days, {info['first']} .. {info['last']}")
+    fetches = list(read_stream(root / "market" / "journal", "fetches"))
+    if fetches:
+        last = fetches[-1]
+        state = "OK" if last.get("ok") else f"FAILED ({last.get('error')})"
+        _out(f"Last update: {last.get('recorded_at')} {state}")
+        for warning in last.get("warnings") or []:
+            _out(f"  WARNING: {warning}")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     # allow_abbrev=False everywhere: an abbreviated option must never silently mean `--mode`.
     p = argparse.ArgumentParser(
@@ -330,6 +401,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "reconcile", help="compare our records with the broker; halt on mismatch", allow_abbrev=False
     )
+    data = sub.add_parser("data", help="research data: download and inspect", allow_abbrev=False)
+    data_sub = data.add_subparsers(dest="data_command", required=True)
+    data_sub.add_parser("update", help="download the latest market data (FX for now)", allow_abbrev=False)
+    data_sub.add_parser("status", help="what market data is stored", allow_abbrev=False)
     return p
 
 
@@ -340,6 +415,7 @@ COMMANDS = {
     "kill": cmd_kill,
     "reset-halt": cmd_reset_halt,
     "reconcile": cmd_reconcile,
+    "data": cmd_data,
 }
 
 

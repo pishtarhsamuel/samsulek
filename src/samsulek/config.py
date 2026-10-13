@@ -141,6 +141,57 @@ class AlertsConfig(BaseModel):
     telegram_enabled: bool = False
 
 
+class RecorderConfig(BaseModel):
+    """The Solana research recorder. Defaults stay well inside the free providers' limits."""
+
+    model_config = _STRICT
+
+    solana_rpc_url: str = "https://api.mainnet.solana.com"
+    discovery_pages: int = Field(default=10, ge=1, le=10)
+    discovery_interval_seconds: int = Field(default=150, ge=60)
+    snapshot_per_mille: int = Field(default=250, ge=0, le=1000)
+    holders_per_mille: int = Field(default=50, ge=0, le=1000)
+
+    @field_validator("solana_rpc_url")
+    @classmethod
+    def _https_only(cls, v: str) -> str:
+        if not v.startswith("https://") or "@" in v:
+            raise ValueError("solana_rpc_url must be a plain https:// URL (no credentials in it)")
+        return v
+
+    @model_validator(mode="after")
+    def _holders_within_snapshots(self) -> Self:
+        if self.holders_per_mille > self.snapshot_per_mille:
+            raise ValueError("holders_per_mille cannot exceed snapshot_per_mille")
+        return self
+
+
+class DataConfig(BaseModel):
+    model_config = _STRICT
+
+    data_dir: Path = Path("data")
+    user_agent: str = Field(default="samsulek/0.1 (personal research)", min_length=8)
+    fx_currencies: list[str] = Field(default_factory=lambda: ["USD", "GBP", "CHF"])
+    recorder: RecorderConfig = RecorderConfig()
+
+    @field_validator("data_dir")
+    @classmethod
+    def _not_the_state_dir(cls, v: Path) -> Path:
+        if Path(v) == STATE_DIR:
+            raise ValueError("data_dir must not be the state folder")
+        return v
+
+    @field_validator("fx_currencies")
+    @classmethod
+    def _iso_codes(cls, v: list[str]) -> list[str]:
+        for c in v:
+            if len(c) != 3 or not c.isalpha() or not c.isupper() or c == "EUR":
+                raise ValueError(f"invalid currency code {c!r}")
+        if len(set(v)) != len(v):
+            raise ValueError("currency listed twice")
+        return v
+
+
 class AppConfig(BaseModel):
     model_config = _STRICT
 
@@ -151,6 +202,7 @@ class AppConfig(BaseModel):
     universe: dict[Market, list[str]]
     sim: SimConfig
     alerts: AlertsConfig = AlertsConfig()
+    data: DataConfig = DataConfig()
 
     @field_validator("mode")
     @classmethod
@@ -192,6 +244,7 @@ class AppConfig(BaseModel):
                 "state_dir": anchor(self.state_dir),
                 "log_dir": anchor(self.log_dir),
                 "env_file": anchor(self.env_file),
+                "data": self.data.model_copy(update={"data_dir": anchor(self.data.data_dir)}),
             }
         )
 

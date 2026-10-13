@@ -10,6 +10,8 @@ environment):
 - The value is units of foreign currency per 1 EUR, so EUR amount = foreign / rate.
 - Published around 16:00 Frankfurt time on TARGET working days; no row on weekends or
   TARGET holidays. A query covering only holidays returns 200 with an EMPTY body.
+  Older history (seen live for 1999-2001, 2026-10-13) instead has holiday rows with an
+  EMPTY OBS_VALUE (e.g. 1999-12-31, Easter 2000): no rate that day, so they are skipped.
 - ``updatedAfter`` with nothing new returns 404 "No Series was returned" - the same
   answer as a misspelled series key. So currencies are validated before asking, and a
   freshness check (not this adapter) decides whether data is missing.
@@ -93,6 +95,8 @@ def parse_csv(text: str, fetched_at: datetime) -> list[FxObservation]:
         ccy = row["CURRENCY"]
         if not _CCY_RE.match(ccy):
             raise EcbFormatError(f"{where}: bad currency {ccy!r}")
+        if row["OBS_VALUE"] == "":
+            continue  # no rate published that day (older history marks holidays this way)
         try:
             obs_date = date.fromisoformat(row["TIME_PERIOD"])
             rate = Decimal(row["OBS_VALUE"])
