@@ -582,3 +582,16 @@ def test_clean_text_keeps_printable_ascii_only() -> None:
     assert clean_text(RIGHT_TO_LEFT + "abc") == "abc"
     assert clean_text("A" * 100) == "A" * 40
     assert clean_text("") == ""
+
+
+def test_an_answer_read_after_the_pc_slept_is_old_not_a_clock_problem() -> None:
+    late = FETCHED + timedelta(minutes=40)
+    with pytest.raises(DexScreenerFormatError, match="clock"):
+        parse(body(BATCH), fetched=late)
+    sent = FETCHED - timedelta(seconds=1)
+    batch = parse_pairs(body(BATCH), dict(headers(BATCH)), REQUESTED_30, late, sent_at=sent)
+    assert batch.fetched_at == late and set(batch.found) == set(IN_FIXTURE)
+    with pytest.raises(DexScreenerFormatError, match="clock"):
+        parse_pairs(
+            body(BATCH), dict(headers(BATCH)), REQUESTED_30, late, sent_at=late - timedelta(seconds=1)
+        )

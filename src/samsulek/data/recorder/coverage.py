@@ -10,6 +10,12 @@ Written to the journal stream ``coverage``:
   ``task_off`` - a task switched off after an error it must not guess past, from then
   to ``stop`` (always ``open_at_stop``: only a restart switches it back on). Other
   tasks of the same source succeeding does not close it.
+  A ``not_running`` gap with ``reason: stalled`` is written when the loop itself froze
+  for longer than STALL_GAP (the PC slept, the console was paused): the process was
+  alive but observing nothing. After an unclean exit (power cut, window closed) the next
+  start closes the outages and switched-off tasks the last heartbeat still listed, with
+  ``open_at_crash``.
+- ``stop`` events carry a ``reason`` (``ctrl_c``, ``time_limit``, ``error``...).
 Research must treat anything inside a gap as "not observed", never as "nothing happened".
 
 The heartbeat file also carries the sources failing and the tasks switched off right now,
@@ -29,6 +35,7 @@ from samsulek.fsutil import atomic_write_text
 
 STREAM = "coverage"
 STATE_FILE = "heartbeat.json"
+STALL_GAP = timedelta(minutes=5)  # a longer pause between beats means nothing was watched
 
 
 class Coverage:
@@ -51,7 +58,15 @@ class Coverage:
 
     def start(self) -> None:
         now = self._clock.now()
-        previous = self._read_last_beat()
+        previous, failing, off = self._read_previous()
+        if previous is not None:
+            # A clean stop leaves these empty: anything listed died with the process.
+            for source, since in failing.items():
+                if since < previous:
+                    self._gap("source_down", since, previous, source=source, open_at_crash=True)
+            for task, (since, source) in off.items():
+                if since < previous:
+                    self._gap("task_off", since, previous, task=task, source=source, open_at_crash=True)
         if previous is not None and previous < now:
             self._gap("not_running", previous, now)
         self._journal.append(STREAM, {"event": "start", "recorder": self._recorder, "pid": os.getpid()})
@@ -60,6 +75,9 @@ class Coverage:
 
     def beat(self) -> None:
         now = self._clock.now()
+        if self._last_beat is not None and now - self._last_beat > STALL_GAP:
+            # Alive but frozen (sleep, a paused console, a huge clock step): not observed.
+            self._gap("not_running", self._last_beat, now, reason="stalled")
         if self._last_beat is None or now - self._last_beat >= self._beat_every:
             # Records first, heartbeat second: the heartbeat must never vouch for
             # records that a power cut could still take away.
@@ -88,15 +106,20 @@ class Coverage:
         self._journal.sync()
         self._write_beat(now)  # visible in `record status` at once
 
-    def stop(self) -> None:
+    def stop(self, reason: str = "stopped", error: str | None = None) -> None:
         now = self._clock.now()
-        for source, (since, error) in sorted(self._failing.items()):
-            self._gap("source_down", since, now, source=source, error=error[:500], open_at_stop=True)
+        for source, (since, first_error) in sorted(self._failing.items()):
+            self._gap("source_down", since, now, source=source, error=first_error[:500], open_at_stop=True)
         self._failing.clear()
-        for task, (since, source, reason) in sorted(self._off.items()):
-            self._gap("task_off", since, now, task=task, source=source, error=reason[:500], open_at_stop=True)
+        for task, (since, task_source, why) in sorted(self._off.items()):
+            self._gap(
+                "task_off", since, now, task=task, source=task_source, error=why[:500], open_at_stop=True
+            )
         self._off.clear()
-        self._journal.append(STREAM, {"event": "stop", "recorder": self._recorder})
+        stop: dict[str, object] = {"event": "stop", "recorder": self._recorder, "reason": reason}
+        if error is not None:
+            stop["error"] = error[:500]
+        self._journal.append(STREAM, stop)
         self._journal.sync()
         self._write_beat(now)
 
@@ -133,20 +156,39 @@ class Coverage:
         atomic_write_text(self._state, json.dumps(state))
         self._last_beat = now
 
-    def _read_last_beat(self) -> datetime | None:
-        """The previous run's last heartbeat. Unreadable -> None, and the journal says so."""
+    def _read_previous(
+        self,
+    ) -> tuple[datetime | None, dict[str, datetime], dict[str, tuple[datetime, str]]]:
+        """The previous run's last heartbeat, and the outages and switched-off tasks it
+        still listed. Unreadable -> nothing, and the journal says so."""
+        none: tuple[None, dict[str, datetime], dict[str, tuple[datetime, str]]] = (None, {}, {})
         try:
             raw = self._state.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return None
+            return none
         except (OSError, ValueError) as exc:
             self._journal.append(STREAM, {"event": "heartbeat_unreadable", "error": type(exc).__name__})
-            return None
+            return none
         try:
-            value = datetime.fromisoformat(json.loads(raw)["last_beat"])
-            if value.tzinfo is None:
-                raise ValueError("naive timestamp")
-            return value
+            state = json.loads(raw)
+            value = _aware(state["last_beat"])
         except Exception as exc:  # damaged file: say so; the gap length is then unknown
             self._journal.append(STREAM, {"event": "heartbeat_unreadable", "error": type(exc).__name__})
-            return None
+            return none
+        failing: dict[str, datetime] = {}
+        off: dict[str, tuple[datetime, str]] = {}
+        try:  # older heartbeats have neither map; a damaged entry is just skipped
+            for source, entry in (state.get("failing") or {}).items():
+                failing[str(source)] = _aware(entry["since"])
+            for task, entry in (state.get("off") or {}).items():
+                off[str(task)] = (_aware(entry["since"]), str(entry.get("source")))
+        except Exception as exc:
+            self._journal.append(STREAM, {"event": "heartbeat_unreadable", "error": type(exc).__name__})
+        return value, failing, off
+
+
+def _aware(text: object) -> datetime:
+    value = datetime.fromisoformat(str(text))
+    if value.tzinfo is None:
+        raise ValueError("naive timestamp")
+    return value

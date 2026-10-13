@@ -16,13 +16,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from samsulek.clock import Clock
 from samsulek.config import RecorderConfig
 from samsulek.data.recorder import maintenance
 from samsulek.data.recorder.coverage import Coverage
 from samsulek.data.recorder.journal import Journal, read_stream
-from samsulek.data.recorder.solana import PumpFun, RecorderSettings, SolanaRecorder
+from samsulek.data.recorder.solana import PumpFun, RecorderSettings, SolanaRecorder, describe_error
 from samsulek.data.sources import dexscreener, geckoterminal, pumpfun, solana_rpc
 from samsulek.net.http import HttpClient
 
@@ -87,14 +88,35 @@ def restore_from_journal(rec: SolanaRecorder, root: Path, now: datetime) -> int:
     since = now - rec.restore_window
     if since <= now - maintenance.RAW_KEEP:
         raise RuntimeError("restore window is not covered by the raw journal; raise RAW_KEEP")
-    snapshots = [r for stream in SNAPSHOT_STREAMS for r in read_stream(root, stream, since=since)]
+    # Streamed, and only the fields restore needs: after days of recording the window
+    # holds hundreds of MB of records, which must not all sit in memory at once.
+    snapshots = (
+        _pick(r, SNAPSHOT_FIELDS)
+        for stream in SNAPSHOT_STREAMS
+        for r in read_stream(root, stream, since=since)
+    )
     rec.restore(
-        list(read_stream(root, "pools", since=since)),
+        (_pick(r, POOL_FIELDS) for r in read_stream(root, "pools", since=since)),
         snapshots,
-        list(read_stream(root, "mint_facts", since=since)),
-        list(read_stream(root, "gt_pages", since=since)),
+        (_mint_owner(r) for r in read_stream(root, "mint_facts", since=since)),
+        (_pick(r, ROUND_FIELDS) for r in read_stream(root, "gt_pages", since=since)),
     )
     return len(rec.schedule)
+
+
+POOL_FIELDS = ("pool_address", "pool_created_at", "dex_id", "base_mint", "snapshot_sampled", "recorded_at")
+SNAPSHOT_FIELDS = ("pool", "target_age_minutes")
+ROUND_FIELDS = ("round_complete", "round_closed", "recorded_at", "newest_created", "known_before")
+
+
+def _pick(record: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    return {k: record[k] for k in fields if k in record}
+
+
+def _mint_owner(record: dict[str, Any]) -> dict[str, Any]:
+    facts = record.get("facts")
+    owner = facts.get("owner") if isinstance(facts, dict) else None
+    return {"mint": record.get("mint"), "facts": {"owner": owner} if isinstance(owner, str) else None}
 
 
 @dataclass
@@ -147,18 +169,24 @@ def run_recorder(
     minutes: float | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
-    """Restore, then step until Ctrl+C or ``minutes``. Always records the stop."""
+    """Restore, then step until Ctrl+C or ``minutes``. Always records the stop, and why:
+    a crash must never read as a clean stop in `record status`."""
     tracked = restore_from_journal(rec, root, clock.now())
     say(f"Resumed {tracked} pools with snapshots still due." if tracked else "Starting fresh.")
     deadline = clock.now() + timedelta(minutes=minutes) if minutes is not None else None
     chores = Housekeeping(root, rec, clock, say)
     rec.start()
+    reason, error = "time_limit", None
     try:
         while deadline is None or clock.now() < deadline:
             pause = rec.step()
             chores()
             sleep(pause.total_seconds())
     except KeyboardInterrupt:
+        reason = "ctrl_c"
         say("Stopping (Ctrl+C)...")
+    except BaseException as exc:
+        reason, error = "error", describe_error(exc)
+        raise
     finally:
-        rec.stop()
+        rec.stop(reason, error)

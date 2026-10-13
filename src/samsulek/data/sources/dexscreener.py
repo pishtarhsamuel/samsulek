@@ -153,17 +153,22 @@ def parse_pairs(
     fetched_at: datetime,
     *,
     chain: str = "solana",
+    sent_at: datetime | None = None,
 ) -> PairsBatch:
-    """Parse a /latest/dex/pairs response for the ``requested`` addresses (any header case)."""
+    """Parse a /latest/dex/pairs response for the ``requested`` addresses (any header case).
+    ``sent_at`` (when the request went out) widens the clock check backwards: an answer
+    read after the PC slept is old, not proof of a wrong clock."""
     wanted = _check_request(requested, chain)
     if fetched_at.tzinfo is None:
         raise ValueError("fetched_at must be timezone-aware")
+    if sent_at is not None and sent_at.tzinfo is None:
+        raise ValueError("sent_at must be timezone-aware")
     fetched_at = fetched_at.astimezone(UTC)
     lower = {name.lower(): value for name, value in headers.items()}
     content_type = lower.get("content-type", "")
     if content_type.split(";", 1)[0].strip().lower() != "application/json":
         raise DexScreenerFormatError(f"expected application/json, got {_show(content_type)}")
-    as_of = _as_of(lower, fetched_at)
+    as_of = _as_of(lower, fetched_at, sent_at)
     doc = _object(_load_json(body), "response", _TOP_KEYS, _TOP_REQUIRED)
     if doc["schemaVersion"] != SCHEMA_VERSION:
         raise DexScreenerFormatError(f"unsupported schemaVersion {_show(doc['schemaVersion'])}")
@@ -208,7 +213,7 @@ def _check_request(addresses: Sequence[str], chain: str) -> tuple[str, ...]:
     return wanted
 
 
-def _as_of(headers: Mapping[str, str], fetched_at: datetime) -> datetime:
+def _as_of(headers: Mapping[str, str], fetched_at: datetime, sent_at: datetime | None = None) -> datetime:
     raw_date = headers.get("date")
     if raw_date is None:
         raise DexScreenerFormatError("no Date header: the snapshot can't be timestamped")
@@ -219,7 +224,8 @@ def _as_of(headers: Mapping[str, str], fetched_at: datetime) -> datetime:
     if server.tzinfo is None:
         raise DexScreenerFormatError(f"Date header without a time zone: {_show(raw_date)}")
     server = server.astimezone(UTC)
-    if abs(server - fetched_at) > MAX_CLOCK_SKEW:
+    earliest = (sent_at if sent_at is not None else fetched_at).astimezone(UTC) - MAX_CLOCK_SKEW
+    if not earliest <= server <= fetched_at + MAX_CLOCK_SKEW:
         raise DexScreenerFormatError(
             f"server Date {server.isoformat()} is more than {MAX_CLOCK_SKEW} away from our clock "
             f"{fetched_at.isoformat()}: check this computer's clock (or a stale cached response)"
@@ -462,4 +468,11 @@ class DexScreenerSource:
             )
         if response.status != 200:
             raise DexScreenerFormatError(f"expected HTTP 200, got {response.status}")
-        return parse_pairs(response.body, response.headers, wanted, response.received_at, chain=chain)
+        return parse_pairs(
+            response.body,
+            response.headers,
+            wanted,
+            response.received_at,
+            chain=chain,
+            sent_at=response.sent_at,
+        )

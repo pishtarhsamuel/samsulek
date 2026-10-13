@@ -12,7 +12,7 @@ import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -321,3 +321,26 @@ def test_the_test_suite_cannot_reach_the_internet() -> None:
         socket.create_connection(("example.com", 443), timeout=1)
     with pytest.raises(RuntimeError, match="must not use the network"):
         urllib.request.urlopen("https://example.com/", timeout=1)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [http.client.BadStatusLine("HTTP/1.1 20"), http.client.LineTooLong("header line")],
+    ids=["cut-status-line", "line-too-long"],
+)
+def test_a_connection_cut_before_the_body_is_a_retryable_network_error(error: Exception) -> None:
+    sleeps: list[float] = []
+    assert client(Script(error, FakeRaw(body=b"ok")), sleeps).get(URL).body == b"ok"
+    assert sleeps == [2.0]
+
+
+def test_responses_say_when_the_request_was_sent() -> None:
+    times = iter([NOW, NOW + timedelta(minutes=40)])
+    c = HttpClient(
+        user_agent="samsulek-test/0",
+        allowed_hosts=frozenset({HOST}),
+        opener=Script(FakeRaw()),
+        now=lambda: next(times),
+    )
+    r = c.get(URL)
+    assert (r.sent_at, r.received_at) == (NOW, NOW + timedelta(minutes=40))

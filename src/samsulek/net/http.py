@@ -81,6 +81,9 @@ class Response:
     headers: Mapping[str, str]  # lower-case names
     body: bytes
     received_at: datetime  # UTC, when the response arrived (point-in-time "known at")
+    # UTC, when the request was sent. The answer was generated between the two; if the
+    # PC slept in the middle, the gap is wide and a server Date in it is still honest.
+    sent_at: datetime | None = None
 
     def text(self, encoding: str = "utf-8") -> str:
         return self.body.decode(encoding)
@@ -255,6 +258,7 @@ class HttpClient:
         return float(self.backoff_seconds * (2 ** (attempt - 1)))
 
     def _send(self, request: urllib.request.Request, url: str) -> Response:
+        sent_at = self.now()
         try:
             raw = self.opener(request, self.timeout)
         except urllib.error.HTTPError as exc:
@@ -281,8 +285,12 @@ class HttpClient:
             if isinstance(exc.reason, ssl.SSLCertVerificationError):
                 raise HttpError(f"TLS certificate check failed: {exc.reason}", url=url) from exc
             raise _Retryable(f"network error: {exc.reason}", status=None) from exc
-        except (TimeoutError, ConnectionError, OSError) as exc:
-            raise _Retryable(f"network error: {type(exc).__name__}: {exc}", status=None) from exc
+        except (TimeoutError, OSError, http.client.HTTPException) as exc:
+            # Includes a connection cut inside the status line or headers (BadStatusLine,
+            # LineTooLong...): urllib doesn't wrap those, and they are network failures.
+            raise _Retryable(
+                f"network error: {type(exc).__name__}: {_clean(str(exc), 200)}", status=None
+            ) from exc
         try:
             headers = {k.lower(): v for k, v in raw.getheaders()}
             data = raw.read(self.max_bytes + 1)
@@ -297,7 +305,14 @@ class HttpClient:
                 )
             if headers.get("content-encoding", "").lower() == "gzip":
                 data = _gunzip(data, self.max_bytes, url)
-            return Response(url=url, status=raw.status, headers=headers, body=data, received_at=self.now())
+            return Response(
+                url=url,
+                status=raw.status,
+                headers=headers,
+                body=data,
+                received_at=self.now(),
+                sent_at=sent_at,
+            )
         except (TimeoutError, OSError, http.client.HTTPException) as exc:
             # A connection dropped mid-body (IncompleteRead, a TLS error while reading,
             # a reset): the same kind of failure as one before the answer, so retryable.

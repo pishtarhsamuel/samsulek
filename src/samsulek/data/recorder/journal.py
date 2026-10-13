@@ -76,10 +76,19 @@ class Journal:
         return fh
 
     def sync(self) -> None:
-        """Force written records to disk (call periodically and before exiting)."""
-        for _, fh in self._open.values():
-            fh.flush()
-            os.fsync(fh.fileno())
+        """Force written records to disk (call periodically and before exiting).
+
+        Files of past hours are closed here too: a stream that goes quiet must not keep
+        an old hour file open for days (Windows can't delete an open file, so the daily
+        compaction would fail on it)."""
+        current = hour_file_name(self._clock.now())
+        for stream, (name, fh) in list(self._open.items()):
+            if name == current:
+                fh.flush()
+                os.fsync(fh.fileno())
+            else:
+                _close(fh)
+                del self._open[stream]
 
     def close(self) -> None:
         for _, fh in self._open.values():

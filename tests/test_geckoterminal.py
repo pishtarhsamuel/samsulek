@@ -597,3 +597,13 @@ def test_fetched_at_must_be_timezone_aware() -> None:
 def test_untrusted_text_becomes_short_printable_ascii(raw: str, clean: str) -> None:
     assert clean_text(raw) == clean
     assert len(clean) <= 40 and all(" " <= ch <= "~" for ch in clean)
+
+
+def test_an_answer_read_after_the_pc_slept_is_old_not_a_clock_problem() -> None:
+    late = FETCHED + timedelta(minutes=40)  # received 40 min after the server's Date
+    with pytest.raises(GeckoTerminalFormatError, match="clock"):
+        parse_new_pools(body(P1), headers(P1), late)
+    page = parse_new_pools(body(P1), headers(P1), late, sent_at=FETCHED - timedelta(seconds=1))
+    assert page.fetched_at == late and len(page.pools) == 4, "sent before the Date: honest, just old"
+    with pytest.raises(GeckoTerminalFormatError, match="clock"):
+        parse_new_pools(body(P1), headers(P1), late, sent_at=late - timedelta(seconds=1))

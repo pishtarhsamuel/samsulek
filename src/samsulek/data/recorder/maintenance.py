@@ -14,9 +14,11 @@ pools that still have snapshots due.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -60,7 +62,8 @@ def _parse(ts: object) -> datetime | None:
 @dataclass
 class Health:
     last_beat: datetime | None = None
-    stopped_at: datetime | None = None  # a clean stop after the latest start
+    stopped_at: datetime | None = None  # a recorded stop after the latest start
+    stop_error: str | None = None  # set when that stop was caused by an error
     counts: dict[str, int] = field(default_factory=dict)
     gap_count: dict[str, int] = field(default_factory=dict)
     gap_seconds: dict[str, float] = field(default_factory=dict)
@@ -81,6 +84,10 @@ class Health:
         out: list[str] = []
         if self.last_beat is None:
             out.append("Recorder: never ran (no heartbeat yet).")
+        elif self.stopped_at is not None and self.stop_error is not None:
+            out.append(
+                f"Recorder: STOPPED after an error at {self.stopped_at:%Y-%m-%d %H:%M} UTC: {self.stop_error}"
+            )
         elif self.stopped_at is not None:
             out.append(f"Recorder: STOPPED cleanly at {self.stopped_at:%Y-%m-%d %H:%M} UTC")
         else:
@@ -147,9 +154,12 @@ def health(root: Path, now: datetime) -> Health:
         if event == "start":
             last_start = _parse(r.get("recorded_at"))
             h.stopped_at = None
+            h.stop_error = None
             down.clear()
         elif event == "stop":
             h.stopped_at = _parse(r.get("recorded_at"))
+            if r.get("reason") == "error":
+                h.stop_error = str(r.get("error") or "unknown error")[:200]
         elif event == "gap":
             kind = str(r.get("kind"))
             h.gap_count[kind] = h.gap_count.get(kind, 0) + 1
@@ -204,6 +214,7 @@ class CompactReport:
     days_written: list[str] = field(default_factory=list)
     files_removed: int = 0
     skipped: list[str] = field(default_factory=list)
+    finished: list[str] = field(default_factory=list)  # leftovers of an earlier run removed
 
 
 def compact(root: Path, now: datetime, keep: timedelta = RAW_KEEP) -> CompactReport:
@@ -231,40 +242,39 @@ def compact(root: Path, now: datetime, keep: timedelta = RAW_KEEP) -> CompactRep
 
 
 def _compact_day(con: Any, folder: Path, day: str, files: list[Path], report: CompactReport) -> None:
+    """One stream-day. Memory stays small whatever the day's size: Python only hashes the
+    journal lines as it reads them, and DuckDB reads the files itself."""
     target = folder / f"{day}.parquet"
     label = f"{folder.name}/{day}"
-    if target.exists():
-        report.skipped.append(f"{label}: a Parquet file for this day already exists; raw files kept")
-        return
-    lines, damaged = _valid_lines(files)
+    count, damaged, digest = _scan(files)
     if damaged:
         report.skipped.append(f"{label}: {damaged} damaged line(s); left as raw text")
         return
-    if not lines:
+    if count == 0:
+        return
+    if target.exists():
+        _finish_earlier(con, target, files, label, report)
         return
     tmp = folder / f".{day}.parquet.tmp"
+    sources = ", ".join(_sql_text(p) for p in files)
     try:
+        # The only text put into SQL is our own file paths, quoted by _sql_text.
         con.execute(
-            "CREATE OR REPLACE TEMP TABLE day_lines AS "
-            "SELECT unnest(range(len($lines))) AS n, unnest($lines) AS record",
-            {"lines": lines},
+            "COPY (SELECT json_extract_string(line, '$.recorded_at') AS recorded_at, line AS record FROM ("  # noqa: S608
+            "SELECT filename, unnest(range(len(parts))) AS i, unnest(parts) AS line FROM ("
+            f"SELECT filename, string_split(content, chr(10)) AS parts FROM read_text([{sources}])"
+            ")) WHERE line <> '' ORDER BY filename, i) "
+            f"TO {_sql_text(tmp)} (FORMAT parquet, COMPRESSION zstd)"
         )
-        # The only text put into SQL is our own temp-file path, quoted by _sql_text.
-        con.execute(
-            "COPY (SELECT json_extract_string(record, '$.recorded_at') AS recorded_at, record "  # noqa: S608
-            f"FROM day_lines ORDER BY n) TO {_sql_text(tmp)} (FORMAT parquet, COMPRESSION zstd)"
-        )
-        con.execute("DROP TABLE day_lines")
-        readback = con.execute(f"SELECT record FROM read_parquet({_sql_text(tmp)})")  # noqa: S608
-        stored = [r[0] for r in readback.fetchall()]
+        stored_count, stored_digest = _parquet_digest(con, tmp)
     except Exception as exc:  # keep the raw files
         tmp.unlink(missing_ok=True)
         report.skipped.append(f"{label}: {type(exc).__name__}: {str(exc)[:200]}")
         return
-    if stored != lines:
+    if (stored_count, stored_digest) != (count, digest):
         tmp.unlink(missing_ok=True)
         report.skipped.append(
-            f"{label}: Parquet ({len(stored)} rows) does not match the journal ({len(lines)}); raw files kept"
+            f"{label}: Parquet ({stored_count} rows) does not match the journal ({count}); raw files kept"
         )
         return
     # On disk before anything is deleted: a power cut must not keep the deletions and
@@ -272,10 +282,58 @@ def _compact_day(con: Any, folder: Path, day: str, files: list[Path], report: Co
     fsync_file(tmp)
     os.replace(tmp, target)
     fsync_dir(folder)
-    for path in files:
-        path.unlink()
-        report.files_removed += 1
+    _remove(files, label, report)
     report.days_written.append(label)
+
+
+def _finish_earlier(con: Any, target: Path, files: list[Path], label: str, report: CompactReport) -> None:
+    """A Parquet file exists but raw files are left: an earlier compaction couldn't delete
+    them (Windows can't delete a file another handle has open). Delete them only if every
+    remaining line is already in the Parquet file; otherwise keep everything."""
+    try:
+        stored = _parquet_hashes(con, target)
+    except Exception as exc:
+        report.skipped.append(
+            f"{label}: can't read the existing Parquet file ({type(exc).__name__}); raw files kept"
+        )
+        return
+    if all(_line_hash(line) in stored for line in _iter_valid(files)):
+        _remove(files, label, report)
+        report.finished.append(label)
+    else:
+        report.skipped.append(f"{label}: a Parquet file for this day already exists; raw files kept")
+
+
+def _remove(files: list[Path], label: str, report: CompactReport) -> None:
+    for path in files:
+        try:
+            path.unlink()
+        except OSError as exc:  # e.g. still open elsewhere on Windows: the next run finishes it
+            report.skipped.append(f"{label}: could not delete {path.name} yet ({type(exc).__name__})")
+            continue
+        report.files_removed += 1
+
+
+def _parquet_digest(con: Any, path: Path) -> tuple[int, str]:
+    digest, count = hashlib.sha256(), 0
+    cursor = con.execute(f"SELECT record FROM read_parquet({_sql_text(path)})")  # noqa: S608
+    while rows := cursor.fetchmany(10_000):
+        for (record,) in rows:
+            digest.update(record.encode("utf-8") + b"\n")
+            count += 1
+    return count, digest.hexdigest()
+
+
+def _parquet_hashes(con: Any, path: Path) -> set[bytes]:
+    hashes: set[bytes] = set()
+    cursor = con.execute(f"SELECT record FROM read_parquet({_sql_text(path)})")  # noqa: S608
+    while rows := cursor.fetchmany(10_000):
+        hashes.update(_line_hash(record) for (record,) in rows)
+    return hashes
+
+
+def _line_hash(line: str) -> bytes:
+    return hashlib.sha256(line.encode("utf-8")).digest()
 
 
 def _sql_text(path: Path) -> str:
@@ -283,26 +341,38 @@ def _sql_text(path: Path) -> str:
     return "'" + str(path).replace("'", "''") + "'"
 
 
-def _valid_lines(files: list[Path]) -> tuple[list[str], int]:
-    """Every whole record line, byte for byte, in order; and how many lines are damaged.
-    A crash-cut last line counts as damaged here: only fully intact days are compacted."""
-    lines: list[str] = []
-    damaged = 0
+def _scan(files: list[Path]) -> tuple[int, int, str]:
+    """Whole record lines (count and a hash of them, in order) and damaged lines. A
+    crash-cut last line counts as damaged here: only fully intact days are compacted."""
+    digest, count, damaged = hashlib.sha256(), 0, 0
     for path in files:
-        for raw in path.read_bytes().decode("utf-8", errors="replace").split("\n"):
-            if not raw:
-                continue
-            try:
-                record: Any = json.loads(raw)
-            except ValueError:
-                damaged += 1
-                continue
-            if (
-                isinstance(record, dict)
-                and isinstance(record.get("recorded_at"), str)
-                and "\ufffd" not in raw
-            ):
-                lines.append(raw)
+        for raw, ok in _lines(path):
+            if ok:
+                digest.update(raw.encode("utf-8") + b"\n")
+                count += 1
             else:
                 damaged += 1
-    return lines, damaged
+    return count, damaged, digest.hexdigest()
+
+
+def _iter_valid(files: list[Path]) -> Iterator[str]:
+    for path in files:
+        for raw, ok in _lines(path):
+            if ok:
+                yield raw
+
+
+def _lines(path: Path) -> Iterator[tuple[str, bool]]:
+    """Each non-empty line of one hour file, and whether it is a whole journal record."""
+    for raw in path.read_bytes().decode("utf-8", errors="replace").split("\n"):
+        if not raw:
+            continue
+        try:
+            record: Any = json.loads(raw)
+        except ValueError:
+            yield raw, False
+            continue
+        yield (
+            raw,
+            isinstance(record, dict) and isinstance(record.get("recorded_at"), str) and "\ufffd" not in raw,
+        )

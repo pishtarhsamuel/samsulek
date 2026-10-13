@@ -268,9 +268,43 @@ def test_a_day_already_compacted_is_not_overwritten(tmp_path: Path) -> None:
     existing.write_bytes(b"earlier result")
     report = compact(tmp_path, datetime(2026, 10, 10, tzinfo=UTC))
     assert report.days_written == [] and report.files_removed == 0
-    assert "already exists" in report.skipped[0]
+    assert "raw files kept" in report.skipped[0], "can't confirm the lines are in it: keep them"
     assert existing.read_bytes() == b"earlier result"
     assert (tmp_path / "pools" / "20261001T00Z.jsonl").exists()
+
+
+def test_raw_files_an_earlier_run_could_not_delete_are_removed_once_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_days(tmp_path, datetime(2026, 10, 1, tzinfo=UTC), hours=3)
+    folder = tmp_path / "pools"
+    stuck = folder / "20261001T01Z.jsonl"
+    real_unlink = Path.unlink
+
+    def windows_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self == stuck:  # Windows refuses to delete a file another handle has open
+            raise PermissionError(32, "The process cannot access the file")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", windows_unlink)
+    first = compact(tmp_path, datetime(2026, 10, 10, tzinfo=UTC))
+    assert first.days_written == ["pools/20261001"] and first.files_removed == 2
+    assert "could not delete 20261001T01Z.jsonl yet" in first.skipped[0]
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    second = compact(tmp_path, datetime(2026, 10, 10, tzinfo=UTC))
+    assert second.finished == ["pools/20261001"] and second.files_removed == 1
+    assert sorted(x.name for x in folder.iterdir()) == ["20261001.parquet"]
+
+
+def test_raw_lines_missing_from_an_existing_parquet_file_are_kept(tmp_path: Path) -> None:
+    write_days(tmp_path, datetime(2026, 10, 1, tzinfo=UTC), hours=2)
+    assert compact(tmp_path, datetime(2026, 10, 10, tzinfo=UTC)).days_written == ["pools/20261001"]
+    clock = FixedClock(datetime(2026, 10, 1, 5, tzinfo=UTC))
+    with Journal(tmp_path, clock) as j:  # a line the Parquet file doesn't have
+        j.append("pools", {"pool_address": "LATE"})
+    report = compact(tmp_path, datetime(2026, 10, 10, tzinfo=UTC))
+    assert report.finished == [] and "already exists; raw files kept" in report.skipped[0]
+    assert (tmp_path / "pools" / "20261001T05Z.jsonl").exists()
 
 
 class Readback:
@@ -279,6 +313,10 @@ class Readback:
 
     def fetchall(self) -> list[tuple[str]]:
         return self.rows
+
+    def fetchmany(self, size: int) -> list[tuple[str]]:
+        rows, self.rows = self.rows, []
+        return rows
 
 
 class AlteredReadback:

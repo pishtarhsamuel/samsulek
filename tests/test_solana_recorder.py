@@ -419,8 +419,9 @@ def test_a_failing_source_is_paused_longer_each_time_and_the_others_keep_going(t
     assert waits == [150, 150, 150, 240, 480, 600, 600]
     assert len(r.chain.sig_calls) == 40, "the chain's creation counter kept its 60-second rhythm"
     r.discovery.fail = None
-    r.clock.advance(timedelta(minutes=10))
-    r.rec.step()
+    for _ in range(10 * 12):  # ten more minutes of normal running
+        r.rec.step()
+        r.clock.advance(timedelta(seconds=5))
     r.clock.advance(timedelta(seconds=150))
     attempts.clear()
     r.rec.step()
@@ -707,3 +708,66 @@ def test_memory_stays_bounded_over_a_long_run(tmp_path: Path) -> None:
     assert len(r.stream("pools")) == 200
     assert len(r.rec._seen) <= 7, "only pools the feed could still show (6 h)"
     assert len(r.rec._mint_program) <= 1, "only mints a tracked pool or holder list needs"
+
+
+def test_ctrl_c_during_a_call_still_records_the_jobs_it_had_taken(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0, dex="meteora"), pool(2, T0, dex="meteora")]}
+    r.chain.mints_fail = KeyboardInterrupt()  # Ctrl+C lands inside the RPC call
+    r.rec.start()
+    with pytest.raises(KeyboardInterrupt):
+        r.rec.step()
+    r.rec.stop("ctrl_c")
+    assert [(m["mint"], m.get("skipped")) for m in r.stream("mint_facts")] == [
+        ("M1", "stopped"),
+        ("M2", "stopped"),
+    ]
+
+
+def test_ctrl_c_during_a_snapshot_call_records_those_snapshots_as_stopped(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0, dex="meteora")]}
+    r.rec.step()
+    r.snapshots.fail = KeyboardInterrupt()  # type: ignore[assignment]
+    r.clock.set(T0 + 5 * M)
+    with pytest.raises(KeyboardInterrupt):
+        r.rec.step()
+    (s,) = r.stream("snapshot_skipped")
+    assert (s["what"], s["target_age_minutes"], s["reason"]) == ("pair", 5.0, "stopped")
+
+
+def test_a_failed_round_gap_is_written_once_however_often_the_recorder_restarts(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0 - 10 * M, dex="meteora")]}
+    r.rec.step()
+    r.clock.advance(timedelta(seconds=150))
+    r.discovery.pages = {1: [pool(3, T0 - 2 * M, dex="meteora"), pool(2, T0 - 4 * M, dex="meteora")]}
+    failing_on_page(r, 2, HttpError("HTTP 503", url="x", status=503))
+    r.rec.step()  # the gap is written in-process
+    r.journal.close()
+    for restart in range(2):
+        again = Rig(tmp_path)
+        again.clock.set(T0 + (5 + restart) * M)
+        again.rec.restore(again.stream("pools"), [], again.stream("mint_facts"), again.stream("gt_pages"))
+        again.journal.close()
+    assert len(gaps(r, "discovery_incomplete")) == 1
+
+
+def test_a_crashed_round_gap_is_written_once_however_often_the_recorder_restarts(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0 - 10 * M, dex="meteora")]}
+    r.rec.step()
+    r.clock.advance(timedelta(seconds=150))
+    r.discovery.pages = {1: [pool(3, T0 - 2 * M, dex="meteora"), pool(2, T0 - 4 * M, dex="meteora")]}
+    failing_on_page(r, 2, KeyboardInterrupt())  # cut off mid-round: nothing written in-process
+    with pytest.raises(KeyboardInterrupt):
+        r.rec.step()
+    r.journal.close()
+    for restart in range(3):
+        again = Rig(tmp_path)
+        again.clock.set(T0 + (5 + restart) * M)
+        again.rec.restore(again.stream("pools"), [], again.stream("mint_facts"), again.stream("gt_pages"))
+        again.journal.close()
+    assert len(gaps(r, "discovery_incomplete")) == 1, (
+        "the first restart writes it; later ones don't repeat it"
+    )

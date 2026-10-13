@@ -30,7 +30,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Protocol
@@ -263,17 +263,17 @@ class SolanaRecorder:
             fn()
         except HttpError as exc:
             if exc.status in (401, 403):  # blocked / not allowed: don't hammer
-                self._disable(task, _describe(exc))
+                self._disable(task, describe_error(exc))
             else:
                 wait = getattr(exc, "retry_after", None)  # a RateLimitedError says how long
-                self._source_down(source, _describe(exc), at_least=wait)
+                self._source_down(source, describe_error(exc), at_least=wait)
         except SolanaRpcError as exc:
             if exc.code in TRANSIENT_RPC_CODES:
-                self._source_down(source, _describe(exc))
+                self._source_down(source, describe_error(exc))
             else:
-                self._disable(task, _describe(exc))
+                self._disable(task, describe_error(exc))
         except Exception as exc:
-            self._disable(task, _describe(exc))
+            self._disable(task, describe_error(exc))
         else:
             self._source_pause.pop(source, None)
             self._source_retry_at.pop(source, None)
@@ -377,11 +377,13 @@ class SolanaRecorder:
     def start(self) -> None:
         self._coverage.start()
 
-    def stop(self) -> None:
-        """Record what was still waiting (it is not carried over to the next run), then stop."""
+    def stop(self, reason: str = "stopped", error: str | None = None) -> None:
+        """Record what was still waiting (it is not carried over to the next run), then stop.
+        ``reason`` says why (ctrl_c, time_limit, error...), so a crash never reads as a
+        clean stop."""
         for task in ("mints", "curves", "holders"):
             self._drop_jobs(task, "stopped")
-        self._coverage.stop()
+        self._coverage.stop(reason, error)
 
     def run(self, sleep: Callable[[float], None], should_stop: Callable[[], bool]) -> None:
         self.start()
@@ -405,6 +407,7 @@ class SolanaRecorder:
             # were never shown to us: say so in creation time, then report the error.
             if not failed.overlapped and previous_newest is not None and failed.oldest is not None:
                 self._feed_gap("discovery_incomplete", previous_newest, failed.oldest)
+            self._close_round()  # its gap (if any) is written: a restart must not repeat it
             raise failed.error from None
         self._write("gt_pages", {"round_complete": True, "newest_created": self._newest_seen_created})
         if not overlapped and previous_newest is not None and oldest_this_round is not None:
@@ -445,6 +448,9 @@ class SolanaRecorder:
         except Exception as exc:
             raise _RoundFailed(exc, oldest_this_round, overlapped) from exc
         return oldest_this_round, overlapped
+
+    def _close_round(self) -> None:
+        self._write("gt_pages", {"round_closed": True, "newest_created": self._newest_seen_created})
 
     def _feed_gap(self, kind: str, start: datetime, end: datetime) -> None:
         """A gap in CREATION time: pools created in (start, end) may never have been seen."""
@@ -544,7 +550,7 @@ class SolanaRecorder:
         batch = [self._mint_queue.popleft() for _ in range(min(100, len(self._mint_queue)))]
         try:
             result = self._chain.mints(batch)
-        except Exception:
+        except BaseException:  # also Ctrl+C: put them back so stop() records them
             self._mint_queue.extendleft(reversed(batch))  # retry them next time
             raise
         for mint in batch:
@@ -565,9 +571,10 @@ class SolanaRecorder:
             return
         try:
             batch = self._snapshots.pairs([d.pool for d in take])
-        except Exception:
-            for d in take:  # these snapshots won't happen: say so, then report the error
-                self._skip("pair", d.pool, d, "source_error")
+        except BaseException as exc:  # these snapshots won't happen: say so, then re-raise
+            why = "source_error" if isinstance(exc, Exception) else "stopped"
+            for d in take:
+                self._skip("pair", d.pool, d, why)
             raise
         for d in take:
             info = self._pool_info.get(d.pool)
@@ -629,7 +636,7 @@ class SolanaRecorder:
             return
         try:
             slot, accounts = self._chain.accounts_raw([pool for pool, _ in batch])
-        except Exception:
+        except BaseException:  # also Ctrl+C: put them back so stop() records them
             self._curve_queue.extendleft(reversed(batch))  # retried next time (or dropped if switched off)
             raise
         fetched = self._clock.now()
@@ -677,7 +684,7 @@ class SolanaRecorder:
             return
         try:
             result = self._chain.token_holders(mint, program)
-        except Exception:
+        except BaseException:  # also Ctrl+C: put it back so stop() records it
             self._holder_queue.appendleft((pool, mint, d))
             raise
         fetched = self._clock.now()
@@ -715,10 +722,10 @@ class SolanaRecorder:
 
     def restore(
         self,
-        pools: Sequence[Mapping[str, Any]],
-        snapshot_records: Sequence[Mapping[str, Any]],
-        mint_facts: Sequence[Mapping[str, Any]],
-        rounds: Sequence[Mapping[str, Any]],
+        pools: Iterable[Mapping[str, Any]],
+        snapshot_records: Iterable[Mapping[str, Any]],
+        mint_facts: Iterable[Mapping[str, Any]],
+        rounds: Iterable[Mapping[str, Any]],
     ) -> None:
         """Rebuild state from the journal after a restart (records in file order).
 
@@ -744,7 +751,7 @@ class SolanaRecorder:
         complete_newest: datetime | None = None
         open_pages: list[Mapping[str, Any]] = []
         for r in rounds:
-            if r.get("round_complete"):
+            if r.get("round_complete") or r.get("round_closed"):
                 last_complete = _when(r.get("recorded_at"))
                 complete_newest = _when(r.get("newest_created"))
                 open_pages = []
@@ -771,6 +778,8 @@ class SolanaRecorder:
         reached_known = any(_int_or_zero(page.get("known_before")) > 0 for page in open_pages)
         if complete_newest is not None and unfinished_oldest is not None and not reached_known:
             self._feed_gap("discovery_incomplete", complete_newest, unfinished_oldest)
+        if open_pages:
+            self._close_round()  # dealt with: the next restart must not write the gap again
         self._forget_old()
 
 
@@ -796,7 +805,7 @@ def _int_or_zero(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _describe(exc: BaseException, limit: int = 500) -> str:
+def describe_error(exc: BaseException, limit: int = 500) -> str:
     """An error as one line of printable ASCII: it goes to the console and the journal."""
     text = " ".join(f"{type(exc).__name__}: {exc}".split())
     return "".join(ch if " " <= ch <= "~" else "?" for ch in text)[:limit]

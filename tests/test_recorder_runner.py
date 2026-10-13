@@ -229,6 +229,38 @@ def test_a_restart_resumes_the_schedule_without_repeating_it(tmp_path: Path) -> 
     assert gaps[0]["seconds"] == pytest.approx(40 * 60, abs=10)
 
 
+@pytest.mark.usefixtures("fast_limits")
+def test_a_crash_is_recorded_as_a_crash_not_a_clean_stop(tmp_path: Path) -> None:
+    read_fixture(GT_PAGE)
+    clock, _, journal, rec = setup(tmp_path)
+    real_step, calls = rec.step, [0]
+
+    def dies(*args: Any) -> Any:
+        calls[0] += 1
+        if calls[0] == 3:
+            raise PermissionError("[WinError 5] Access is denied: 'solana_heartbeat.json'")
+        return real_step(*args)
+
+    rec.step = dies
+    with journal, pytest.raises(PermissionError):
+        runner.run_recorder(tmp_path, rec, clock, lambda _: None, minutes=10, sleep=sleeper(clock))
+    end = [c for c in stream(tmp_path, "coverage") if c["event"] == "stop"][-1]
+    assert end["reason"] == "error" and "PermissionError" in end["error"]
+    line = maintenance.health(tmp_path, clock.now()).lines(clock.now())[0]
+    assert line.startswith("Recorder: STOPPED after an error at") and "PermissionError" in line
+
+
+@pytest.mark.usefixtures("fast_limits")
+def test_ctrl_c_and_the_time_limit_are_clean_stops(tmp_path: Path) -> None:
+    read_fixture(GT_PAGE)
+    clock, _, journal, rec = setup(tmp_path)
+    with journal:
+        runner.run_recorder(tmp_path, rec, clock, lambda _: None, minutes=1, sleep=sleeper(clock))
+    end = [c for c in stream(tmp_path, "coverage") if c["event"] == "stop"][-1]
+    assert end["reason"] == "time_limit" and "error" not in end
+    assert "STOPPED cleanly" in maintenance.health(tmp_path, clock.now()).lines(clock.now())[0]
+
+
 def test_the_raw_journal_outlives_the_restore_window(tmp_path: Path) -> None:
     clock = FixedClock(T0)
     with Journal(tmp_path, clock) as journal:

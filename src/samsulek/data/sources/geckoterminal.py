@@ -173,11 +173,20 @@ def check_page(page: int) -> None:
 
 
 def parse_new_pools(
-    body: bytes, headers: Mapping[str, str], fetched_at: datetime, page: int = 1
+    body: bytes,
+    headers: Mapping[str, str],
+    fetched_at: datetime,
+    page: int = 1,
+    *,
+    sent_at: datetime | None = None,
 ) -> NewPoolsPage:
-    """Parse one new_pools response (body + its HTTP headers). ``page`` is only a label."""
+    """Parse one new_pools response (body + its HTTP headers). ``page`` is only a label.
+    ``sent_at`` (when the request went out) widens the clock check backwards: an answer
+    read after the PC slept is old, not proof of a wrong clock."""
     require_aware(fetched_at, "fetched_at")
     fetched_at = fetched_at.astimezone(UTC)
+    if sent_at is not None:
+        require_aware(sent_at, "sent_at")
     check_page(page)
     lowered = _lower_headers(headers)
     content_type = lowered.get("content-type", "")
@@ -185,7 +194,7 @@ def parse_new_pools(
         raise GeckoTerminalFormatError(f"expected application/json, got {_show(content_type)}")
     if len(body) > MAX_BODY_BYTES:
         raise GeckoTerminalFormatError(f"response is {len(body)} bytes, more than {MAX_BODY_BYTES}")
-    server_date, as_of = _server_times(lowered, fetched_at)
+    server_date, as_of = _server_times(lowered, fetched_at, sent_at)
     doc = _load_json(body)
     if not isinstance(doc, dict):
         raise GeckoTerminalFormatError(f"expected a JSON object, got {type(doc).__name__}")
@@ -243,7 +252,9 @@ class GeckoTerminalSource:
         response = self._http.get(url, headers={"Accept": ACCEPT})
         if response.status != 200:
             raise GeckoTerminalFormatError(f"expected HTTP 200, got {response.status}")
-        return parse_new_pools(response.body, response.headers, response.received_at, page)
+        return parse_new_pools(
+            response.body, response.headers, response.received_at, page, sent_at=response.sent_at
+        )
 
 
 # ---------------------------------------------------------------------------- helpers
@@ -257,7 +268,9 @@ def _lower_headers(headers: Mapping[str, str]) -> dict[str, str]:
     return out
 
 
-def _server_times(headers: Mapping[str, str], fetched_at: datetime) -> tuple[datetime, datetime]:
+def _server_times(
+    headers: Mapping[str, str], fetched_at: datetime, sent_at: datetime | None = None
+) -> tuple[datetime, datetime]:
     """(server Date, as_of = Date - Age), both UTC, checked against our own clock."""
     raw_date = headers.get("date")
     if raw_date is None:
@@ -269,7 +282,8 @@ def _server_times(headers: Mapping[str, str], fetched_at: datetime) -> tuple[dat
     if server_date.tzinfo is None:
         raise GeckoTerminalFormatError(f"Date header without a time zone: {_show(raw_date)}")
     server_date = server_date.astimezone(UTC)
-    if abs(server_date - fetched_at) > MAX_CLOCK_SKEW:
+    earliest = (sent_at if sent_at is not None else fetched_at).astimezone(UTC) - MAX_CLOCK_SKEW
+    if not earliest <= server_date <= fetched_at + MAX_CLOCK_SKEW:
         raise GeckoTerminalFormatError(
             f"server Date {server_date.isoformat()} is more than {MAX_CLOCK_SKEW} away from our clock "
             f"{fetched_at.isoformat()}: check this computer's clock"

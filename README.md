@@ -224,11 +224,16 @@ It prints a short progress line every 30 minutes. **Stop it with Ctrl+C**
 (wait for `Recorder stopped`). To try it for a few minutes first:
 `uv run samsulek record solana --minutes 5`.
 
-To see what it did in the last 24 hours, from any other window:
+To see what it did in the last 24 hours, open a second PowerShell window (the
+first one is busy recording), go to the project folder, and ask:
 
 ```powershell
+cd $HOME\samsulek
 uv run samsulek record status
 ```
+
+(Without the `cd`, a new window starts in your home folder and `uv` answers
+"Failed to spawn: samsulek": it only finds the bot inside its folder.)
 
 What to expect:
 
@@ -236,6 +241,9 @@ What to expect:
   time is lost for good (there is no free way to fetch it later), and the gap
   is written down. In Windows Settings > System > Power, set "When plugged in,
   put my device to sleep after" to **Never** while you record.
+- Don't click inside the recorder's window. Selecting text there pauses the
+  program until you press Esc or Enter (a Windows console feature), and the
+  pause is recorded as a gap.
 - Disk space: roughly 100-300 MB per day of recording (estimated from a short
   test run; it depends on how many tokens are launched). The newest 7 days stay
   as plain text, so expect up to about 2 GB. Older days are packed into Parquet

@@ -104,6 +104,10 @@ Known limits, stated plainly:
   pool *creation* time: pools created inside them may never have been seen.
   `not_running`, `source_down` and `task_off` (a task switched off until the next
   restart, e.g. a blocked RPC method) are gaps in *clock* time. Use both.
+  `not_running` with `reason: stalled` means the process lived but its loop froze
+  (the PC slept with the window open). Gaps flagged `open_at_crash` were closed by
+  the next start after an unclean exit, at the last heartbeat. A `stop` event says
+  why the run ended (`ctrl_c`, `time_limit`, or `error` with the error).
 - **The pump.fun launch counter** starts a new baseline after every restart, so no
   counting window spans downtime.
 - **DexScreener has no liquidity figure** for pump.fun bonding-curve and Meteora DBC

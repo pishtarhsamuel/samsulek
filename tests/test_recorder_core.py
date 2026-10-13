@@ -206,3 +206,79 @@ def test_a_damaged_heartbeat_file_is_reported_not_trusted(tmp_path: Path) -> Non
     events = [r["event"] for r in records(tmp_path, "coverage")]
     assert events[0] == "heartbeat_unreadable"
     assert "gap" not in events
+
+
+def test_files_of_past_hours_are_closed_at_the_next_sync(tmp_path: Path) -> None:
+    clock = FixedClock(T)  # 21:59:30
+    with Journal(tmp_path, clock) as j:
+        j.append("tasks", {"event": "task_disabled"})  # a stream that then goes quiet
+        clock.advance(timedelta(hours=2))
+        j.append("pools", {"pool": "A"})
+        j.sync()
+        assert sorted(j._open) == ["pools"], "no handle outlives its hour (Windows can't delete open files)"
+
+
+def test_a_frozen_loop_is_a_gap_even_though_the_process_lived(tmp_path: Path) -> None:
+    clock = FixedClock(T)
+    with Journal(tmp_path, clock) as j:
+        cov = Coverage(j, tmp_path, clock, "solana")
+        cov.start()
+        clock.advance(timedelta(minutes=1))
+        cov.beat()
+        clock.advance(timedelta(hours=8))  # the PC slept with the window open
+        cov.beat()
+        clock.advance(timedelta(minutes=4))  # an ordinary slow step is not a gap
+        cov.beat()
+    found = gaps(tmp_path)
+    assert [(g["kind"], g.get("reason"), g["seconds"]) for g in found] == [
+        ("not_running", "stalled", 8 * 3600.0)
+    ]
+
+
+def test_after_an_unclean_exit_open_outages_and_switched_off_tasks_get_their_gaps(tmp_path: Path) -> None:
+    clock = FixedClock(T)
+    with Journal(tmp_path, clock) as j:
+        cov = Coverage(j, tmp_path, clock, "solana")
+        cov.start()
+        cov.source_failed("dexscreener", "HTTP 503")
+        cov.task_off("discovery", "geckoterminal", "format changed")
+        for _ in range(60):
+            clock.advance(timedelta(minutes=1))
+            cov.beat()
+        # power cut: the run never records its end
+    clock.advance(timedelta(minutes=30))
+    with Journal(tmp_path, clock) as j:
+        Coverage(j, tmp_path, clock, "solana").start()
+    found = [
+        (
+            g["kind"],
+            g.get("source") if g["kind"] == "source_down" else g.get("task"),
+            g["seconds"],
+            g.get("open_at_crash"),
+        )
+        for g in gaps(tmp_path)
+    ]
+    assert found == [
+        ("source_down", "dexscreener", 3600.0, True),
+        ("task_off", "discovery", 3600.0, True),
+        ("not_running", None, 1800.0, None),
+    ]
+
+
+def test_a_clean_end_leaves_nothing_for_the_next_start_to_close(tmp_path: Path) -> None:
+    clock = FixedClock(T)
+    with Journal(tmp_path, clock) as j:
+        cov = Coverage(j, tmp_path, clock, "solana")
+        cov.start()
+        cov.task_off("discovery", "geckoterminal", "format changed")
+        clock.advance(timedelta(minutes=5))
+        cov.stop("ctrl_c")
+    clock.advance(timedelta(minutes=5))
+    with Journal(tmp_path, clock) as j:
+        Coverage(j, tmp_path, clock, "solana").start()
+    assert [(g["kind"], g.get("open_at_crash")) for g in gaps(tmp_path)] == [
+        ("task_off", None),
+        ("not_running", None),
+    ]
+    ends = [r for r in records(tmp_path, "coverage") if r["event"] == "stop"]
+    assert ends[0]["reason"] == "ctrl_c"
