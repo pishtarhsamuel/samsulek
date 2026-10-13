@@ -4,3 +4,5 @@
 *.ps1 text eol=crlf
 *.bat text eol=crlf
 *.cmd text eol=crlf
+# Recorded API responses are kept byte-for-byte (some servers send CRLF line endings).
+tests/fixtures/** -text

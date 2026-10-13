@@ -10,6 +10,7 @@ dependencies = [
   "pydantic==2.13.5",
   "PyYAML==6.0.3",
   "tzdata==2026.4",          # timezone database; Windows has none built in
+  "duckdb==1.5.5",           # local Parquet/SQL store (M2). No dependencies of its own.
 ]
 
 [project.scripts]
@@ -51,7 +52,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S603", "S607", "S108", "PLC0415", "PLR0917", "PT009", "PT018"]
+"tests/**" = ["S101", "S105", "S603", "S607", "S108", "S608", "PLC0415", "PLR0917", "PT009", "PT018"]
 ".claude/hooks/guard.py" = ["S", "PLW"]
 
 [tool.mypy]

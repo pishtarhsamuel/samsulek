@@ -7,7 +7,6 @@ import os
 import re
 import shutil
 import threading
-import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -29,7 +28,6 @@ from samsulek.risk.engine import RiskEngine
 from samsulek.risk.state import RiskStateStore, StateCorruptError
 from samsulek.runlock import AlreadyRunningError, RunLock
 from samsulek.strategies.base import StrategyContext
-from samsulek.terminal import confirm_phrase
 from samsulek.types import AccountSnapshot, Market, Position, Quote, Side, TargetWeights
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -255,27 +253,33 @@ def test_checklist_parser_fails_closed(tmp_path: Path) -> None:
 # ------------------------------------------------- #30 #34: real POSIX terminal
 @pytest.mark.skipif(os.name == "nt" or not hasattr(os, "fork"), reason="POSIX pseudo-terminal test")
 def test_real_tty_opener_reads_what_a_person_types() -> None:
-    import pty
-    import select
+    # Forking a multi-threaded process (DuckDB starts threads) can deadlock, so the
+    # pseudo-terminal dance runs in a fresh, single-threaded interpreter.
+    import subprocess
+    import sys
 
-    pid, fd = pty.fork()
-    if pid == 0:  # child: talks to the pseudo-terminal as its controlling terminal
-        try:
-            ok = confirm_phrase("Type it", "RESET 123456")
-            os._exit(0 if ok else 3)
-        except BaseException:
-            os._exit(4)
-    out = b""
-    deadline = time.monotonic() + 10
-    while b"> " not in out and time.monotonic() < deadline:
-        ready, _, _ = select.select([fd], [], [], 0.5)
-        if ready:
-            out += os.read(fd, 1024)
-    os.write(fd, b"RESET 123456\n")
-    _, status = os.waitpid(pid, 0)
-    os.close(fd)
-    assert b"RESET 123456" in out
-    assert os.WEXITSTATUS(status) == 0
+    script = (
+        "import os, pty, select, sys, time\n"
+        "from samsulek.terminal import confirm_phrase\n"
+        "pid, fd = pty.fork()\n"
+        "if pid == 0:\n"
+        "    try:\n"
+        "        os._exit(0 if confirm_phrase('Type it', 'RESET 123456') else 3)\n"
+        "    except BaseException:\n"
+        "        os._exit(4)\n"
+        "out = b''\n"
+        "deadline = time.monotonic() + 10\n"
+        "while b'> ' not in out and time.monotonic() < deadline:\n"
+        "    ready, _, _ = select.select([fd], [], [], 0.5)\n"
+        "    if ready:\n"
+        "        out += os.read(fd, 1024)\n"
+        "os.write(fd, b'RESET 123456\\n')\n"
+        "_, status = os.waitpid(pid, 0)\n"
+        "os.close(fd)\n"
+        "sys.exit(0 if b'RESET 123456' in out and os.WEXITSTATUS(status) == 0 else 1)\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", script], timeout=60, check=False, capture_output=True)
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
 
 
 # ------------------------------------------------- #25 #26: run lock

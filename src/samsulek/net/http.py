@@ -41,10 +41,11 @@ DEFAULT_MAX_BYTES = 20 * 1024 * 1024
 class HttpError(RuntimeError):
     """A request failed for good (after any retries). ``status`` is None for network errors."""
 
-    def __init__(self, message: str, *, url: str, status: int | None = None) -> None:
+    def __init__(self, message: str, *, url: str, status: int | None = None, body: str = "") -> None:
         super().__init__(message)
         self.url = url
         self.status = status
+        self.body = body  # first 2 KB of an error response, for callers that must read it
 
 
 class RateLimitedError(HttpError):
@@ -224,7 +225,8 @@ class HttpClient:
             raw = self.opener(request, self.timeout)
         except urllib.error.HTTPError as exc:
             status = exc.code
-            excerpt = _excerpt(exc.read(2048) if exc.fp is not None else b"")
+            raw_body = exc.read(2048) if exc.fp is not None else b""
+            excerpt = _excerpt(raw_body)
             retry_after = _retry_after(exc.headers.get("Retry-After") if exc.headers else None, self.now())
             exc.close()
             if status in RETRY_STATUSES:
@@ -234,7 +236,12 @@ class HttpClient:
                 raise HttpError(
                     f"HTTP {status} redirect to {where} not followed", url=url, status=status
                 ) from exc
-            raise HttpError(f"HTTP {status}: {excerpt}", url=url, status=status) from exc
+            raise HttpError(
+                f"HTTP {status}: {excerpt}",
+                url=url,
+                status=status,
+                body=raw_body.decode("utf-8", "replace"),
+            ) from exc
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, ssl.SSLCertVerificationError):
                 raise HttpError(f"TLS certificate check failed: {exc.reason}", url=url) from exc
