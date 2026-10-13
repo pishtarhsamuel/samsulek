@@ -151,9 +151,19 @@ class ReadReport:
 
 
 def read_stream(
-    root: Path, stream: str, report: ReadReport | None = None, *, before_file: str | None = None
+    root: Path,
+    stream: str,
+    report: ReadReport | None = None,
+    *,
+    before_file: str | None = None,
+    since: datetime | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Every record of ``stream`` in file order. ``before_file`` limits to closed hours (< that name)."""
+    """Every record of ``stream`` in file order.
+
+    ``before_file`` limits to closed hours (file names < that name); ``since`` skips whole
+    hour files that end before that time (records inside a kept file are all returned).
+    """
+    first_file = hour_file_name(since) if since is not None else None
     report = report if report is not None else ReadReport()
     if report.damaged_lines is None:
         report.damaged_lines = []
@@ -162,6 +172,8 @@ def read_stream(
         return
     for path in sorted(folder.glob("*" + FILE_SUFFIX)):
         if before_file is not None and path.name >= before_file:
+            continue
+        if first_file is not None and path.name < first_file:
             continue
         lines = path.read_text(encoding="utf-8").split("\n")
         # A complete file ends with "\n", so the final element is "".
