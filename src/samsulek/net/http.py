@@ -198,7 +198,8 @@ class HttpClient:
             try:
                 response = self._send(request, url)
             except _Retryable as exc:
-                wait = exc.retry_after if exc.retry_after is not None else self._backoff(attempt)
+                # Never retry faster than our own backoff: some servers send "Retry-After: 0".
+                wait = max(exc.retry_after or 0.0, self._backoff(attempt))
                 if exc.status == 429 and limiter is not None:
                     limiter.penalize(wait)
                 if attempt > self.retries:

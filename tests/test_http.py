@@ -119,6 +119,9 @@ def test_retry_after_is_honoured_and_too_long_waits_raise() -> None:
     sleeps2: list[float] = []
     client(Script(http_error(503, headers={"Retry-After": http_date}), FakeRaw()), sleeps2).get(URL)
     assert sleeps2 == [30.0]
+    sleeps3: list[float] = []  # GeckoTerminal sends "Retry-After: 0": still back off
+    client(Script(http_error(429, headers={"Retry-After": "0"}), FakeRaw()), sleeps3).get(URL)
+    assert sleeps3 == [2.0]
 
 
 def test_gives_up_after_the_retry_budget() -> None:

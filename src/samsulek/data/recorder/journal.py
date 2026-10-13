@@ -16,7 +16,8 @@ import os
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import IO, Any
 
@@ -133,6 +134,12 @@ def _json_default(obj: object) -> object:
     if isinstance(obj, datetime):
         require_aware(obj, "timestamp in record")
         return obj.astimezone(UTC).isoformat()
+    if isinstance(obj, Decimal):  # exact, as text (a float would round it)
+        return str(obj)
+    if isinstance(obj, date):
+        return obj.isoformat()
+    if isinstance(obj, timedelta):
+        return obj.total_seconds()
     raise TypeError(f"cannot store {type(obj).__name__} in the journal")
 
 
