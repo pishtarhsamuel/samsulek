@@ -6,18 +6,23 @@ Rules:
 - Every request has a timeout and a response size cap.
 - Each host has its own rate limiter, set BELOW the provider's documented limit.
 - Redirects are never followed (they could lead off the allow-list or to plain http).
-- Retries only what is safe to retry: timeouts, connection errors, 429 and 5xx. A
-  ``Retry-After`` header is honoured; one longer than ``max_retry_after`` raises
-  instead of stalling the caller for a long time.
+- Retries only what is safe to retry: timeouts, connection errors (also a connection
+  that drops mid-response, or a body shorter than its Content-Length), 429 and 5xx. A
+  ``Retry-After`` header is honoured; one longer than ``max_retry_after`` raises at once
+  (carrying the wait, capped at a day) instead of stalling the caller, and never leaves
+  the rate limiter blocked for longer than ``max_retry_after``.
 - Other 4xx answers are not retried: they mean our request is wrong.
 - Errors never include response bodies longer than a short excerpt (they may be HTML
-  pages) and never include request headers (they may one day carry credentials).
+  pages), never include request headers (they may one day carry credentials), never
+  include a URL's path or query (they can carry API keys), and contain printable ASCII
+  only (a provider's text must not drive the owner's terminal).
 """
 
 from __future__ import annotations
 
 import email.utils
 import gzip
+import http.client
 import io
 import json
 import logging
@@ -27,6 +32,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -36,6 +42,9 @@ log = logging.getLogger(__name__)
 
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 DEFAULT_MAX_BYTES = 20 * 1024 * 1024
+MAX_RETRY_AFTER_SECONDS = 86_400.0  # a longer Retry-After counts as a day
+MAX_PENALTY_SECONDS = 3_600.0  # no header can block a rate limiter for longer
+ERROR_BODY_BYTES = 2048
 
 
 class HttpError(RuntimeError):
@@ -49,7 +58,20 @@ class HttpError(RuntimeError):
 
 
 class RateLimitedError(HttpError):
-    """The provider said "slow down" for longer than we are willing to wait."""
+    """The provider said "slow down" for longer than we are willing to wait.
+    ``retry_after``: the wait it asked for in seconds (capped at a day), if it said."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        url: str,
+        status: int | None = None,
+        body: str = "",
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message, url=url, status=status, body=body)
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +151,9 @@ class RateLimiter:
                 self._sleep((1 - self._tokens) * self._interval)
 
     def penalize(self, seconds: float) -> None:
-        """After a 429: empty the bucket so the next request waits at least ``seconds``."""
+        """After a 429: empty the bucket so the next request waits at least ``seconds``
+        (never more than MAX_PENALTY_SECONDS, whatever a server asked for)."""
+        seconds = min(max(seconds, 0.0), MAX_PENALTY_SECONDS)
         with self._lock:
             self._tokens = min(self._tokens, 0.0) - seconds / self._interval
 
@@ -200,18 +224,27 @@ class HttpClient:
             except _Retryable as exc:
                 # Never retry faster than our own backoff: some servers send "Retry-After: 0".
                 wait = max(exc.retry_after or 0.0, self._backoff(attempt))
-                if exc.status == 429 and limiter is not None:
-                    limiter.penalize(wait)
-                if attempt > self.retries:
-                    cls = RateLimitedError if exc.status == 429 else HttpError
-                    raise cls(
-                        f"{exc} (gave up after {attempt} attempts)", url=url, status=exc.status
-                    ) from exc
                 if wait > self.max_retry_after:
+                    # Refuse before touching the limiter: a long wait must not block the
+                    # next call (and with it a single-threaded caller) for that long.
                     raise RateLimitedError(
                         f"{exc}; server asked to wait {wait:.0f}s, more than {self.max_retry_after:.0f}s",
                         url=url,
                         status=exc.status,
+                        retry_after=wait,
+                    ) from exc
+                if exc.status == 429 and limiter is not None:
+                    limiter.penalize(wait)
+                if attempt > self.retries:
+                    if exc.status == 429:
+                        raise RateLimitedError(
+                            f"{exc} (gave up after {attempt} attempts)",
+                            url=url,
+                            status=exc.status,
+                            retry_after=wait,
+                        ) from exc
+                    raise HttpError(
+                        f"{exc} (gave up after {attempt} attempts)", url=url, status=exc.status
                     ) from exc
                 log.info("retrying %s %s in %.1fs: %s", method, redact_url(url), wait, exc)
                 self.sleep(wait)
@@ -226,16 +259,17 @@ class HttpClient:
             raw = self.opener(request, self.timeout)
         except urllib.error.HTTPError as exc:
             status = exc.code
-            raw_body = exc.read(2048) if exc.fp is not None else b""
+            raw_body = _error_body(exc)
             excerpt = _excerpt(raw_body)
             retry_after = _retry_after(exc.headers.get("Retry-After") if exc.headers else None, self.now())
             exc.close()
             if status in RETRY_STATUSES:
                 raise _Retryable(f"HTTP {status}", status=status, retry_after=retry_after) from exc
             if 300 <= status < 400:
-                where = exc.headers.get("Location", "?") if exc.headers else "?"
+                where = exc.headers.get("Location", "") if exc.headers else ""
+                target = _clean(redact_url(where), 100) if where else "?"
                 raise HttpError(
-                    f"HTTP {status} redirect to {where} not followed", url=url, status=status
+                    f"HTTP {status} redirect to {target} not followed", url=url, status=status
                 ) from exc
             raise HttpError(
                 f"HTTP {status}: {excerpt}",
@@ -254,12 +288,21 @@ class HttpClient:
             data = raw.read(self.max_bytes + 1)
             if len(data) > self.max_bytes:
                 raise HttpError(f"response larger than {self.max_bytes} bytes", url=url, status=raw.status)
+            declared = headers.get("content-length", "")
+            if declared.isascii() and declared.isdigit() and len(data) < int(declared):
+                # http.client returns a short read without complaint when the server
+                # closes early: a cut-off body must never be taken for the whole answer.
+                raise _Retryable(
+                    f"network error: response cut short ({len(data)} of {declared} bytes)", status=None
+                )
             if headers.get("content-encoding", "").lower() == "gzip":
                 data = _gunzip(data, self.max_bytes, url)
             return Response(url=url, status=raw.status, headers=headers, body=data, received_at=self.now())
-        except (TimeoutError, ConnectionError) as exc:
+        except (TimeoutError, OSError, http.client.HTTPException) as exc:
+            # A connection dropped mid-body (IncompleteRead, a TLS error while reading,
+            # a reset): the same kind of failure as one before the answer, so retryable.
             raise _Retryable(
-                f"network error while reading: {type(exc).__name__}: {exc}", status=None
+                f"network error while reading: {type(exc).__name__}: {_clean(str(exc), 200)}", status=None
             ) from exc
         finally:
             raw.close()
@@ -277,15 +320,15 @@ def _retry_after(value: str | None, now: datetime) -> float | None:
     if not value:
         return None
     value = value.strip()
-    if value.isdigit():
-        return float(value)
+    if value.isascii() and value.isdigit():  # some non-ASCII digits pass isdigit() but not float()
+        return min(float(value), MAX_RETRY_AFTER_SECONDS)
     try:
         when = email.utils.parsedate_to_datetime(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
     if when.tzinfo is None:
         return None
-    return max(0.0, (when - now).total_seconds())
+    return min(max(0.0, (when - now).total_seconds()), MAX_RETRY_AFTER_SECONDS)
 
 
 def _gunzip(data: bytes, max_bytes: int, url: str) -> bytes:
@@ -299,9 +342,33 @@ def _gunzip(data: bytes, max_bytes: int, url: str) -> bytes:
     return out
 
 
+def _error_body(exc: urllib.error.HTTPError) -> bytes:
+    """The first bytes of an error answer, decompressed if gzip; never raises."""
+    if getattr(exc, "fp", None) is None:  # typeshed says never None; urllib says otherwise
+        return b""
+    try:
+        raw = exc.read(ERROR_BODY_BYTES)
+    except (OSError, http.client.HTTPException):
+        return b""
+    encoding = exc.headers.get("Content-Encoding", "") if exc.headers else ""
+    if encoding.lower() == "gzip":
+        try:  # tolerates a cut-off stream: only the start of it was read
+            return zlib.decompressobj(31).decompress(raw, ERROR_BODY_BYTES)
+        except zlib.error:
+            return b""
+    return raw
+
+
+def _clean(text: str, limit: int) -> str:
+    """Printable ASCII only (anything else becomes "?"), whitespace runs as one space,
+    at most ``limit`` characters: provider text must not reach a terminal raw."""
+    flat = " ".join(text.split())
+    out = "".join(ch if " " <= ch <= "~" else "?" for ch in flat)
+    return out[:limit] + ("..." if len(out) > limit else "")
+
+
 def _excerpt(body: bytes, limit: int = 200) -> str:
-    text = body.decode("utf-8", "replace").replace("\n", " ").strip()
-    return text[:limit] + ("..." if len(text) > limit else "")
+    return _clean(body.decode("utf-8", "replace"), limit)
 
 
 def redact_url(url: str) -> str:

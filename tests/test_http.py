@@ -6,6 +6,7 @@ import gzip
 import http.client
 import io
 import json
+import re
 import socket
 import ssl
 import urllib.error
@@ -198,6 +199,114 @@ def test_rate_limiter_spaces_requests_and_penalizes_after_429() -> None:
     limiter.penalize(3.0)
     limiter.acquire()
     assert sum(slept[1:]) == pytest.approx(3.5)
+
+
+class DropsMidBody(FakeRaw):
+    """A response whose connection dies while the body is being read."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__(body=b"")
+        self.error = error
+
+    def read(self, amt: int | None = None) -> bytes:
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        http.client.IncompleteRead(b'{"partial'),  # a clean close mid-chunk
+        ssl.SSLError("record layer failure"),  # an OSError, but not a ConnectionError
+        ConnectionResetError("reset"),
+    ],
+    ids=["incomplete-read", "tls-error", "reset"],
+)
+def test_a_connection_that_drops_mid_body_is_a_retryable_network_error(error: BaseException) -> None:
+    sleeps: list[float] = []
+    script = Script(DropsMidBody(error), FakeRaw(body=b"ok"))
+    assert client(script, sleeps).get(URL).body == b"ok"
+    assert sleeps == [2.0]
+    with pytest.raises(HttpError, match="network error while reading") as err:
+        client(Script(*[DropsMidBody(error) for _ in range(4)]), []).get(URL)
+    assert err.value.status is None, "a network failure, so callers treat it as an outage"
+
+
+def test_a_body_shorter_than_its_content_length_is_never_returned() -> None:
+    cut = FakeRaw(body=b'{"rate": 1.16', headers=[("Content-Length", "15")])
+    whole = FakeRaw(body=b'{"rate": 1.1661}', headers=[("Content-Length", "16")])
+    sleeps: list[float] = []
+    assert client(Script(cut, whole), sleeps).get(URL).json() == {"rate": 1.1661}
+    assert sleeps == [2.0], "the cut-off answer was retried, not accepted"
+
+
+def test_a_long_retry_after_is_refused_without_blocking_the_next_call() -> None:
+    t = [0.0]
+    slept: list[float] = []
+
+    def sleep(s: float) -> None:
+        slept.append(s)
+        t[0] += s
+
+    limiter = RateLimiter(1, 1.0, monotonic=lambda: t[0], sleep=sleep)
+    c = client(
+        Script(http_error(429, headers={"Retry-After": "3600"}), FakeRaw()), [], limiters={HOST: limiter}
+    )
+    with pytest.raises(RateLimitedError, match="more than") as err:
+        c.get(URL)
+    assert err.value.retry_after == 3600.0, "the caller learns how long the server wants"
+    t[0] += 1.0
+    c.get(URL)
+    assert slept == [], "the limiter was not told to wait an hour"
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("99999999999999", 86_400.0),  # capped: no header can make us wait more than a day
+        ("1" + "0" * 400, 86_400.0),  # would be float('inf')
+        ("²", None),  # a "digit" float() refuses: ignored, not a crash
+        ("Mon, 12 Oct 2126 18:00:00 GMT", 86_400.0),
+    ],
+)
+def test_retry_after_values_are_bounded(header: str, expected: float | None) -> None:
+    with pytest.raises(RateLimitedError) as err:
+        client(Script(*[http_error(429, headers={"Retry-After": header}) for _ in range(4)]), []).get(URL)
+    if expected is None:
+        assert err.value.retry_after == 16.0, "fell back to our own backoff"
+    else:
+        assert err.value.retry_after == expected
+
+
+def test_a_penalty_never_blocks_a_limiter_for_more_than_an_hour() -> None:
+    t = [0.0]
+    slept: list[float] = []
+
+    def sleep(s: float) -> None:
+        slept.append(s)
+        t[0] += s
+
+    limiter = RateLimiter(1, 1.0, monotonic=lambda: t[0], sleep=sleep)
+    limiter.acquire()
+    limiter.penalize(float("inf"))
+    limiter.acquire()
+    assert sum(slept) == pytest.approx(3601.0)
+
+
+def test_provider_text_in_errors_is_printable_ascii_and_redirects_show_only_the_host() -> None:
+    hostile = b"\x1b]0;owned\x07\x1b[2K\rRecorder: RUNNING\x1b[8m"
+    with pytest.raises(HttpError) as err:
+        client(Script(http_error(401, hostile)), []).get(URL)
+    assert all(" " <= ch <= "~" for ch in str(err.value)), str(err.value)
+    assert "Recorder: RUNNING" in str(err.value), "the readable part is kept"
+    packed = gzip.compress(b"<html>quota exceeded</html>")
+    with pytest.raises(HttpError, match="quota exceeded"):
+        client(Script(http_error(403, packed, {"Content-Encoding": "gzip"})), []).get(URL)
+    keyed = "https://rpc.example.org/SECRETPATH/?api-key=SECRETQUERY"
+    with pytest.raises(
+        HttpError, match=re.escape("redirect to https://rpc.example.org not followed")
+    ) as err2:
+        client(Script(http_error(308, headers={"Location": keyed})), []).get(URL)
+    assert "SECRET" not in str(err2.value)
 
 
 def test_limiters_must_be_for_allowed_hosts() -> None:

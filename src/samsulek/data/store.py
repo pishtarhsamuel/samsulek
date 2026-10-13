@@ -149,6 +149,37 @@ class VersionedTable:
         names = [d[0] for d in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
 
+    def as_known(
+        self, con: duckdb.DuckDBPyConnection, where: Mapping[str, Any], known_at: datetime
+    ) -> list[dict[str, Any]]:
+        """Every key as research may use it at ``known_at``: the newest version stored by
+        then; for a key first stored later (history backfilled after the fact) its OLDEST
+        version, the best stand-in for what was public at the time. Never a correction
+        stored after ``known_at`` when an earlier version exists."""
+        files = self.files()
+        if not files:
+            return []
+        conditions, params = [], []
+        for col, value in where.items():
+            if col not in {c.name for c in self.keys}:
+                raise ValueError(f"can only filter on key columns, not {col!r}")
+            conditions.append(f'"{col}" = ?')
+            params.append(value)
+        cutoff = to_us(known_at)
+        key_list = ", ".join(f'"{c.name}"' for c in self.keys)
+        select = ", ".join(f'"{c.name}"' for c in self.columns)
+        source = f"read_parquet([{', '.join(_sql_str(str(p)) for p in files)}], union_by_name = true)"
+        sql = (  # identifiers checked by _IDENT_RE, paths escaped, values are parameters
+            f"SELECT {select} FROM {source}"  # noqa: S608
+            + (f" WHERE {' AND '.join(conditions)}" if conditions else "")
+            + f" QUALIFY row_number() OVER (PARTITION BY {key_list} ORDER BY (fetched_us <= ?) DESC,"
+            + " CASE WHEN fetched_us <= ? THEN -fetched_us ELSE fetched_us END) = 1"
+            + f" ORDER BY {key_list}"
+        )
+        cursor = con.execute(sql, [*params, cutoff, cutoff])
+        names = [d[0] for d in cursor.description]
+        return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
     def history(self, con: duckdb.DuckDBPyConnection, where: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Every stored version of the matching keys, oldest first (for audits)."""
         files = self.files()

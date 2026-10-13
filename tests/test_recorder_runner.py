@@ -52,7 +52,8 @@ def recorded_headers(source: str, name: str) -> list[tuple[str, str]]:
             out = []
         elif ":" in line:
             key, value = line.split(":", 1)
-            out.append((key.strip(), value.strip()))
+            if key.strip().lower() != "content-length":  # it measured the untrimmed original
+                out.append((key.strip(), value.strip()))
     return out
 
 
@@ -173,7 +174,9 @@ def test_twenty_minutes_of_recording_through_the_real_adapters(tmp_path: Path) -
 
     assert {p["pool_address"] for p in stream(tmp_path, "pools")} == GT_POOLS
     assert len(stream(tmp_path, "pools")) == 4, "later rounds see the same page: nothing re-recorded"
-    assert len(stream(tmp_path, "gt_pages")) == 8, "a round every 150 s"
+    pages = stream(tmp_path, "gt_pages")
+    assert len([p for p in pages if "page" in p]) == 8, "a round every 150 s"
+    assert len([p for p in pages if p.get("round_complete")]) == 8, "each round marked complete"
     creations = stream(tmp_path, "pump_creations")
     assert creations[0]["baseline"] is True and creations[0]["count"] == 20
     assert all(c["count"] == 0 for c in creations[1:]) and len(creations) == 20

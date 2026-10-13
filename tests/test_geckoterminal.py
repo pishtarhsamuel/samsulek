@@ -64,7 +64,8 @@ def recorded_headers(name: str) -> list[tuple[str, str]]:
             out = []
         elif ":" in line:
             key, value = line.split(":", 1)
-            out.append((key.strip(), value.strip()))
+            if key.strip().lower() != "content-length":  # it measured the untrimmed original
+                out.append((key.strip(), value.strip()))
     return out
 
 

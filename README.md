@@ -245,7 +245,8 @@ What to expect:
   free feed lets us read them, so discovery is incomplete. `record status`
   shows how many pump.fun launches it caught.
 - `SOURCE DOWN` means a provider is failing; the recorder pauses it and tries
-  again by itself (30 s, then longer, up to 10 minutes).
+  again by itself (30 s, then longer, up to 10 minutes; up to an hour if the
+  provider itself asks us to wait). The other providers keep working meanwhile.
 - `TASK SWITCHED OFF` means a provider answered with something the code doesn't
   recognise, or blocked us. That part stays off until you restart the
   recorder: it never guesses. Send me the `record status` output.

@@ -118,8 +118,12 @@ class MarketData:
         return report
 
     def latest_fx(self, currency: str, at: datetime, known_at: datetime | None = None) -> FxRate | None:
-        """The newest rate that was public at ``at`` (and that we had stored by ``known_at``)."""
-        rows = self.fx.latest(self.con, where={"source": ecb.SOURCE, "currency": currency}, known_at=known_at)
+        """The newest rate public at ``at``, as it was known at ``known_at`` (default: ``at``,
+        so a correction the ECB published later is never used early). For history we
+        downloaded after the fact, the first version we stored stands in."""
+        rows = self.fx.as_known(
+            self.con, where={"source": ecb.SOURCE, "currency": currency}, known_at=known_at or at
+        )
         usable = [r for r in rows if r["available_us"] <= to_us(at)]
         if not usable:
             return None
@@ -128,10 +132,14 @@ class MarketData:
             currency, r["obs_date"], Decimal(r["rate"]), from_us(r["available_us"]), from_us(r["fetched_us"])
         )
 
-    def to_eur(self, amount: Decimal, currency: str, at: datetime) -> Decimal:
+    def to_eur(
+        self, amount: Decimal, currency: str, at: datetime, known_at: datetime | None = None
+    ) -> Decimal:
+        """``amount`` in EUR at the rate ``latest_fx`` gives (as known at ``known_at``,
+        default ``at``)."""
         if currency == "EUR":
             return amount
-        rate = self.latest_fx(currency, at)
+        rate = self.latest_fx(currency, at, known_at)
         if rate is None:
             raise LookupError(f"no {currency} rate public at {at.isoformat()}")
         return amount / rate.rate

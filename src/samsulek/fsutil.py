@@ -7,6 +7,24 @@ import time
 from pathlib import Path
 
 
+def fsync_file(path: Path) -> None:
+    """Force a file's contents to disk (Windows needs write access to do this)."""
+    with path.open("r+b") as fh:
+        os.fsync(fh.fileno())
+
+
+def fsync_dir(path: Path) -> None:
+    """Force a folder's entries (renames, deletes) to disk. POSIX only: Windows can't
+    open a folder this way and NTFS journals its metadata itself."""
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def atomic_write_text(path: Path, text: str, attempts: int = 5) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")

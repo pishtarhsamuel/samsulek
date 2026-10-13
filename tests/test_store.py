@@ -71,6 +71,23 @@ def test_revisions_are_kept_and_point_in_time_reads_see_the_old_value(tmp_path: 
     assert [h["fetched_us"] for h in history] == [to_us(T1), to_us(T2)]
 
 
+def test_as_known_never_uses_a_later_correction_and_falls_back_to_the_first_version(tmp_path: Path) -> None:
+    con, t = connect(tmp_path), table(tmp_path)
+    t.write(con, [row(5, 10.0), row(6, 11.0)], T1)
+    t.write(con, [row(6, 11.5), row(7, 12.0)], T2)  # a correction of the 6th, and a new day
+
+    def closes(known_at: datetime) -> list[tuple[int, float]]:
+        return [(r["session"].day, r["close"]) for r in t.as_known(con, {"symbol": "ETF"}, known_at)]
+
+    assert closes(T1 + timedelta(seconds=1)) == [(5, 10.0), (6, 11.0), (7, 12.0)], (
+        "the 6th as known then; the 7th wasn't stored yet, so its first version stands in"
+    )
+    assert closes(T2) == [(5, 10.0), (6, 11.5), (7, 12.0)], "the correction, once stored"
+    assert closes(T1 - timedelta(days=1)) == [(5, 10.0), (6, 11.0), (7, 12.0)], (
+        "before anything was stored: the OLDEST version of each key, never the correction"
+    )
+
+
 def test_none_and_nan_compare_as_unchanged_but_none_to_value_is_a_revision(tmp_path: Path) -> None:
     con, t = connect(tmp_path), table(tmp_path)
     t.write(con, [row(5, 10.0, None), row(6, 11.0, float("nan"))], T1)

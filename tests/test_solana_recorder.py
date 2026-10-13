@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -17,7 +18,7 @@ from samsulek.data.recorder.coverage import Coverage
 from samsulek.data.recorder.journal import Journal, read_stream
 from samsulek.data.recorder.solana import PumpFun, RecorderSettings, SolanaRecorder
 from samsulek.data.sources.solana_rpc import SolanaRpcError
-from samsulek.net.http import HttpError
+from samsulek.net.http import HttpError, RateLimitedError
 
 T0 = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
 M = timedelta(minutes=1)
@@ -384,7 +385,7 @@ def test_restart_resumes_from_the_journal(tmp_path: Path) -> None:
         again.stream("pools"),
         again.stream("pair_snapshots"),
         again.stream("mint_facts"),
-        again.stream("pump_creations"),
+        again.stream("gt_pages"),
     )
     assert "P1" in again.rec.schedule
     again.rec.step()
@@ -393,7 +394,9 @@ def test_restart_resumes_from_the_journal(tmp_path: Path) -> None:
         ("P1", 15.0),
     ], "the 5-minute snapshot is not repeated"
     assert again.stream("snapshot_skipped") == [], "done ages are not re-scheduled (and then skipped)"
-    assert again.chain.sig_calls == ["s9"]
+    assert again.chain.sig_calls == [None], (
+        "the launch counter starts a new baseline: no window spans downtime"
+    )
     assert not [p for p in again.stream("pools") if p["pool_address"] == "P1"][1:], "not re-recorded"
 
 
@@ -451,7 +454,8 @@ def test_stopping_records_the_work_left_waiting(tmp_path: Path) -> None:
     r.rec.step()
     r.rec.stop()
     (dropped,) = [t for t in r.stream("tasks") if t["event"] == "queue_dropped"]
-    assert dropped == {**dropped, "task": "mints", "items": 2, "reason": "stop"}
+    assert dropped == {**dropped, "task": "mints", "items": 2, "reason": "stopped"}
+    assert [m.get("skipped") for m in r.stream("mint_facts")] == ["stopped", "stopped"], "and per mint"
     assert r.stream("coverage")[-1]["event"] == "stop"
 
 
@@ -472,3 +476,234 @@ def test_settings_refuse_rates_above_the_free_limits() -> None:
     with pytest.raises(ValueError, match="holders_per_mille"):
         RecorderSettings(snapshot_per_mille=100, holders_per_mille=200)
     assert RecorderSettings().holders_within_sample_per_mille == 200
+
+
+# ------------------------------------------------- fixes from the M2 review (2026-10-13)
+
+
+def gaps(r: Rig, kind: str) -> list[dict[str, Any]]:
+    return [g for g in r.stream("coverage") if g.get("event") == "gap" and g.get("kind") == kind]
+
+
+def failing_on_page(r: Rig, bad_page: int, error: BaseException) -> None:
+    real = r.discovery.new_pools
+
+    def flaky(page: int) -> Page:
+        if page == bad_page:
+            raise error
+        return real(page)
+
+    r.discovery.new_pools = flaky  # type: ignore[method-assign]
+
+
+def test_a_round_that_fails_part_way_records_the_creation_time_it_may_have_missed(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0 - 10 * M, dex="meteora")]}
+    r.rec.step()
+    r.clock.advance(timedelta(seconds=150))
+    r.discovery.pages = {1: [pool(3, T0 - 2 * M, dex="meteora"), pool(2, T0 - 4 * M, dex="meteora")]}
+    failing_on_page(r, 2, HttpError("HTTP 503", url="x", status=503))
+    r.rec.step()
+    (gap,) = gaps(r, "discovery_incomplete")
+    assert (gap["start"], gap["end"]) == ((T0 - 10 * M).isoformat(), (T0 - 4 * M).isoformat())
+    assert len([p for p in r.stream("gt_pages") if p.get("round_complete")]) == 1, "only round 1 finished"
+
+
+def test_a_round_cut_off_by_a_crash_leaves_the_same_gap_after_restart(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0 - 10 * M, dex="meteora")]}
+    r.rec.step()
+    r.clock.advance(timedelta(seconds=150))
+    r.discovery.pages = {1: [pool(3, T0 - 2 * M, dex="meteora"), pool(2, T0 - 4 * M, dex="meteora")]}
+    failing_on_page(r, 2, KeyboardInterrupt())  # the window is closed mid-round
+    with pytest.raises(KeyboardInterrupt):
+        r.rec.step()
+    r.journal.close()
+    assert gaps(r, "discovery_incomplete") == [], "nothing could be written in the crash itself"
+    again = Rig(tmp_path)
+    again.clock.set(T0 + 5 * M)
+    snaps = [x for s in ("pair_snapshots", "pair_missing", "snapshot_skipped") for x in again.stream(s)]
+    again.rec.restore(again.stream("pools"), snaps, again.stream("mint_facts"), again.stream("gt_pages"))
+    (gap,) = gaps(again, "discovery_incomplete")
+    assert (gap["start"], gap["end"]) == ((T0 - 10 * M).isoformat(), (T0 - 4 * M).isoformat())
+
+
+def test_a_switched_off_task_stays_a_gap_until_stop_and_its_jobs_are_recorded(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+
+    def blocked(mint: str, program: str) -> Holders:
+        raise HttpError("HTTP 403 blocked", url="x", status=403)
+
+    r.chain.token_holders = blocked  # type: ignore[method-assign]
+    r.discovery.pages = {1: [pool(1, T0, dex="meteora")]}
+    r.rec.start()
+    for _ in range(int(16 * 60 / 5)):  # through P1's 15-minute holder list (blocked)
+        r.rec.step()
+        r.clock.advance(timedelta(seconds=5))
+        if r.clock.now() >= T0 + 2 * M:
+            r.discovery.pages = {1: [pool(2, T0 + 2 * M, dex="meteora"), pool(1, T0, dex="meteora")]}
+    for _ in range(int(3 * 60 / 5)):  # P2's 15-minute snapshot, holders already off
+        r.rec.step()
+        r.clock.advance(timedelta(seconds=5))
+    assert "holders" in r.rec.disabled
+    beat = json.loads((tmp_path / "solana_heartbeat.json").read_text(encoding="utf-8"))
+    assert list(beat["off"]) == ["holders"], "status can show it however long it lasts"
+    assert r.chain.mint_calls, "other solana_rpc tasks kept succeeding meanwhile"
+    skipped = [s for s in r.stream("snapshot_skipped") if s.get("what") == "holders"]
+    assert [(s["pool"], s["target_age_minutes"], s["reason"]) for s in skipped] == [
+        ("P1", 15.0, "task_disabled"),  # the blocked job itself
+        ("P2", 15.0, "task_disabled"),  # one that came after
+    ]
+    r.rec.stop()
+    (gap,) = gaps(r, "task_off")
+    assert (gap["task"], gap["source"], gap["open_at_stop"]) == ("holders", "solana_rpc", True)
+    assert gaps(r, "source_down") == [], "a sibling task's success did not close it"
+
+
+def test_a_curve_job_that_waited_past_its_tolerance_is_skipped_not_mislabelled(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0)]}  # pump.fun
+    real = r.chain.accounts_raw
+    calls: list[datetime] = []
+
+    def first_fails(addresses: Sequence[str]) -> tuple[int, dict[str, Raw | None]]:
+        calls.append(r.clock.now())
+        if len(calls) == 1:
+            raise HttpError("HTTP 503", url="x", status=503)
+        return real(addresses)
+
+    r.chain.accounts_raw = first_fails  # type: ignore[method-assign]
+    r.rec.step()
+    r.clock.set(T0 + 5 * M)
+    r.rec.step()  # the 5-minute snapshot; its curve read fails and waits
+    r.clock.set(T0 + 3 * 60 * M)  # the PC slept for three hours
+    r.rec.step()
+    assert [c for c in r.stream("curve_states") if c["target_age_minutes"] == 5.0] == []
+    late = [s for s in r.stream("snapshot_skipped") if s.get("what") == "curve"]
+    assert [(s["target_age_minutes"], s["reason"]) for s in late] == [(5.0, "late")]
+    assert len(calls) == 1, "nothing was fetched for a label it no longer fits"
+
+
+def test_a_curve_answer_that_came_back_too_late_is_not_stored_under_its_age(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0)]}
+    real = r.chain.accounts_raw
+
+    def slow(addresses: Sequence[str]) -> tuple[int, dict[str, Raw | None]]:
+        r.clock.advance(3 * M)  # retries and waits inside the call
+        return real(addresses)
+
+    r.chain.accounts_raw = slow  # type: ignore[method-assign]
+    r.rec.step()
+    r.clock.set(T0 + 5 * M)
+    r.rec.step()
+    assert r.stream("curve_states") == []
+    (s,) = [s for s in r.stream("snapshot_skipped") if s.get("what") == "curve"]
+    assert (s["target_age_minutes"], s["reason"]) == (5.0, "late_answer")
+
+
+def test_curve_and_holder_records_say_when_they_were_due_and_fetched(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0)]}
+    for minute in (0, 5, 15):
+        r.clock.set(T0 + minute * M)
+        r.rec.step()
+        r.clock.advance(timedelta(seconds=3))
+        r.rec.step()
+    curve = r.stream("curve_states")[0]
+    assert curve["due_at"] == (T0 + 5 * M).isoformat() and curve["fetched_at"] == (T0 + 5 * M).isoformat()
+    (holders,) = r.stream("holders")
+    assert holders["due_at"] == (T0 + 15 * M).isoformat()
+    assert holders["fetched_at"] == (T0 + 15 * M).isoformat()
+
+
+def test_a_holder_list_that_waited_past_its_tolerance_is_skipped(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0, dex="meteora")]}
+    r.rec.step()
+    r.clock.set(T0 + 15 * M)
+    r.rec._source_retry_at["solana_rpc"] = T0 + 30 * M  # the RPC source is paused
+    r.rec.step()  # the 15-minute snapshot queues a holder list that has to wait
+    r.clock.set(T0 + 30 * M)
+    r.rec.step()
+    assert r.chain.holder_calls == []
+    (s,) = [s for s in r.stream("snapshot_skipped") if s.get("what") == "holders"]
+    assert (s["target_age_minutes"], s["reason"]) == (15.0, "late")
+
+
+def test_a_snapshot_answer_that_arrives_too_late_is_not_stored_under_its_age(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.pages = {1: [pool(1, T0, dex="meteora")]}
+    r.rec.step()
+    real = r.snapshots.pairs
+
+    def slow(addresses: Sequence[str]) -> Batch:
+        r.clock.advance(3 * M)  # Retry-After waits and retries inside the call
+        return real(addresses)
+
+    r.snapshots.pairs = slow  # type: ignore[method-assign]
+    r.clock.set(T0 + 5 * M)
+    r.rec.step()
+    assert r.stream("pair_snapshots") == [] and r.stream("pair_missing") == []
+    (s,) = [s for s in r.stream("snapshot_skipped") if s["what"] == "pair"]
+    assert (s["target_age_minutes"], s["reason"]) == (5.0, "late_answer")
+
+
+def test_restart_keeps_pools_whose_last_snapshot_is_still_on_time(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    created = T0 - timedelta(hours=73, minutes=30)  # the 72 h snapshot was due 1.5 h ago
+    pools = [{"pool_address": "P1", "pool_created_at": created.isoformat(), "dex_id": "x", "base_mint": "M1",
+              "snapshot_sampled": True}]  # fmt: skip
+    done = [{"pool": "P1", "target_age_minutes": a} for a in (5.0, 15.0, 60.0, 240.0, 1440.0)]
+    r.rec.restore(pools, done, [], [])
+    r.rec.step()
+    (snap,) = r.stream("pair_snapshots")
+    assert (snap["pool"], snap["target_age_minutes"]) == ("P1", 4320.0), "18 h tolerance: still on time"
+    assert r.rec.restore_window == timedelta(hours=92)
+
+
+def test_the_first_launch_count_after_a_restart_is_a_baseline_and_overflow_gaps_have_a_length(
+    tmp_path: Path,
+) -> None:
+    r = Rig(tmp_path)
+    r.chain.sig_batches = [[Sig("s1", 1)], [Sig(f"x{i}", 10 + i) for i in range(1000)]]
+    r.rec.step()
+    r.clock.advance(timedelta(seconds=60))
+    r.rec.step()
+    (overflow,) = gaps(r, "creation_count_overflow")
+    assert overflow["seconds"] == 60.0
+    r.journal.close()
+    again = Rig(tmp_path)
+    again.clock.set(T0 + 6 * 60 * M)  # back after six hours
+    again.rec.restore(again.stream("pools"), [], again.stream("mint_facts"), again.stream("gt_pages"))
+    again.rec.step()
+    first = again.stream("pump_creations")[-1]
+    assert first["baseline"] is True and first["window_start"] is None, "no window spans the downtime"
+
+
+def test_a_provider_that_says_how_long_to_wait_is_left_alone_that_long(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    r.discovery.fail = RateLimitedError("HTTP 429", url="x", status=429, retry_after=600.0)
+    attempts: list[datetime] = []
+    real = r.discovery.new_pools
+
+    def timed(page: int) -> Page:
+        attempts.append(r.clock.now())
+        return real(page)
+
+    r.discovery.new_pools = timed  # type: ignore[method-assign]
+    for _ in range(int(15 * 60 / 5)):
+        r.rec.step()
+        r.clock.advance(timedelta(seconds=5))
+    assert [(b - a).total_seconds() for a, b in itertools.pairwise(attempts)] == [600.0]
+
+
+def test_memory_stays_bounded_over_a_long_run(tmp_path: Path) -> None:
+    r = Rig(tmp_path, RecorderSettings(snapshot_per_mille=0, holders_per_mille=0))
+    for i in range(200):  # 200 rounds, each with one new pool, an hour apart
+        r.clock.set(T0 + i * 60 * M)
+        r.discovery.pages = {1: [pool(i, T0 + i * 60 * M, dex="meteora")]}
+        r.rec.step()
+    assert len(r.stream("pools")) == 200
+    assert len(r.rec._seen) <= 7, "only pools the feed could still show (6 h)"
+    assert len(r.rec._mint_program) <= 1, "only mints a tracked pool or holder list needs"

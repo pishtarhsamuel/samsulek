@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from samsulek.clock import FixedClock
+from samsulek.data.recorder import coverage as coverage_module
 from samsulek.data.recorder.coverage import Coverage
 from samsulek.data.recorder.journal import Journal, JournalError, ReadReport, hour_file_name, read_stream
 
@@ -152,6 +154,48 @@ def test_source_outages_become_gaps_and_are_closed_at_stop(tmp_path: Path) -> No
     assert found[1]["open_at_stop"] is True
     downs = [r for r in records(tmp_path, "coverage") if r["event"] == "source_down"]
     assert len(downs) == 2, "one event per outage, not one per failed call"
+
+
+def test_the_heartbeat_never_vouches_for_records_not_yet_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    clock = FixedClock(T)
+    with Journal(tmp_path, clock) as j:
+        real_sync = j.sync
+        monkeypatch.setattr(j, "sync", lambda: (order.append("sync"), real_sync())[1])
+        real_beat = coverage_module.atomic_write_text
+        monkeypatch.setattr(
+            coverage_module, "atomic_write_text", lambda p, t: (order.append("beat"), real_beat(p, t))[1]
+        )
+        cov = Coverage(j, tmp_path, clock, "solana")
+        cov.start()
+        clock.advance(timedelta(minutes=2))
+        cov.beat()
+        cov.task_off("holders", "solana_rpc", "HTTP 403")
+        cov.stop()
+    assert order == ["sync", "beat"] * 4, "start, beat, task_off and stop each sync first"
+
+
+def test_a_switched_off_task_is_a_gap_until_stop_and_in_the_heartbeat(tmp_path: Path) -> None:
+    clock = FixedClock(T)
+    with Journal(tmp_path, clock) as j:
+        cov = Coverage(j, tmp_path, clock, "solana")
+        cov.start()
+        cov.source_failed("solana_rpc", "HTTP 503")
+        cov.task_off("holders", "solana_rpc", "HTTP 403 blocked")
+        clock.advance(timedelta(minutes=1))
+        cov.source_ok("solana_rpc")  # another task of the same source works again
+        beat = json.loads((tmp_path / "solana_heartbeat.json").read_text(encoding="utf-8"))
+        assert beat["off"]["holders"]["reason"] == "HTTP 403 blocked" and beat["failing"]
+        clock.advance(timedelta(minutes=9))
+        cov.stop()
+    found = gaps(tmp_path)
+    assert [(g["kind"], g.get("task"), g["seconds"]) for g in found] == [
+        ("source_down", None, 60.0),
+        ("task_off", "holders", 600.0),
+    ]
+    assert found[1]["open_at_stop"] is True
 
 
 def test_a_damaged_heartbeat_file_is_reported_not_trusted(tmp_path: Path) -> None:

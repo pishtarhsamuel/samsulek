@@ -46,8 +46,14 @@ EXIT_OK, EXIT_ERROR, EXIT_HALTED, EXIT_REFUSED = 0, 1, 2, 3
 LOCK_WAIT_SECONDS = 20.0
 
 
+_CONTROL = {c: "?" for c in [*range(0x20), 0x7F] if c not in (0x09, 0x0A)}
+
+
 def _out(text: str = "") -> None:
-    sys.stdout.write(redact(text).encode("ascii", "replace").decode("ascii") + "\n")
+    # ASCII only, and no terminal control characters (ESC, CR, BEL...): text from a data
+    # provider must never be able to rewrite or hide what the owner reads.
+    safe = redact(text).encode("ascii", "replace").decode("ascii").translate(_CONTROL)
+    sys.stdout.write(safe + "\n")
 
 
 def _eur(x: Decimal) -> str:

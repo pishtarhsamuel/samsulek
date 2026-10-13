@@ -47,6 +47,7 @@ def test_health_summarises_the_last_24_hours(tmp_path: Path) -> None:
         clock.advance(timedelta(minutes=10))
         cov.source_ok("dexscreener")  # a closed 10-minute outage
         cov.source_failed("solana_rpc", "HTTP 403: blocked")  # still failing
+        cov.task_off("holders", "solana_rpc", "403")  # what the recorder does on a block
         j.append("tasks", {"event": "task_disabled", "task": "holders", "reason": "403"})
         j.append("mint_facts", {"mint": "M1", "facts": {"reason": "unreadable: empty extensions list"}})
         j.append("mint_facts", {"mint": "M2", "facts": {"reason": "a token account, not a mint"}})
@@ -101,6 +102,23 @@ def test_a_stale_or_damaged_heartbeat_reads_as_not_running(tmp_path: Path) -> No
     assert health(tmp_path, later).last_beat is None
     (tmp_path / maintenance.HEARTBEAT).write_text('["not a dict"]', encoding="utf-8")
     assert health(tmp_path, later).last_beat is None
+
+
+def test_a_running_recorder_shows_old_outages_and_switched_off_tasks(tmp_path: Path) -> None:
+    clock = FixedClock(T0)
+    with Journal(tmp_path, clock) as j:
+        cov = Coverage(j, tmp_path, clock, "solana")
+        cov.start()
+        cov.source_failed("dexscreener", "HTTP 503")
+        cov.task_off("snapshots", "dexscreener", "ValueError: unexpected schema")
+        for _ in range(30):  # still running 30 hours later, beating every hour
+            clock.advance(timedelta(hours=1))
+            cov.beat()
+    now = clock.now() + timedelta(seconds=10)
+    h = health(tmp_path, now)
+    assert h.running(now)
+    assert h.disabled == ["snapshots"], "switched off 30 h ago, still off: still shown"
+    assert h.open_outages == ["dexscreener: HTTP 503"]
 
 
 def test_a_clean_stop_is_reported_as_stopped_not_running(tmp_path: Path) -> None:
@@ -219,6 +237,29 @@ def test_a_day_with_a_damaged_line_is_left_as_raw_text(tmp_path: Path, bad_line:
     assert report.skipped == ["pools/20261001: 1 damaged line(s); left as raw text"]
     assert len(list((tmp_path / "pools").glob("20261001T*.jsonl"))) == 24
     assert not (tmp_path / "pools" / "20261001.parquet").exists()
+
+
+def test_compaction_makes_the_parquet_file_durable_before_deleting_raw_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_days(tmp_path, datetime(2026, 10, 1, tzinfo=UTC), hours=2)
+    events: list[str] = []
+    monkeypatch.setattr(maintenance, "fsync_file", lambda p: events.append(f"fsync {p.name}"))
+    monkeypatch.setattr(maintenance, "fsync_dir", lambda p: events.append(f"fsync dir {p.name}"))
+    real_unlink = Path.unlink
+
+    def unlink(self: Path, missing_ok: bool = False) -> None:
+        events.append(f"delete {self.name}")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    compact(tmp_path, datetime(2026, 10, 10, tzinfo=UTC))
+    assert events == [
+        "fsync .20261001.parquet.tmp",
+        "fsync dir pools",
+        "delete 20261001T00Z.jsonl",
+        "delete 20261001T01Z.jsonl",
+    ]
 
 
 def test_a_day_already_compacted_is_not_overwritten(tmp_path: Path) -> None:

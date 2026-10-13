@@ -92,7 +92,7 @@ def restore_from_journal(rec: SolanaRecorder, root: Path, now: datetime) -> int:
         list(read_stream(root, "pools", since=since)),
         snapshots,
         list(read_stream(root, "mint_facts", since=since)),
-        list(read_stream(root, "pump_creations", since=since)),
+        list(read_stream(root, "gt_pages", since=since)),
     )
     return len(rec.schedule)
 

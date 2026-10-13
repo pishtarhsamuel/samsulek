@@ -71,3 +71,9 @@ def test_a_failed_update_stores_nothing_and_says_so(
     assert cli.main(["--root", str(root), "data", "status"]) == cli.EXIT_OK
     out = capsys.readouterr().out
     assert "No market data yet" in out and "FAILED" in out
+
+
+def test_cli_output_never_carries_terminal_control_characters(capsys: pytest.CaptureFixture[str]) -> None:
+    cli._out("provider says: \x1b]0;title\x07\x1b[2K\rall fine\x1b[8m\x7f\ttab\nnext line")
+    out = capsys.readouterr().out
+    assert out == "provider says: ?]0;title??[2K?all fine?[8m?\ttab\nnext line\n"

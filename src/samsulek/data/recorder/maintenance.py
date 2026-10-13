@@ -25,6 +25,7 @@ from typing import Any
 from samsulek.data.recorder.journal import FILE_SUFFIX, read_stream
 from samsulek.data.recorder.solana import PUMP_FUN_DEX
 from samsulek.data.store import connect
+from samsulek.fsutil import fsync_dir, fsync_file
 from samsulek.types import require_aware
 
 HEARTBEAT = "solana_heartbeat.json"
@@ -114,9 +115,13 @@ class Health:
 
 
 def health(root: Path, now: datetime) -> Health:
-    """What the recorder did in the 24 hours before ``now``, read from its journal."""
+    """What the recorder did in the 24 hours before ``now``, read from its journal.
+
+    While it runs, open outages and switched-off tasks come from its heartbeat, so they
+    stay visible however long ago they started; otherwise from the journal."""
     require_aware(now, "now")
     h = Health()
+    beat: Any = None
     try:
         beat = json.loads((root / HEARTBEAT).read_text(encoding="utf-8"))
         h.last_beat = _parse(beat.get("last_beat")) if isinstance(beat, dict) else None
@@ -162,6 +167,14 @@ def health(root: Path, now: datetime) -> Health:
             and (last_start is None or (_parse(r.get("recorded_at")) or since) >= last_start)
         }
     )
+    if h.running(now) and isinstance(beat, dict):
+        failing, off = beat.get("failing"), beat.get("off")
+        if isinstance(failing, dict):
+            h.open_outages = [
+                f"{s}: {e.get('error') if isinstance(e, dict) else e}" for s, e in sorted(failing.items())
+            ]
+        if isinstance(off, dict):
+            h.disabled = sorted(str(task) for task in off)
     h.pump_launches = sum(
         max(0, _int(r.get("count")) - _int(r.get("failed")))
         for r in recent["pump_creations"]
@@ -254,7 +267,11 @@ def _compact_day(con: Any, folder: Path, day: str, files: list[Path], report: Co
             f"{label}: Parquet ({len(stored)} rows) does not match the journal ({len(lines)}); raw files kept"
         )
         return
+    # On disk before anything is deleted: a power cut must not keep the deletions and
+    # lose the Parquet data (the OS may write metadata before file contents).
+    fsync_file(tmp)
     os.replace(tmp, target)
+    fsync_dir(folder)
     for path in files:
         path.unlink()
         report.files_removed += 1

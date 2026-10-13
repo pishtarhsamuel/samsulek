@@ -66,9 +66,17 @@ def test_a_corrected_rate_is_kept_as_a_new_version(tmp_path: Path) -> None:
     report = md.update_fx(FakeEcb(corrected), ["USD"])  # type: ignore[arg-type]
     assert len(report.revised) == 1 and "2026-06-09" in report.revised[0]
     at = datetime(2026, 6, 9, 20, 0, tzinfo=UTC)
-    assert md.latest_fx("USD", at).rate == Decimal("1.2000")  # type: ignore[union-attr]
+    original = md.latest_fx("USD", at)
+    # By default "as known at the decision time": the correction stored a day later must
+    # not be used. (Nothing was stored by `at` itself: the first stored version stands in.)
+    assert original is not None and original.rate != Decimal("1.2000")
+    assert original.fetched_at == FETCH1
     before_fix = md.latest_fx("USD", at, known_at=FETCH1 + timedelta(hours=1))
-    assert before_fix is not None and before_fix.rate != Decimal("1.2000"), "what we knew then"
+    assert before_fix == original, "what we knew then"
+    after_fix = md.latest_fx("USD", at, known_at=fetch2)
+    assert after_fix is not None and after_fix.rate == Decimal("1.2000"), "asked for later knowledge"
+    assert md.to_eur(Decimal(120), "USD", at, known_at=fetch2) == Decimal(100)
+    assert md.to_eur(Decimal(120), "USD", at) == Decimal(120) / original.rate
 
 
 def test_a_rate_is_only_usable_after_it_was_published(tmp_path: Path) -> None:

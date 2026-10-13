@@ -25,7 +25,10 @@ General rules for every dataset:
   no row; older data (seen for 1999-2001) has a row with an empty value instead. Both
   mean "no rate that day".
 - **Revisions:** the ECB may republish a rate (rare). Each `data update` re-downloads
-  the last 30 days, so a correction appears as a new version.
+  the last 30 days, so a correction appears as a new version. `latest_fx` and `to_eur`
+  answer "as known at the decision time" by default: a correction stored later is never
+  used early. For history we downloaded after the fact (the 1999+ backfill) nothing was
+  stored "at the time", so the first version we stored stands in for it.
 - **Not the broker's rate:** the ECB says the rates are "for information purposes
   only". Trading 212 converts at its own rate and charges an FX fee. Backtests must
   add that cost (and rerun at 2x).
@@ -90,6 +93,19 @@ Known limits, stated plainly:
   depend on how they turned out.
 - **Absent is not rugged:** DexScreener returns nothing for pools it doesn't list.
   That is recorded as `pair_missing`, a separate state.
+- **On time or not at all:** every snapshot, curve state and holder list labelled
+  with a target age was observed within that age's tolerance (2 min, or a quarter of
+  the age), checked again when the answer arrived. Anything later is in
+  `snapshot_skipped` (`what` = pair/curve/holders, with the reason: `late`,
+  `late_answer`, `source_error`, `task_disabled`, `holder_queue_full`, `stopped`), never
+  stored under the label. Curve and holder records carry `due_at` and `fetched_at`.
+- **Gaps in creation time vs. clock time:** `discovery_overrun` and
+  `discovery_incomplete` (a round that failed or was cut off part-way) are gaps in
+  pool *creation* time: pools created inside them may never have been seen.
+  `not_running`, `source_down` and `task_off` (a task switched off until the next
+  restart, e.g. a blocked RPC method) are gaps in *clock* time. Use both.
+- **The pump.fun launch counter** starts a new baseline after every restart, so no
+  counting window spans downtime.
 - **DexScreener has no liquidity figure** for pump.fun bonding-curve and Meteora DBC
   pools; the bonding-curve state from the chain fills that gap for pump.fun.
 - **Times:** snapshot values are as of `Date - Age` of the HTTP response (CDN caches up
