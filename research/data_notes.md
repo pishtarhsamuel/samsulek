@@ -44,6 +44,17 @@ General rules for every dataset:
   owner compares next year's holidays with the official list, then raises it.
 - Daily bars are labeled 10 minutes after the scheduled close (17:40 Berlin, 14:10 on
   the early-close day), because the official close comes from the closing auction.
+- **Session times (unverified):** Deutsche Boerse's sites could not be reached from the
+  build environment (DNS failure on 2026-10-14), so these come from search-result
+  snippets only. Opening auction call from about 08:55 Berlin; continuous trading starts
+  between 09:00 and 09:04 depending on the segment (random auction end). Closing auction
+  call at 17:30, price around 17:35 (random end); a trade-at-close phase until 17:40
+  exists only for DAX/MDAX/SDAX shares. Extended retail hours were added from
+  1 December 2025; we do not use them.
+- **Backtest execution time:** the backtester fills at the next session's open plus a
+  delay, by default **09:05 Berlin**, after every segment's opening auction is over. It
+  is a setting, not a constant: once the official times are checked, change the setting,
+  not the code.
 
 ## ETF daily prices
 
