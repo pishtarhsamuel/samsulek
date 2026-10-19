@@ -27,6 +27,28 @@ class TradingCalendar(Protocol):
         ...
 
 
+class SessionCalendar(TradingCalendar, Protocol):
+    """A trading calendar that also knows when each session opens (the backtester's clock).
+
+    ``open_print_utc(day)`` labels the opening price the way ``close_utc`` labels the
+    close: an instant by which it is surely known (never before it can exist);
+    ``open_utc(day)`` is the scheduled open, not a label. For every session
+    ``open_utc(d) <= open_print_utc(d) < close_utc(d)``. ``open_utc``/``open_print_utc``
+    raise ``ValueError`` for a day that is not a session; ``previous_session``/
+    ``next_session`` accept any day and raise ``ValueError`` if their scan finds no
+    session. All of them raise the calendar's range error (a ``ValueError``) outside the
+    years it was checked for, so callers fail closed.
+    """
+
+    def open_utc(self, day: date) -> datetime: ...
+
+    def open_print_utc(self, day: date) -> datetime: ...
+
+    def previous_session(self, day: date) -> date: ...
+
+    def next_session(self, day: date) -> date: ...
+
+
 @dataclass(frozen=True, slots=True)
 class DailyBar:
     """One trading session of one instrument, as a source reported it.

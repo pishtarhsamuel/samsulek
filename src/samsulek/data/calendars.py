@@ -14,12 +14,20 @@ Times:
   Labeling it 17:30 would date the price before it existed (a small lookahead).
 - Before November 2003 the trading hours were different (not verified here), so the
   calendar refuses years before 2004.
+- The opening auction ends at a random moment between 09:00 and 09:04 Berlin, depending
+  on the segment (research/data_notes.md). ``OPEN`` = 09:00 is the scheduled open, the
+  earliest that end can be, on every session (the early-close day included). The
+  opening price is labeled at ``open_print_utc`` = ``open_utc`` + ``OPEN_PRINT_ALLOWANCE``
+  (5 min) = 09:05 Berlin, after every segment's auction is over, so the label never
+  predates the price. Both times are UNVERIFIED against Deutsche Boerse (its site was
+  unreachable). On every session ``open_print_utc(d) < close_utc(d)`` (tested).
 """
 
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, time, timedelta
 from functools import lru_cache
+from typing import ClassVar
 from zoneinfo import ZoneInfo
 
 
@@ -50,6 +58,9 @@ class XetraCalendar:
     REGULAR_CLOSE = time(17, 30)
     EARLY_CLOSE = time(14, 0)
     AUCTION_ALLOWANCE = timedelta(minutes=10)
+    OPEN: ClassVar[time] = time(9, 0)  # UNVERIFIED (research/data_notes.md)
+    # The opening auction price is labeled 09:05 Berlin (auction ends 09:00-09:04). UNVERIFIED.
+    OPEN_PRINT_ALLOWANCE: ClassVar[timedelta] = timedelta(minutes=5)
 
     def __init__(self, checked_through_year: int | None = None) -> None:
         self._zone = ZoneInfo(self.tz)
@@ -107,6 +118,28 @@ class XetraCalendar:
                 return d
             d -= timedelta(days=1)
         raise ValueError(f"no {self.name} session in the 15 days before {day}")
+
+    def next_session(self, day: date) -> date:
+        """The first session after ``day``: the mirror image of ``previous_session``."""
+        d = day + timedelta(days=1)
+        for _ in range(15):
+            if self.is_session(d):
+                return d
+            d += timedelta(days=1)
+        raise ValueError(f"no {self.name} session in the 15 days after {day}")
+
+    def open_utc(self, day: date) -> datetime:
+        """``day``'s scheduled open, 09:00 Berlin: the EARLIEST the opening auction can end.
+
+        Not a price label: the opening price may not exist yet. Use ``open_print_utc``.
+        """
+        if not self.is_session(day):  # raises CalendarRangeError outside the checked years
+            raise ValueError(f"{day} is not a {self.name} trading day")
+        return datetime.combine(day, self.OPEN, tzinfo=self._zone).astimezone(UTC)
+
+    def open_print_utc(self, day: date) -> datetime:
+        """When ``day``'s opening auction price is known: the open's point-in-time label."""
+        return self.open_utc(day) + self.OPEN_PRINT_ALLOWANCE
 
 
 @lru_cache(maxsize=64)
