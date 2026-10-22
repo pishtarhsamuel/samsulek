@@ -2,9 +2,10 @@
 
 research/risk_research.yaml must equal derive_research_config(config/risk.yaml) leaf by
 leaf; only the five relaxed leaves differ from the bot's limits, every other leaf is
-equal; every drift is flagged by name; the derived config goes through full schema
-validation; load_mode_configs loads both files with the bot's own load_risk_config and
-refuses a research file that drifted.
+equal; R is never tighter than L (each relaxed leaf is max(live, relaxed), so a live cap
+above a relaxed value is kept); every drift is flagged by name; the derived config goes
+through full schema validation; load_mode_configs loads both files with the bot's own
+load_risk_config and refuses a research file that drifted.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from typing import Any
 
 import pytest
 import yaml
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from samsulek.backtest import limits
 from samsulek.backtest.limits import (
@@ -115,6 +118,99 @@ def test_derive_validates_and_never_copies(monkeypatch: pytest.MonkeyPatch) -> N
     )
     with pytest.raises(ValueError, match="max_position_eur cannot exceed"):
         derive_research_config(live())
+
+
+# =============================================================================== never tighter than L
+def live_with(changes: dict[str, Any]) -> RiskConfig:
+    """The bot's limits with some leaves changed (still a valid config)."""
+    data = live().model_dump(mode="json")
+    for key, value in changes.items():
+        _set(data, key, value)
+    return RiskConfig.model_validate(data)
+
+
+BIG_CAPS = {
+    "account.equity_sanity_max_eur": "5000000000",
+    "account.max_daily_loss_pct": "0.5",  # the schema maximum: equal to the relaxed value
+    "markets.stocks.max_position_eur": "2000000",
+    "markets.stocks.max_gross_exposure_eur": "3000000",
+    "markets.memecoin.max_gross_exposure_eur": "1500000",  # its position cap stays EUR 5
+}
+ABOVE_RELAXED = [
+    "account.equity_sanity_max_eur",
+    "markets.memecoin.max_gross_exposure_eur",
+    "markets.stocks.max_gross_exposure_eur",
+    "markets.stocks.max_position_eur",
+]
+
+
+def test_live_caps_above_the_relaxed_values_are_kept() -> None:
+    rich = live_with(BIG_CAPS)
+    derived = leaves(derive_research_config(rich))
+    assert derived["account.equity_sanity_max_eur"] == "5000000000"
+    assert derived["account.max_daily_loss_pct"] == "0.5"
+    assert derived["account.max_drawdown_pct"] == "0.9"  # live 0.15: relaxed
+    assert derived["markets.stocks.max_position_eur"] == "2000000"
+    assert derived["markets.stocks.max_gross_exposure_eur"] == "3000000"
+    assert derived["markets.memecoin.max_position_eur"] == "1000000"  # live 5: relaxed
+    assert derived["markets.memecoin.max_gross_exposure_eur"] == "1500000"
+    bot = leaves(rich)
+    assert {k for k in bot if bot[k] != derived[k]} == RELAXED_LEAVES - {
+        *ABOVE_RELAXED,
+        "account.max_daily_loss_pct",
+    }
+
+
+def test_a_research_config_tighter_than_the_live_one_is_flagged() -> None:
+    """The old derivation (relaxed values written over every live value) is refused for a
+    live config above them, by name; the derived config is accepted."""
+    rich = live_with(BIG_CAPS)
+    overwritten = rich.model_dump(mode="json")
+    for key in RELAXED_LEAVES:
+        _, _, name = key.rpartition(".")
+        _set(overwritten, key, str({**RELAXED_ACCOUNT, **RELAXED_MARKET}[name]))
+    problems = research_config_problems(rich, RiskConfig.model_validate(overwritten))
+    assert sorted(p.split(":", 1)[0] for p in problems) == ABOVE_RELAXED
+    assert research_config_problems(rich, derive_research_config(rich)) == []
+
+
+EUR_CAP = st.decimals(min_value=Decimal(1), max_value=Decimal("1e10"), places=2)
+
+
+@settings(max_examples=60, deadline=None)
+@given(
+    daily=st.decimals(min_value=Decimal("0.001"), max_value=Decimal("0.5"), places=3),
+    drawdown=st.decimals(min_value=Decimal("0.001"), max_value=Decimal("0.9"), places=3),
+    sanity=EUR_CAP,
+    caps=st.lists(st.tuples(EUR_CAP, EUR_CAP), min_size=2, max_size=2),
+)
+def test_research_is_never_tighter_than_live(
+    daily: Decimal, drawdown: Decimal, sanity: Decimal, caps: list[tuple[Decimal, Decimal]]
+) -> None:
+    changes: dict[str, Any] = {
+        "account.max_daily_loss_pct": str(daily),
+        "account.max_drawdown_pct": str(drawdown),
+        "account.equity_sanity_max_eur": str(sanity),
+    }
+    for market, pair in zip(("stocks", "memecoin"), caps, strict=True):
+        position, gross = sorted(pair)  # the schema needs position <= gross
+        changes[f"markets.{market}.max_position_eur"] = str(max(position, Decimal(30)))  # above the order cap
+        changes[f"markets.{market}.max_gross_exposure_eur"] = str(max(gross, Decimal(30)))
+    bot_config = live_with(changes)
+    bot, research = leaves(bot_config), leaves(derive_research_config(bot_config))
+    relaxed = {**RELAXED_ACCOUNT, **RELAXED_MARKET}
+    for key in bot:
+        if key in RELAXED_LEAVES:
+            value = Decimal(bot[key])
+            assert Decimal(research[key]) == max(value, relaxed[key.rpartition(".")[2]]) >= value, key
+        else:
+            assert research[key] == bot[key], key
+
+
+def test_loosening_refuses_a_leaf_that_is_not_a_decimal() -> None:
+    assert limits._loosened({"x": Decimal(2), "y": 1}, {"x": Decimal(1)}) == {"x": Decimal(2), "y": 1}
+    with pytest.raises(TypeError, match="expected a Decimal"):
+        limits._loosened({"x": 0.5}, {"x": Decimal(1)})
 
 
 def test_derive_leaves_the_bot_config_untouched() -> None:
@@ -238,6 +334,22 @@ def test_a_research_file_that_no_longer_matches_a_changed_bot_config_is_refused(
     (root / RISK_FILE).write_text(yaml.safe_dump(risk), encoding="utf-8")
     with pytest.raises(ConfigError, match="max_order_eur"):  # ...and the R file must follow
         load_mode_configs(root)
+
+
+def test_load_mode_configs_keeps_live_caps_above_the_relaxed_values(tmp_path: Path) -> None:
+    root = copy_project(tmp_path)
+    rich = live_with(BIG_CAPS)
+    (root / RISK_FILE).write_text(yaml.safe_dump(rich.model_dump(mode="json")), encoding="utf-8")
+    with pytest.raises(ConfigError) as info:  # the committed R file has the plain relaxed values
+        load_mode_configs(root)
+    for key in ABOVE_RELAXED:
+        assert key in str(info.value)
+    research = derive_research_config(rich).model_dump(mode="json")
+    (root / RESEARCH_RISK_FILE).write_text(yaml.safe_dump(research), encoding="ascii", newline="\n")
+    modes = load_mode_configs(root)
+    assert modes.replay == rich and modes.research == derive_research_config(rich)
+    assert modes.research.limits_for(Market.STOCKS).max_position_eur == Decimal(2_000_000)
+    assert modes.research.account.equity_sanity_max_eur == Decimal(5_000_000_000)
 
 
 @pytest.mark.parametrize("text", [None, "account: [unclosed", "version: 1\n"])

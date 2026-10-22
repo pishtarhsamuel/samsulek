@@ -797,19 +797,38 @@ def test_the_fingerprint_is_stable_and_ignores_data_after_the_cutoff() -> None:
 
 
 # ---------------------------------------------------- corporate actions (trap 10)
-def test_trap10_adjusted_bars_use_only_the_actions_known_by_the_decision() -> None:
+TICK = timedelta(microseconds=1)
+
+
+def effective_at(action: CorporateAction) -> datetime:
+    """The rule, stated independently of the implementation: an action adjusts earlier bars
+    once it is known AND the market trades on the new basis (the ex-date's open print)."""
+    return max(action.known_at, CAL.open_print_utc(action.ex_session))
+
+
+def closes_through(bars: list[DailyBar], asof: datetime) -> list[float]:
+    return [b.close for b in bars if b.close_ts <= asof]
+
+
+def test_trap10_a_split_announced_before_its_ex_date_takes_effect_at_the_ex_dates_open_print() -> None:
     bars = series(("A",))
     raw = {b.session: b for b in bars["A"]}
     ex = SESSIONS[120]
     known = CAL.close_utc(SESSIONS[115]) + timedelta(hours=2)
     split_bars, split = plant_split(bars["A"], ex, 2.0, known)
     ds = build(source({"A": split_bars}, actions=(split,)))
-    before_known = known - timedelta(microseconds=1)
-    unadjusted = ds.adjusted_window("A", before_known, 1000)
-    assert [b.close for b in unadjusted] == [raw[s].close for s in SESSIONS[:116]]
-    after_known = ds.adjusted_window("A", known, 1000)
-    assert [b.close for b in after_known] == [raw[s].close * 0.5 for s in SESSIONS[:116]]
-    assert [b.volume for b in after_known] == [raw[s].volume / 0.5 for s in SESSIONS[:116]]  # type: ignore[operator]
+    effective = CAL.open_print_utc(ex)
+    assert effective_at(split) == effective > known
+    # Announced but not in effect: the market still trades at the old level, so do the bars.
+    for asof in (known - TICK, known, CAL.close_utc(SESSIONS[119]), effective - TICK):
+        window = ds.adjusted_window("A", asof, 1000)
+        assert [b.close for b in window] == closes_through(split_bars, asof), asof
+        assert [b.volume for b in window] == [b.volume for b in split_bars if b.close_ts <= asof]
+    # From the ex-date's open print on, every earlier bar is adjusted (volume too).
+    for asof in (effective, effective + timedelta(minutes=3), CAL.close_utc(ex) - TICK):
+        window = ds.adjusted_window("A", asof, 1000)
+        assert [b.close for b in window] == [raw[s].close * 0.5 for s in SESSIONS[:120]], asof
+        assert [b.volume for b in window] == [raw[s].volume / 0.5 for s in SESSIONS[:120]]  # type: ignore[operator]
     after_ex = ds.adjusted_window("A", CAL.close_utc(ex), 1000)
     assert [b.close for b in after_ex[:120]] == [raw[s].close * 0.5 for s in SESSIONS[:120]]
     assert after_ex[120].close == raw[ex].close / 2  # the raw post-split price, unadjusted
@@ -817,8 +836,9 @@ def test_trap10_adjusted_bars_use_only_the_actions_known_by_the_decision() -> No
     assert ds.raw_close_eur("A", SESSIONS[100]) == Decimal(repr(raw[SESSIONS[100]].close))
     assert ds.raw_open_eur("A", ex) == Decimal(repr(raw[ex].open / 2))  # type: ignore[operator]
     assert ds.latest_print("A", known)[1] == Decimal(repr(raw[SESSIONS[115]].close))  # type: ignore[index]
+    assert ds.latest_print("A", effective) == (effective, ds.raw_open_eur("A", ex))
     # adjusted_close agrees with the window, and refuses the future.
-    for as_of in (before_known, known, CAL.close_utc(ex)):
+    for as_of in (known - TICK, known, effective - TICK, effective, CAL.close_utc(ex)):
         window = ds.adjusted_window("A", as_of, 1)
         session = next(s for s in reversed(SESSIONS) if CAL.close_utc(s) <= as_of)
         assert ds.adjusted_close("A", session, as_of=as_of) == window[-1].close
@@ -830,14 +850,57 @@ def test_trap10_adjusted_bars_use_only_the_actions_known_by_the_decision() -> No
     assert ds.actions_on(SESSIONS[119]) == ()
 
 
+def test_trap10_the_bars_a_decision_sees_are_on_the_basis_of_the_price_it_trades_at() -> None:
+    """At every open print around the split, the last adjusted close is near the raw open of
+    that session: adjusting at the announcement would show half the price the market trades at."""
+    bars = series(("A",))
+    ex = SESSIONS[120]
+    split_bars, split = plant_split(bars["A"], ex, 2.0, CAL.close_utc(SESSIONS[112]))
+    ds = build(source({"A": split_bars}, actions=(split,)))
+    for s in SESSIONS[110:131]:
+        at = CAL.open_print_utc(s)
+        seen = ds.adjusted_window("A", at, 1)[-1].close
+        assert 0.9 < float(ds.raw_open_eur("A", s)) / seen < 1.1, s
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [timedelta(days=-5), -TICK, timedelta(0), TICK, timedelta(hours=2), timedelta(days=6)],
+    ids=["days-before", "1us-before", "at-open-print", "1us-after", "same-session", "days-after"],
+)
+def test_trap10_an_action_takes_effect_at_the_later_of_its_announcement_and_the_ex_open(
+    offset: timedelta,
+) -> None:
+    ex = SESSIONS[120]
+    op = CAL.open_print_utc(ex)
+    known = op + offset
+    split_bars, split = plant_split(series(("A",))["A"], ex, 2.0, known)
+    ds = build(source({"A": split_bars}, actions=(split,)))
+    effective = max(known, op)
+    instants = {known - TICK, known, known + TICK, op - TICK, op, op + TICK, CAL.close_utc(ex), FAR}
+    instants |= {CAL.close_utc(SESSIONS[119]), CAL.close_utc(SESSIONS[127]), effective - TICK}
+    for asof in sorted(instants):
+        first = ds.adjusted_window("A", asof, 1000)[0]  # SESSIONS[0], long before the ex-date
+        assert first.close == split_bars[0].close * (0.5 if asof >= effective else 1.0), asof
+
+
 def test_a_split_known_only_after_its_ex_date_leaves_history_unadjusted_until_then() -> None:
     bars = series(("A",))
+    raw = {b.session: b for b in bars["A"]}
     ex = SESSIONS[120]
     known = CAL.close_utc(SESSIONS[125]) + timedelta(hours=1)
     split_bars, split = plant_split(bars["A"], ex, 2.0, known)
     ds = build(source({"A": split_bars}, actions=(split,)))
+    assert effective_at(split) == known
     between = ds.adjusted_window("A", CAL.close_utc(SESSIONS[122]), 4)
     assert between[1].close / between[0].close < 0.6  # the drop is visible, as it was then
+    assert [b.close for b in ds.adjusted_window("A", known - TICK, 1000)] == closes_through(
+        split_bars, known
+    )  # still raw an instant before the announcement
+    at_known = ds.adjusted_window("A", known, 1000)
+    assert [b.close for b in at_known] == [raw[s].close * 0.5 for s in SESSIONS[:120]] + [
+        b.close for b in split_bars[120:126]
+    ]
     later = ds.adjusted_window("A", known, 10)
     assert all(0.8 < b.close / a.close < 1.25 for a, b in pairwise(later))
     # The split happened at its ex-date whenever it was announced: actions_on reports it
@@ -845,12 +908,95 @@ def test_a_split_known_only_after_its_ex_date_leaves_history_unadjusted_until_th
     assert ds.actions_on(ex) == (split,)
 
 
+def test_actions_take_effect_in_effective_order_not_announcement_order() -> None:
+    """X is announced first but takes effect last; Y is announced after its ex-date, so it
+    takes effect at once. A prefix by announcement order would apply X at Y's time."""
+    bars = series(("A",))
+    split_bars, x = plant_split(bars["A"], SESSIONS[150], 2.0, CAL.close_utc(SESSIONS[10]))
+    y = CorporateAction(
+        "A", SESSIONS[90], "distribution", 0.97, CAL.close_utc(SESSIONS[100]) + timedelta(hours=1)
+    )
+    data = source({"A": split_bars}, actions=(x, y))
+    ds = build(data)
+    assert x.known_at < y.known_at and effective_at(y) < effective_at(x)
+    plain = split_bars[0].close
+    expected = [
+        (effective_at(y) - TICK, plain),
+        (effective_at(y), plain * 0.97),  # Y only
+        (effective_at(x) - TICK, plain * 0.97),
+        (effective_at(x), plain * 0.97 * 0.5),  # both
+        (FAR, plain * 0.97 * 0.5),
+    ]
+    for asof, close in expected:
+        assert ds.adjusted_window("A", asof, 1000)[0].close == pytest.approx(close, rel=1e-12), asof
+        assert ds.adjusted_close("A", SESSIONS[0], as_of=asof) == pytest.approx(close, rel=1e-12)
+    # Between the two, a bar after Y's ex-date and before X's is untouched.
+    assert ds.adjusted_window("A", effective_at(y), 1000)[95].close == split_bars[95].close
+    # The cache answers the same whatever order the instants are asked in.
+    backwards = build(data)
+    for asof, _ in reversed(expected):
+        assert backwards.adjusted_window("A", asof, 1000) == ds.adjusted_window("A", asof, 1000)
+    # A dataset cut between the two holds both (X is announced) and answers the same.
+    for cut_at in (effective_at(y), effective_at(x) - TICK, effective_at(y) - TICK):
+        cut = ds.truncated(cut_at)
+        assert cut.fingerprint == build(data, cut_at).fingerprint
+        assert cut.adjusted_window("A", cut_at, 1000) == ds.adjusted_window("A", cut_at, 1000)
+    assert {a.kind for a in ds.truncated(effective_at(y)).actions_on(SESSIONS[150])} == {"split"}
+
+
+def test_an_announced_action_not_yet_in_effect_survives_the_cut_and_adjusts_nothing() -> None:
+    split = RICH.actions[0]
+    assert split.symbol == "A" and split.kind == "split"
+    cut_at = split.known_at + timedelta(hours=1)
+    assert cut_at < effective_at(split)
+    cut = RICH_DS.truncated(cut_at)
+    assert cut.actions_on(split.ex_session) == (split,)  # announced: kept, with its ex-date
+    assert late_values(cut, cut_at) == []
+    a_rows = [b for b in RICH.rows if b.symbol == "A"]
+    assert [b.close for b in cut.adjusted_window("A", cut_at, 1000)] == closes_through(a_rows, cut_at)
+    assert RICH_DS.truncated(split.known_at - TICK).actions_on(split.ex_session) == ()  # not announced
+
+
+def test_adjusted_bars_equal_an_oracle_from_the_source_rows() -> None:
+    """Every symbol of the rich fixture (a split announced before its ex-date, a distribution
+    announced after it), recomputed from the source rows and the stated rule, at every cut
+    instant (each open print and close, and each announcement, to the microsecond)."""
+    for symbol in RICH_DS.symbols():
+        rows = [b for b in RICH.rows if b.symbol == symbol]
+        actions = [a for a in RICH.actions if a.symbol == symbol]
+        for asof in CUTS:
+            in_effect = [a for a in actions if effective_at(a) <= asof]
+            expected = []
+            for b in rows:
+                if b.close_ts > asof:
+                    break
+                factor = 1.0
+                for a in in_effect:
+                    if a.ex_session > b.session:
+                        factor *= a.price_factor
+                expected.append(b.close * factor)
+            got = [b.close for b in RICH_DS.adjusted_window(symbol, asof, 1000)]
+            assert got == expected, (symbol, asof)
+
+
+def test_the_fingerprint_does_not_depend_on_the_order_actions_are_given_in() -> None:
+    bars = series(("A",))
+    split_bars, x = plant_split(bars["A"], SESSIONS[150], 2.0, CAL.close_utc(SESSIONS[10]))
+    y = CorporateAction("A", SESSIONS[90], "distribution", 0.97, CAL.close_utc(SESSIONS[100]))
+    one = build(source({"A": split_bars}, actions=(x, y)))
+    other = build(source({"A": split_bars}, actions=(y, x)))
+    assert one.fingerprint == other.fingerprint
+    later = replace(y, known_at=y.known_at + TICK)
+    assert build(source({"A": split_bars}, actions=(x, later))).fingerprint != one.fingerprint
+
+
 def test_a_distribution_adjusts_prices_but_not_volume() -> None:
     bars = series(("A",))
     ex, known = SESSIONS[50], CAL.close_utc(SESSIONS[49])
     action = CorporateAction("A", ex, "distribution", 0.97, known)
     ds = build(source(bars, actions=(action,)))
-    window = ds.adjusted_window("A", known, 2)
+    assert ds.adjusted_window("A", known, 2)[-1].close == bars["A"][49].close  # not yet in effect
+    window = ds.adjusted_window("A", CAL.open_print_utc(ex), 2)
     assert window[-1].close == bars["A"][49].close * 0.97
     assert window[-1].volume == bars["A"][49].volume
 

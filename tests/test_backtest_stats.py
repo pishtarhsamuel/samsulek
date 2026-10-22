@@ -98,6 +98,28 @@ def test_scaling_returns_keeps_sharpe_skew_and_kurtosis(returns: list[float], c:
         assert b.kurt == pytest.approx(a.kurt, rel=1e-6, abs=1e-6)
 
 
+@pytest.mark.parametrize(
+    "returns",
+    [
+        [-0.2, -0.2, -0.19999999999999998],  # found by Hypothesis: gave a Sharpe of -1.27e16
+        [0.01, 0.01 + 1e-12, 0.01 - 1e-12, 0.01],
+        [5e-324, 5e-324, 1e-323],  # subnormal, but a real 2x spread: NOT noise
+    ],
+)
+def test_float_noise_is_no_spread_but_a_real_spread_is(returns: list[float]) -> None:
+    stats_ = sharpe_stats(returns)
+    if max(returns) - min(returns) > 1e-6 * max(abs(r) for r in returns):
+        assert stats_ is not None
+    else:
+        assert stats_ is None
+        assert sharpe_annual(returns) is None
+
+
+def test_the_noise_floor_is_far_below_real_daily_returns() -> None:
+    # A calm ETF day-to-day spread (0.01% around 0.02%) is still a measurement.
+    assert sharpe_stats([0.0002, 0.0003, 0.0001, 0.0002]) is not None
+
+
 @given(returns_lists)
 def test_negating_returns_negates_sharpe_and_skew(returns: list[float]) -> None:
     a, b = sharpe_stats(returns), sharpe_stats([-r for r in returns])

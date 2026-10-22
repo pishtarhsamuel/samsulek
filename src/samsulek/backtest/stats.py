@@ -7,8 +7,11 @@ Facts relied on:
   ``m_k = sum((r - mean)^k) / T``: ``skew = m3 / m2^1.5``, ``kurt = m4 / m2^2``
   (non-excess: a normal distribution has 3).
 - A series with fewer than 2 returns, or whose returns are all equal, has no Sharpe
-  ratio (None). "All equal" is tested exactly, so float rounding of the mean can never
-  turn a flat series into a huge Sharpe ratio. Values are divided by their largest
+  ratio (None). So has a series whose sample standard deviation is below
+  ``_MIN_RELATIVE_STD`` (1e-6) times its largest magnitude: that spread is float noise
+  (-0.2, -0.2, -0.19999999999999998), and dividing by it would give a Sharpe ratio of
+  1e16. Real daily returns are many orders of magnitude above that floor, and a missing
+  Sharpe ratio only ever counts against a strategy. Values are divided by their largest
   magnitude before any mean or square is taken (every statistic here is scale-free), so
   tiny returns neither underflow nor lose precision.
 - PSR and DSR follow Bailey and Lopez de Prado (2014):
@@ -43,6 +46,8 @@ EULER_GAMMA: Final = 0.5772156649015329
 _PERIODS_PER_YEAR: Final = 252  # = metrics.PERIODS_PER_YEAR (metrics imports this module, not the reverse)
 _NORMAL: Final = NormalDist()
 _MINUS_INF: Final = -math.inf
+# Below this sample std (relative to the largest |value|), a spread is float noise.
+_MIN_RELATIVE_STD: Final = 1e-6
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,9 +75,12 @@ def _scaled_deviations(values: Sequence[float]) -> tuple[float, list[float], flo
     mu = math.fsum(scaled) / n
     dev = [x - mu for x in scaled]
     sum_sq = math.fsum(d * d for d in dev)
-    if not sum_sq > 0:  # the values only differed below float precision once scaled
+    s = math.sqrt(sum_sq / (n - 1))
+    # A spread this small next to the largest value is float noise (e.g. -0.2, -0.2 and
+    # -0.19999999999999998), not a measurement: it would turn into a Sharpe ratio of 1e16.
+    if not s > _MIN_RELATIVE_STD:
         return None
-    return mu, dev, math.sqrt(sum_sq / (n - 1))
+    return mu, dev, s
 
 
 def _require_finite(values: Sequence[float], what: str) -> None:

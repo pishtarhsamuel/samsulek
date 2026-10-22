@@ -90,19 +90,23 @@ def test_with_no_delay_the_print_and_the_decision_coincide() -> None:
     assert quote is not None and quote.ts == clock.now() == CAL.open_print_utc(session)
 
 
-def test_quotes_are_raw_even_when_a_split_is_known(tmp_path: Path) -> None:
-    session = SESSIONS[98]  # the split is known, not yet effective
+def test_quotes_are_raw_whether_a_split_is_known_or_in_effect(tmp_path: Path) -> None:
+    session = SESSIONS[98]  # the split is known, not yet in effect (its ex-date is session 100)
     clock = FixedClock(execute_at(session))
     feed = make_feed(clock)
     quote = feed.quote("B")
     assert quote is not None and quote.price == DS.raw_open_eur("B", session)
     bars = feed.bars_until(clock.now())["B"]
-    assert bars[-1].close == pytest.approx(float(DS.raw_close_eur("B", SESSIONS[97])) * 0.5, rel=1e-12)
+    assert bars[-1].close == float(DS.raw_close_eur("B", SESSIONS[97]))  # not adjusted yet
     after = SESSIONS[101]
     clock.set(execute_at(after))
-    raw_after = make_feed(clock).quote("B")
+    feed_after = make_feed(clock)
+    raw_after = feed_after.quote("B")
     assert raw_after is not None and raw_after.price == DS.raw_open_eur("B", after)
     assert raw_after.price < quote.price * Decimal("0.7")  # the raw quote halves at the split
+    bars_after = feed_after.bars_until(clock.now())["B"]
+    assert bars_after[-1].close == float(DS.raw_close_eur("B", SPLIT_EX))  # the ex-date's own bar: raw
+    assert bars_after[-2].close == pytest.approx(float(DS.raw_close_eur("B", SESSIONS[99])) * 0.5, rel=1e-12)
 
 
 def test_a_non_eur_quote_is_the_open_in_eur_at_the_rate_public_at_the_print() -> None:
@@ -258,18 +262,36 @@ def test_trap04_tuples() -> None:
     assert DS.fingerprint == fingerprint and dict(vars(feed)) == state
 
 
-def test_trap10_adjusted_bars_see_a_split_only_once_known() -> None:
-    before = SESSIONS[95]
-    clock = FixedClock(execute_at(before))  # the split becomes known after this session's close
+def test_trap10_adjusted_bars_see_a_split_only_once_in_effect() -> None:
+    """A split announced after session 95's close, ex-date session 100: the bars are
+    adjusted from the ex-date's open print on, not from the announcement."""
+    assert CAL.close_utc(SESSIONS[95]) < SPLIT_KNOWN < CAL.open_print_utc(SPLIT_EX)
+    clock = FixedClock(execute_at(SESSIONS[95]))  # not known yet
     feed = make_feed(clock, window=50)
-    unadjusted = feed.bars_until(clock.now())["B"]
-    assert unadjusted[-1].close == float(DS.raw_close_eur("B", SESSIONS[94]))
-    clock.set(execute_at(SESSIONS[97]))
-    adjusted = feed.bars_until(clock.now())["B"]
-    assert adjusted[-1].close == pytest.approx(float(DS.raw_close_eur("B", SESSIONS[96])) * 0.5, rel=1e-12)
-    assert adjusted[0].close == pytest.approx(unadjusted[2].close * 0.5, rel=1e-12)  # all earlier bars
-    clock.set(CAL.close_utc(SESSIONS[97]))
+    for s in (SESSIONS[95], SESSIONS[97], SESSIONS[99]):  # then known, not in effect
+        clock.set(execute_at(s))
+        bars = feed.bars_until(clock.now())["B"]
+        assert bars[-1].close == float(DS.raw_close_eur("B", CAL.previous_session(s))), s
+    unadjusted = feed.bars_until(clock.now())["B"]  # at session 99: sessions 49..98
+    clock.set(execute_at(SPLIT_EX))  # the ex-date's decision: every earlier bar is adjusted
+    adjusted = feed.bars_until(clock.now())["B"]  # sessions 50..99
+    assert adjusted[-1].close == pytest.approx(float(DS.raw_close_eur("B", SESSIONS[99])) * 0.5, rel=1e-12)
+    assert adjusted[0].close == pytest.approx(unadjusted[1].close * 0.5, rel=1e-12)  # all earlier bars
+    clock.set(CAL.close_utc(SESSIONS[97]) + timedelta(days=5))
     assert feed.mark("B", SESSIONS[97]) == DS.raw_close_eur("B", SESSIONS[97])  # marks stay raw
+    assert feed.mark("B", SPLIT_EX) == DS.raw_close_eur("B", SPLIT_EX)
+
+
+def test_trap10_the_bars_are_on_the_basis_of_the_quote_the_decision_trades_at() -> None:
+    """At every decision around the split, the last adjusted close is near the raw quote:
+    adjusting at the announcement would show the strategy half the price it trades at."""
+    for s in SESSIONS[92:106]:
+        clock = FixedClock(execute_at(s))
+        feed = make_feed(clock)
+        quote = feed.quote("B")
+        assert quote is not None
+        last = feed.bars_until(clock.now())["B"][-1].close
+        assert 0.9 < float(quote.price) / last < 1.1, s
 
 
 def test_the_feed_answers_from_a_dataset_cut_at_the_decision_exactly_as_from_the_full_one() -> None:

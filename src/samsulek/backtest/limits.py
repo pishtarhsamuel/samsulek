@@ -8,6 +8,11 @@ Facts relied on:
   percentage caps, collars, flatten collar, quote age, minimum and maximum order (the EUR
   20 maximum order stays), trade counts, market orders, pool percentage, safety pass and
   the risk-day timezone.
+- R is never tighter than L: each relaxed leaf is ``max(live value, relaxed value)``.
+  For all five, a larger value is looser (a larger loss or drawdown before a halt, a
+  larger equity before the sanity halt, larger EUR caps), so a live config that one day
+  exceeds a relaxed value keeps its own value in R. ``max`` keeps the market rule
+  ``max_position_eur <= max_gross_exposure_eur`` (both relaxed values are equal).
 - ``derive_research_config`` dumps the live config, replaces those leaves and runs
   ``RiskConfig.model_validate`` again, so the R config passes every schema check the bot's
   own config does (``model_copy`` would skip validation, so it is never used).
@@ -33,6 +38,7 @@ from samsulek.backtest.types import ModeConfigs
 from samsulek.config import RISK_FILE, ConfigError, RiskConfig, load_risk_config
 
 RESEARCH_RISK_FILE: Final = Path("research") / "risk_research.yaml"
+# The relaxed leaves: R uses max(live value, these), never less than the live value.
 RELAXED_ACCOUNT: Final[Mapping[str, Decimal]] = MappingProxyType(
     {
         "max_daily_loss_pct": Decimal("0.5"),
@@ -49,11 +55,26 @@ RELAXED_MARKET: Final[Mapping[str, Decimal]] = MappingProxyType(  # every market
 
 
 def derive_research_config(live: RiskConfig) -> RiskConfig:
-    """Dump, replace the relaxed leaves, ``RiskConfig.model_validate`` (never ``model_copy``)."""
+    """Dump, replace each relaxed leaf with ``max(live, relaxed)`` (R is never tighter than L),
+    ``RiskConfig.model_validate`` (never ``model_copy``)."""
     data = live.model_dump(mode="python")
-    data["account"] = {**data["account"], **RELAXED_ACCOUNT}
-    data["markets"] = {market: {**limits, **RELAXED_MARKET} for market, limits in data["markets"].items()}
+    data["account"] = _loosened(data["account"], RELAXED_ACCOUNT)
+    data["markets"] = {
+        market: _loosened(limits, RELAXED_MARKET) for market, limits in data["markets"].items()
+    }
     return RiskConfig.model_validate(data)
+
+
+def _loosened(limits: Mapping[str, Any], relaxed: Mapping[str, Decimal]) -> dict[str, Any]:
+    """``limits`` with each relaxed leaf at ``max(its value, the relaxed value)``. The dump
+    holds Decimals (the schema types these leaves as Decimal); anything else is refused."""
+    out = dict(limits)
+    for key, value in relaxed.items():
+        current = out[key]
+        if not isinstance(current, Decimal):
+            raise TypeError(f"{key}: expected a Decimal in the dumped risk config, got {current!r}")
+        out[key] = max(current, value)
+    return out
 
 
 def _leaves(data: Any, prefix: str) -> dict[str, Any]:

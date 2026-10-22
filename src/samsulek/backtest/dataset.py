@@ -24,11 +24,26 @@ Facts the backtester relies on:
   (and its high and low) at ``close_ts``, with the rate known at that instant.
 - Raw (unadjusted) EUR prices are for quotes, marks and sizing: ``raw_open_eur``,
   ``raw_close_eur``, ``latest_print``. Adjusted bars are for signals: ``adjusted_window``
-  multiplies a bar by the ``price_factor`` of every action KNOWN by the decision time
-  (``known_at <= asof``) whose ``ex_session`` is after the bar's session (volume divided
-  by it for splits). A future split never reaches an earlier decision. The adjusted series
-  are built lazily once per (symbol, epoch), where the epoch is the number of that symbol's
-  actions known by ``asof``; the cache is deterministic and is not pickled.
+  multiplies a bar by the ``price_factor`` of every action IN EFFECT at the decision time
+  whose ``ex_session`` is after the bar's session (volume divided by it for splits).
+- An action is in effect from ``effective_at = max(known_at,
+  calendar.open_print_utc(ex_session))``: once it is known AND the market trades on the
+  new basis. Between an announcement and the ex-date the market still trades at the old
+  levels, so adjusting earlier would show the strategy price levels that never existed
+  (next to a raw quote at the old level). An action announced before its ex-date takes
+  effect at the ex-date's open print; one announced after it takes effect at ``known_at``
+  (until then the raw jump is visible, as it was). A future split never reaches an
+  earlier decision. ``actions_on`` still reports an action at its ex-date, however late
+  it is announced (the runner aborts on a held symbol: not modelled in M3).
+- ``effective_at`` is computed from the stored action whenever it is needed, never
+  stored. The physical cut still goes by ``known_at`` alone: an action announced by the
+  cutoff stays (with its announced ex-date) even if it takes effect only after the
+  cutoff; one announced later is gone.
+- Each symbol's actions are stored in effective order, so the actions in effect at
+  ``asof`` are always a prefix; the epoch is its length (found by bisect). The adjusted
+  series are built lazily once per (symbol, epoch); the cache is deterministic and is not
+  pickled. The fingerprint lists the actions in announcement order, so it does not depend
+  on that storage order (the effective times follow from the actions and the calendar).
 - ``listed`` drops a symbol only once its delisting is KNOWN (``delisting_known_at <=
   at``); ``last_session`` alone is never used to hide a symbol early.
 - The dataset pickles (it travels inside ``EngineContext``): plain dicts, tuples and frozen
@@ -62,6 +77,8 @@ if TYPE_CHECKING:
 
 _ACTION_KINDS: Final = ("split", "distribution")
 _EUR: Final = "EUR"
+# One converted row: (open in EUR, (high, low, close) in EUR), None where it is not stored.
+_Converted = tuple[Decimal | None, tuple[Decimal, Decimal, Decimal] | None]
 
 
 class DataRefusedError(BacktestRefused):
@@ -75,7 +92,8 @@ class CutoffError(ValueError):
 @dataclass(frozen=True, slots=True)
 class CorporateAction:
     """Bars with ``session < ex_session`` are multiplied by ``price_factor`` once the action is
-    known (``known_at``); for splits, volume is divided by it."""
+    in effect: from ``max(known_at, open print of ex_session)``; for splits, volume is
+    divided by it."""
 
     symbol: str
     ex_session: date
@@ -115,16 +133,16 @@ class _SymbolData:
     bar_ts: tuple[datetime, ...]  # close_ts
     close_eur: tuple[Decimal, ...]
     bars_eur: tuple[Bar, ...]  # unadjusted, in EUR (epoch 0)
-    actions: tuple[CorporateAction, ...]  # sorted by known_at
-    action_known: tuple[datetime, ...]
+    actions: tuple[CorporateAction, ...]  # in effective order (_effective_order)
     print_ts: tuple[datetime, ...]  # every open and close print, in time order
     print_eur: tuple[Decimal, ...]
 
     def cut(self, cutoff: datetime, calendar: XetraCalendar) -> tuple[_SymbolData, int]:
-        """A physical copy without anything known after ``cutoff``, and how many items went."""
+        """A physical copy without anything known after ``cutoff``, and how many items went.
+        Actions go by ``known_at`` (filtered, which keeps their effective order)."""
         n_open = bisect_right(self.open_ts, cutoff)
         n_bar = bisect_right(self.bar_ts, cutoff)
-        n_act = bisect_right(self.action_known, cutoff)
+        actions = tuple(a for a in self.actions if a.known_at <= cutoff)
         n_print = bisect_right(self.print_ts, cutoff)
         listing = _redact(self.listing, cutoff, calendar)
         dropped = (
@@ -133,7 +151,7 @@ class _SymbolData:
             + len(self.bar_ts)
             - n_bar
             + len(self.actions)
-            - n_act
+            - len(actions)
             + (listing != self.listing)
         )
         kept = _SymbolData(
@@ -147,8 +165,7 @@ class _SymbolData:
             bar_ts=self.bar_ts[:n_bar],
             close_eur=self.close_eur[:n_bar],
             bars_eur=self.bars_eur[:n_bar],
-            actions=self.actions[:n_act],
-            action_known=self.action_known[:n_act],
+            actions=actions,
             print_ts=self.print_ts[:n_print],
             print_eur=self.print_eur[:n_print],
         )
@@ -162,7 +179,7 @@ class _SymbolData:
             *self.open_ts,
             *self.bar_ts,
             *self.print_ts,
-            *self.action_known,
+            *(a.known_at for a in self.actions),
             *(r.close_ts for r in self.rows),
             *(b.close_ts for b in self.bars_eur),
         )
@@ -209,9 +226,27 @@ class _SymbolData:
             ],
             "actions": [
                 [a.ex_session.isoformat(), a.kind, repr(a.price_factor), _iso(a.known_at)]
-                for a in self.actions
+                for a in sorted(self.actions, key=_announcement_order)
             ],
         }
+
+
+def _announcement_order(a: CorporateAction) -> tuple[datetime, date, str, float]:
+    return (a.known_at, a.ex_session, a.kind, a.price_factor)
+
+
+def _effective_at(calendar: XetraCalendar, action: CorporateAction) -> datetime:
+    """When ``action`` starts to adjust earlier bars: once it is known AND the market trades
+    on the new basis (the ex-session's open print). Only for actions that passed ``build``
+    (their ex-session is a session the calendar knows)."""
+    return max(action.known_at, calendar.open_print_utc(action.ex_session))
+
+
+def _effective_order(
+    calendar: XetraCalendar, a: CorporateAction
+) -> tuple[datetime, datetime, date, str, float]:
+    """A total order (``build`` refuses two actions of one kind on one ex-date)."""
+    return (_effective_at(calendar, a), *_announcement_order(a))
 
 
 def _iso(value: date | datetime | None) -> str | None:
@@ -443,7 +478,7 @@ class PitDataset:
             ),
             default=None,
         )
-        built: dict[str, _SymbolData] = {}
+        checked: dict[str, tuple[Listing, list[_Row], list[_Converted]]] = {}
         for symbol in sorted(set(rows) | set(listings)):
             items = rows.get(symbol, [])
             entry = listings.get(symbol)
@@ -471,10 +506,17 @@ class PitDataset:
             if symbol_problems:
                 problems.extend(symbol_problems)
             elif not isinstance(converted, str):
-                symbol_actions = [a for a in actions if a.symbol == symbol]
-                built[symbol] = _symbol_data(entry, items, converted, symbol_actions)
+                checked[symbol] = (entry, items, converted)
         if problems:
             raise DataRefusedError(problems)
+        # Stored only once nothing is wrong: ordering the actions asks the calendar about
+        # their ex-dates, which are valid sessions only after the checks above.
+        built = {
+            symbol: _symbol_data(
+                entry, items, converted, [a for a in actions if a.symbol == symbol], calendar=calendar
+            )
+            for symbol, (entry, items, converted) in checked.items()
+        }
         fx = data.fx.truncated(cutoff) if data.fx is not None else None
         return cls(
             calendar=calendar,
@@ -617,17 +659,17 @@ class PitDataset:
     # ------------------------------------------------------------- adjusted bars
     def adjusted_window(self, symbol: str, asof: datetime, window: int) -> tuple[Bar, ...]:
         """The last ``window`` bars closed by ``asof``, in EUR, adjusted for the corporate
-        actions known by ``asof``."""
+        actions in effect at ``asof`` (known, and the ex-session's open printed)."""
         require_aware(asof, "decision time")
         if window < 1:
             raise ValueError(f"window must be >= 1, got {window}")
         sd = self._symbol(symbol)
         n = bisect_right(sd.bar_ts, asof)
-        series = self._adjusted(symbol, bisect_right(sd.action_known, asof))
+        series = self._adjusted(symbol, self._epoch(sd, asof))
         return series[max(0, n - window) : n]
 
     def adjusted_close(self, symbol: str, session: date, *, as_of: datetime) -> float:
-        """``session``'s close in EUR, adjusted for the actions known by ``as_of``.
+        """``session``'s close in EUR, adjusted for the actions in effect at ``as_of``.
         ``LookaheadError`` if it closes after ``as_of``; ``KeyError`` if there is none."""
         require_aware(as_of, "decision time")
         sd = self._symbol(symbol)
@@ -638,7 +680,7 @@ class PitDataset:
             raise LookaheadError(
                 f"{symbol} closes {sd.bar_ts[i].isoformat()} for {session}, after {as_of.isoformat()}"
             )
-        return self._adjusted(symbol, bisect_right(sd.action_known, as_of))[i].close
+        return self._adjusted(symbol, self._epoch(sd, as_of))[i].close
 
     # ---------------------------------------------------------------- internals
     def _symbol(self, symbol: str) -> _SymbolData:
@@ -647,8 +689,14 @@ class PitDataset:
             raise KeyError(f"{symbol} is not in the dataset")
         return sd
 
+    def _epoch(self, sd: _SymbolData, asof: datetime) -> int:
+        """How many of the symbol's actions are in effect at ``asof``: a prefix, as they are
+        stored in effective order."""
+        calendar = self.calendar
+        return bisect_right(sd.actions, asof, key=lambda a: _effective_at(calendar, a))
+
     def _adjusted(self, symbol: str, epoch: int) -> tuple[Bar, ...]:
-        """Every bar of ``symbol`` adjusted for its first ``epoch`` actions (by ``known_at``)."""
+        """Every bar of ``symbol`` adjusted for its first ``epoch`` actions (in effective order)."""
         key = (symbol, epoch)
         cached = self._cache.get(key)
         if cached is not None:
@@ -793,9 +841,7 @@ def _quality_problems(
     ]
 
 
-def _convert(
-    symbol: str, items: list[_Row], currency: str, fx: FxIndex | None
-) -> list[tuple[Decimal | None, tuple[Decimal, Decimal, Decimal] | None]] | str:
+def _convert(symbol: str, items: list[_Row], currency: str, fx: FxIndex | None) -> list[_Converted] | str:
     """Per row: (open in EUR, (high, low, close) in EUR), each at its own print time; or one
     problem string naming the prints without an FX rate. A missing or bad price (already
     reported by ``_row_problems``) is skipped, never converted."""
@@ -806,7 +852,7 @@ def _convert(
             return amount
         return fx.to_eur(amount, currency, at) if fx is not None else None
 
-    out: list[tuple[Decimal | None, tuple[Decimal, Decimal, Decimal] | None]] = []
+    out: list[_Converted] = []
     missing: list[datetime] = []
     for r in items:
         b = r.bar
@@ -835,10 +881,13 @@ def _convert(
 def _symbol_data(
     listing: Listing,
     items: list[_Row],
-    converted: list[tuple[Decimal | None, tuple[Decimal, Decimal, Decimal] | None]],
+    converted: list[_Converted],
     actions: Iterable[CorporateAction],
+    *,
+    calendar: XetraCalendar,
 ) -> _SymbolData:
-    """The stored form of one checked symbol (every row valid, every EUR value present)."""
+    """The stored form of one checked symbol (every row valid, every EUR value present, every
+    action checked)."""
     opens: list[tuple[datetime, date, float, Decimal]] = []
     bars: list[tuple[DailyBar, Decimal, Bar]] = []
     for r, (open_eur, hlc) in zip(items, converted, strict=True):
@@ -855,7 +904,7 @@ def _symbol_data(
                     Bar(b.symbol, b.close_ts, float(open_eur), float(high), float(low), float(close), volume),
                 )
             )
-    ordered_actions = tuple(sorted(actions, key=lambda a: (a.known_at, a.ex_session, a.kind, a.price_factor)))
+    ordered_actions = tuple(sorted(actions, key=lambda a: _effective_order(calendar, a)))
     prints = sorted([(ts, px) for ts, _, _, px in opens] + [(b.close_ts, close) for b, close, _ in bars])
     return _SymbolData(
         listing=listing,
@@ -869,7 +918,6 @@ def _symbol_data(
         close_eur=tuple(c for _, c, _ in bars),
         bars_eur=tuple(bar for _, _, bar in bars),
         actions=ordered_actions,
-        action_known=tuple(a.known_at for a in ordered_actions),
         print_ts=tuple(ts for ts, _ in prints),
         print_eur=tuple(px for _, px in prints),
     )
