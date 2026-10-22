@@ -6,7 +6,9 @@ symbol EXACTLY, never overlap or touch, stay inside the window, depend only on t
 buy-and-hold helpers are tested against a fake dataset that has ONLY the ``PitDataset``
 methods ``baselines.py`` may call (``calendar``, ``listed``, ``adjusted_close``,
 ``sessions``, ``adjusted_window``): calling anything else fails the test with an
-AttributeError. One test runs them on the real ``PitDataset`` too.
+AttributeError. The fake adjusts like the real one: a split counts from ``effective_at =
+max(known_at, open print of its ex-session)``. The anchor cases also run on a real
+``PitDataset`` (same numbers), and one test runs both helpers on the real dataset.
 """
 
 from __future__ import annotations
@@ -37,9 +39,9 @@ from samsulek.backtest.baselines import (
     seeds_for,
     unconstrained_buy_and_hold,
 )
-from samsulek.backtest.dataset import PitDataset
+from samsulek.backtest.dataset import CorporateAction, Listing, PitDataset
 from samsulek.backtest.fence import RESEARCH_DATA_CUTOFF
-from samsulek.backtest.sources import SyntheticBarSource, SyntheticPlants
+from samsulek.backtest.sources import SourceData, SyntheticBarSource, SyntheticPlants
 from samsulek.backtest.types import (
     BacktestIntegrityError,
     BacktestRefused,
@@ -52,6 +54,7 @@ from samsulek.backtest.types import (
     RunResult,
 )
 from samsulek.config import MarketLimits
+from samsulek.data.bars import DailyBar
 from samsulek.data.calendars import XetraCalendar
 from samsulek.strategies.base import LookaheadError
 from samsulek.types import Bar, Market
@@ -420,10 +423,13 @@ class FakeDataset:
     calendar: XetraCalendar = CAL
     calls: list[tuple[Any, ...]] = field(default_factory=list)
 
-    def _factor(self, symbol: str, session: date, known_by: datetime) -> float:
+    def _factor(self, symbol: str, session: date, asof: datetime) -> float:
+        """The real rule: a split adjusts the bars before its ex-session once it is in effect,
+        at ``max(known_at, open print of the ex-session)`` (known AND traded on the new basis)."""
         out = 1.0
         for ex_session, factor, known_at in self.symbols_data[symbol].splits:
-            if known_at <= known_by and ex_session > session:
+            effective_at = max(known_at, CAL.open_print_utc(ex_session))
+            if effective_at <= asof and ex_session > session:
                 out *= factor
         return out
 
@@ -548,16 +554,53 @@ def test_only_symbols_listed_at_the_first_session_count() -> None:
     assert plan.anchor_closes == (("AAA", 10.5), ("EEE", 5.5))
 
 
-@pytest.mark.parametrize(("known_at", "anchor"), [(E + timedelta(seconds=1), 10.5), (E, 5.25)])
-def test_the_anchor_uses_only_corporate_actions_known_at_execution(known_at: datetime, anchor: float) -> None:
-    split = (date(2021, 3, 8), 0.5, known_at)  # a 2:1 split a week later
-    ds = three(
-        AAA=FakeSymbol(date(2021, 1, 4), {**flat(BEFORE, 10.0, 10.0), PREV: (9.5, 10.5)}, splits=(split,))
+AAA_BARS = {**flat(BEFORE, 10.0, 10.0), PREV: (9.5, 10.5)}
+
+
+def real_aaa(split: tuple[date, float, datetime]) -> PitDataset:
+    """AAA of ``three()`` with one split, as a real point-in-time dataset."""
+    rows = tuple(
+        DailyBar("AAA", d, CAL.close_utc(d), o, max(o, c), min(o, c), c, 1000.0, "EUR", "test")
+        for d, (o, c) in sorted(AAA_BARS.items())
     )
+    ex_session, factor, known_at = split
+    data = SourceData(
+        "anchor-check",
+        True,
+        rows,
+        (Listing("AAA", "EUR", date(2021, 1, 4), None, None, "test fixture"),),
+        (CorporateAction("AAA", ex_session, "split", factor, known_at),),
+        None,
+    )
+    return PitDataset.build(data, calendar=CAL, cutoff=RESEARCH_DATA_CUTOFF)
+
+
+@pytest.mark.parametrize(
+    ("ex_session", "known_at", "anchor"),
+    [
+        (date(2021, 3, 8), E, 10.5),  # announced at E, ex-date a week later: old basis at E
+        (date(2021, 3, 8), E - timedelta(days=30), 10.5),  # announced long before: still the old basis
+        (S, E, 5.25),  # ex-date S, known at E: in effect from S's open print, which is E
+        (S, E - timedelta(days=7), 5.25),
+        (S, E + timedelta(seconds=1), 10.5),  # known just after E: not yet
+    ],
+)
+def test_the_anchor_uses_only_corporate_actions_in_effect_at_execution(
+    ex_session: date, known_at: datetime, anchor: float
+) -> None:
+    """A 2:1 split adjusts the anchor (PREV's close) only once it is in effect at E, at
+    ``max(known_at, open print of the ex-session)``: known AND traded on the new basis. The
+    real ``PitDataset`` gives the very same anchor as the fake."""
+    split = (ex_session, 0.5, known_at)
+    ds = three(AAA=FakeSymbol(date(2021, 1, 4), dict(AAA_BARS), splits=(split,)))
     plan = buy_and_hold_plan(
         as_dataset(ds), ("AAA",), limits=limits("0.30"), first_session=S, execute_at=E, min_bars=MIN_BARS
     )
     assert plan.anchor_closes == (("AAA", anchor),)
+    real = buy_and_hold_plan(
+        real_aaa(split), ("AAA",), limits=limits("0.30"), first_session=S, execute_at=E, min_bars=MIN_BARS
+    )
+    assert real.anchor_closes == plan.anchor_closes
 
 
 def test_nothing_listed_is_refused() -> None:

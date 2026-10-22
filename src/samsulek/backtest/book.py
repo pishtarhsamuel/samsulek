@@ -41,6 +41,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Final
 
+from samsulek.backtest.halts import ResetPolicy, reset_policy_for
 from samsulek.backtest.types import (
     BacktestIntegrityError,
     Episode,
@@ -312,6 +313,12 @@ def summarize_halts(result: RunResult) -> HaltSummary:
         first_halt_equity=first_equity,
         equity_sanity_halts=sum(1 for h in halts if HaltKind.EQUITY_SANITY in h.kinds),
         cap_drift_halts=sum(1 for h in halts if HaltKind.CAP_DRIFT in h.kinds),
-        hard_stop_active_at_end=result.job.risk_mode is RiskMode.R and any(h.reset_at is None for h in halts),
+        # In R only hard stops freeze the account; a cap-drift halt on the last session is
+        # simply not reset yet (there is no next session), so it is not a hard stop.
+        hard_stop_active_at_end=result.job.risk_mode is RiskMode.R
+        and any(
+            h.reset_at is None and reset_policy_for(RiskMode.R, kinds=h.kinds) is ResetPolicy.NEVER
+            for h in halts
+        ),
         frozen_end_equity=result.frozen_equity[-1].equity if result.frozen_equity else None,
     )

@@ -5,7 +5,8 @@ traps 12 and 14 production halves; WP4).
   timing, the fence, warm-up, sessions outside the data, the cost guard, the universe,
   currencies, plans and research limits.
 - P4: ``run_backtest`` equals a hand loop of reset, clock, cycle and mark built from the
-  same parts: the runner adds no decision of its own.
+  same parts: the runner adds no decision of its own (also for a cap-drift halt, which
+  both modes reset at the next session; mode R keeps only its hard stops).
 - Trap 12: every fill is stamped E, strictly between the previous close and the session's
   close; a loop that leaves the clock at the previous mark cannot get a price.
 - Trap 14: a run after another run (earlier start, same process) equals that run alone;
@@ -341,15 +342,16 @@ def test_warm_up_plans_and_sessions_are_checked() -> None:
 
 # --------------------------------------------------------------------------- P4: no extras
 def hand_loop(the_job: RunJob, ctx: EngineContext) -> tuple[BacktestParts, list[tuple[Decimal, Decimal]]]:
-    """Reset, clock, cycle, mark by hand on the same parts the runner builds."""
+    """Reset, clock, cycle, mark by hand on the same parts the runner builds. The modeled
+    owner resets every halt in L, and only a cap-drift halt in R (the R hard stops stay)."""
     parts = build_parts(the_job, ctx)
     marks: list[tuple[Decimal, Decimal]] = []
     for session in ctx.dataset.sessions(the_job.first_session, the_job.last_session):
         times = session_times(CAL, session, ctx.timing)
         halt = parts.store.read_halt()
-        if halt.active and the_job.risk_mode is RiskMode.L:
+        kinds = [k for k in map(classify_halt, halt.reasons) if k is not None]
+        if halt.active and (the_job.risk_mode is RiskMode.L or set(kinds) == {HaltKind.CAP_DRIFT}):
             parts.clock.set(times.reset_at)
-            kinds = [k for k in map(classify_halt, halt.reasons) if k is not None]
             apply_reset_policy(parts.store, kinds=kinds, at=times.reset_at)
         parts.clock.set(times.execute)
         universe = ctx.dataset.listed(
@@ -388,6 +390,25 @@ def test_p4_the_runner_adds_no_decisions(mode: RiskMode) -> None:
         assert any(h.immediate_rehalt for h in result.halts) and len(result.halts) >= 3
     else:
         assert {s.status for s in result.sessions if s.session > result.halts[0].session} == {"blocked"}
+
+
+@pytest.mark.parametrize("mode", [RiskMode.L, RiskMode.R])
+def test_p4_a_cap_drift_reset_adds_no_decisions(mode: RiskMode) -> None:
+    """A +50% gap with two symbols 30% each and one trade a day: B ends the gap day above its
+    cap (only A's sell got through). Both modes reset that halt at the next session (in R
+    too: a cap drift is no hard stop), exactly as the hand loop does, and trade on."""
+    ds = dataset(gaps={SESSIONS[60]: 1.5})
+    ctx = context(ds, replay=limits(stocks__max_trades_per_day=1))
+    the_job = job(buy_and_hold(ds, ctx, ("A", "B")), universe=("A", "B"), mode=mode)
+    result = run_backtest(the_job, ctx)
+    parts, marks = hand_loop(the_job, ctx)
+    assert decisions(result) == parts.log.all_records
+    assert tuple(r.fill for r in result.fills) == tuple(parts.broker.fills_since(None))
+    assert [(p.cash, p.equity) for p in result.equity] == marks
+    (event,) = result.halts
+    assert event.session == SESSIONS[60] and event.kinds == (HaltKind.CAP_DRIFT,)
+    assert event.reset_at == session_times(CAL, SESSIONS[61], TIMING).reset_at
+    assert {s.status for s in result.sessions if s.session > SESSIONS[60]} == {"done"}
 
 
 # ------------------------------------------------------------------- traps 12 and 14
@@ -1168,10 +1189,16 @@ def test_the_books_add_up_exactly_on_random_runs(
     assert len(returns) == len(days) and all(math.isfinite(r) for r in returns)
     if mode is RiskMode.L and result.halts:
         assert result.frozen_equity[0].session == result.halts[0].session
-    if mode is RiskMode.R and result.halts:  # a hard stop: blocked for good, no reset, no fill
-        after = [s for s in result.sessions if s.session > result.halts[0].session]
-        assert {s.status for s in after} <= {"blocked"} and all(h.reset_at is None for h in result.halts)
-        assert not [r for r in result.fills if r.session > result.halts[0].session]
+    if mode is RiskMode.R and result.halts:
+        *before, latest = result.halts
+        for h in before:  # R resets only a cap-drift halt, at the next session
+            assert h.kinds == (HaltKind.CAP_DRIFT,) and h.reset_at is not None, h
+        if latest.kinds == (HaltKind.CAP_DRIFT,):
+            assert (latest.reset_at is None) == (latest.session == days[-1])
+        else:  # a hard stop: blocked for good, no reset, no fill
+            after = [s for s in result.sessions if s.session > latest.session]
+            assert {s.status for s in after} <= {"blocked"} and latest.reset_at is None
+            assert not [r for r in result.fills if r.session > latest.session]
 
 
 # --------------------------------------------- statistics plumbing, runner to metrics

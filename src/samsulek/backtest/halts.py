@@ -9,13 +9,21 @@ Facts the runner relies on:
   reverse). Every other halt reason (zero or invalid equity, stale data, missing prices,
   broker or bookkeeping errors, a clock that moved backwards, unreadable state, anything
   unexpected) gives None: a bug or bad data, and the run is void.
-- Mode L (``ResetPolicy.NEXT_SESSION``): the halt freezes the rest of the session, and at
-  the next session's ``reset_at`` the modeled owner runs the CLI's own reset steps
+- ``ResetPolicy.NEXT_SESSION``: the halt freezes the rest of the session, and at the next
+  session's ``reset_at`` the modeled owner runs the CLI's own reset steps
   (``apply_owner_reset``) on the in-memory store: the halt is cleared, the KILL flag is
   never touched, and the drawdown peak is rebased to the last seen equity only for a
   drawdown halt. The day state and trade counts are untouched, so the re-halt trap
   (a reset on a losing day halts again at the next look) is reproduced exactly.
-- Mode R (``ResetPolicy.NEVER``): a halt is never reset; it is a hard stop.
+- Mode L: every modeled halt is reset that way (owner decision Q2).
+- Mode R: the relaxed daily loss (50%) and drawdown (90%) stops and the equity-sanity halt
+  are hard stops (``ResetPolicy.NEVER``): never reset, the account stays frozen and later
+  cycles are blocked. A cap-drift halt alone (a held position grew above its cap through
+  price drift, with no buy of it that session) is NOT a hard stop: the research limits
+  keep the percentage caps of the bot's own limits, so it is the same real halt as in L,
+  and the modeled owner resets it at the next session exactly as in L (no peak rebase).
+  Only kinds in ``R_RESETTABLE`` are reset in R: a halt that carries a cap drift together
+  with any other kind is a hard stop, and so is a halt whose kinds are unknown.
 - ``apply_reset_policy`` refuses any store that is not the backtest's in-memory one, so it
   can never clear a halt of the bot.
 """
@@ -60,6 +68,8 @@ _KINDS: Final = (
     ),
 )
 _CAP_PREFIX: Final = "Position cap exceeded after trading: "
+# The only halt kinds the modeled owner resets in mode R; every other kind is a hard stop.
+R_RESETTABLE: Final = frozenset({HaltKind.CAP_DRIFT})
 
 
 class ResetPolicy(StrEnum):
@@ -67,9 +77,17 @@ class ResetPolicy(StrEnum):
     NEVER = "never"
 
 
-def reset_policy_for(mode: RiskMode) -> ResetPolicy:
-    """L: reset at the next session (the modeled owner); R: never (a hard stop)."""
-    return {RiskMode.L: ResetPolicy.NEXT_SESSION, RiskMode.R: ResetPolicy.NEVER}[RiskMode(mode)]
+def reset_policy_for(mode: RiskMode, *, kinds: Collection[HaltKind] | None = None) -> ResetPolicy:
+    """What the modeled owner does with a halt of ``kinds`` in ``mode``. L: reset at the next
+    session, whatever the kinds. R: reset at the next session only when every kind is in
+    ``R_RESETTABLE`` (a cap-drift halt); otherwise never (a hard stop: daily loss, drawdown,
+    equity sanity, or a mix with any of them). Without kinds (None or empty) R gives NEVER."""
+    if RiskMode(mode) is RiskMode.L:
+        return ResetPolicy.NEXT_SESSION
+    found = {HaltKind(k) for k in kinds or ()}
+    if found and found <= R_RESETTABLE:
+        return ResetPolicy.NEXT_SESSION
+    return ResetPolicy.NEVER
 
 
 def classify_halt(reason: str) -> HaltKind | None:
@@ -90,8 +108,9 @@ def cap_drift_symbols(reason: str) -> tuple[str, ...]:
 def apply_reset_policy(
     store: MemoryRiskStateStore, *, kinds: Collection[HaltKind], at: datetime
 ) -> ResetOutcome:
-    """The modeled owner's reset of a mode-L halt of ``kinds`` (never the KILL flag; the peak
-    is rebased only for a drawdown halt). ``TypeError`` for any store but the in-memory one;
+    """The modeled owner's reset of a halt of ``kinds`` that ``reset_policy_for`` resets (any
+    mode-L halt, a mode-R cap-drift halt; the caller decides). Never the KILL flag; the peak
+    is rebased only for a drawdown halt. ``TypeError`` for any store but the in-memory one;
     ``ValueError`` without a halt kind."""
     if not isinstance(store, MemoryRiskStateStore) or getattr(store, "in_memory", False) is not True:
         raise TypeError(

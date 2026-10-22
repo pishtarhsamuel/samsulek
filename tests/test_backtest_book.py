@@ -629,6 +629,31 @@ def test_an_r_mode_halt_is_a_hard_stop() -> None:
     assert s.frozen_end_equity is None
 
 
+def test_an_r_mode_cap_drift_on_the_last_session_is_not_a_hard_stop() -> None:
+    # A cap drift is reset at the next session in R too; on the last session there is none.
+    recs = sessions(4, status={3: "halted"})
+    r = run_result(
+        start=Decimal(50),
+        final=Decimal(52),
+        episodes=(),
+        residual=Decimal(0),
+        halts=[halt(3, HaltKind.CAP_DRIFT, reset=False)],
+        recs=recs,
+    )
+    s = summarize_halts(r)
+    assert s.hard_stop_active_at_end is False
+    assert s.cap_drift_halts == 1
+
+
+def test_an_r_mode_cap_drift_with_a_daily_loss_is_a_hard_stop() -> None:
+    recs = sessions(4, status={3: "halted"})
+    both = halt(3, HaltKind.CAP_DRIFT, HaltKind.DAILY_LOSS, reset=False)
+    r = run_result(
+        start=Decimal(50), final=Decimal(40), episodes=(), residual=Decimal(0), halts=[both], recs=recs
+    )
+    assert summarize_halts(r).hard_stop_active_at_end is True
+
+
 def test_no_halts() -> None:
     s = summarize_halts(
         run_result(start=Decimal(50), final=Decimal(51), episodes=(), residual=Decimal(0), recs=sessions(3))

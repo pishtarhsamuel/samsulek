@@ -13,9 +13,11 @@ cost table whose currency disagrees with the data; and the no-fill cost guard
 
 Then it builds new parts (``build_parts``: nothing is shared between runs) and, for each
 session s from the first to the last (spec section 4):
-1. RESET at ``reset_at`` (mode L only, while halted): the modeled owner's reset
+1. RESET at ``reset_at`` (while halted, if ``halts.reset_policy_for`` resets the pending
+   halt: every halt in mode L, a cap-drift-only halt in mode R): the modeled owner's reset
    (``halts.apply_reset_policy``); the pending halt event records when, and the rebased
-   peak. Mode R never resets: the halt stays, and later cycles are blocked.
+   peak. An R hard stop (daily loss, drawdown or equity sanity, alone or with a cap
+   drift) is never reset: the halt stays, and later cycles are blocked.
 2. The clock moves to the execution time E.
 3. PRE-CHECKS (dataset metadata only): no KILL flag; every held symbol has an open print
    at s (else it was delisted while held); no corporate action on a held symbol at s (not
@@ -26,9 +28,11 @@ session s from the first to the last (spec section 4):
 5. CYCLE: ``run_unlocked_cycle``, the very core ``samsulek run`` runs. Every order goes
    through the real router and risk engine there; this module never plans, checks or
    sends an order itself.
-6. CLASSIFY: "error" voids the run; "blocked" is allowed only under an R-mode hard stop;
-   "halted" must add halt reasons that ``classify_halt`` recognises (a limit halt), and a
-   cap-drift halt must not name a symbol bought this session (that is a sizing bug).
+6. CLASSIFY: "error" voids the run; "blocked" is allowed only under an R-mode hard stop
+   (the latest halt is one mode R never resets, and it is still active; a cap-drift halt
+   left standing after its reset voids the run like any failed reset); "halted" must add
+   halt reasons that ``classify_halt`` recognises (a limit halt), and a cap-drift halt
+   must not name a symbol bought this session (that is a sizing bug).
    Any order the cycle had to cancel (an approved order that did not fill) voids the run.
 7. AUDITS: no open order; ledger and broker reconcile; every new fill is stamped E and
    priced exactly ``expected_fill_price(raw open of s)`` with fee ``fee_for`` (a
@@ -351,7 +355,6 @@ class _Run:
         self._parts = parts
         self._dataset = ctx.dataset
         self._calendar = ctx.dataset.calendar
-        self._policy = reset_policy_for(job.risk_mode)
         self._window = plan_window(job.plan)
         self._limits = parts.risk_config.limits_for(Market.STOCKS)
         self._start = parts.clock.now()
@@ -427,13 +430,16 @@ class _Run:
         self._mark(session, times.close_print)
 
     def _reset(self, session: date, times: SessionTimes) -> bool:
-        """Step 1: the modeled owner's reset of a pending mode-L halt. True if it ran."""
+        """Step 1: the modeled owner's reset of the pending halt, if its mode resets that halt
+        (any halt in L, a cap-drift-only halt in R). True if it ran; an R hard stop stays."""
         store = self._parts.store
-        if self._policy is not ResetPolicy.NEXT_SESSION or not store.read_halt().active:
+        if not store.read_halt().active:
             return False
         pending = self._halts[-1] if self._halts else None
         if pending is None or pending.reset_at is not None:
             raise self._void("trading is halted, but no modeled halt is waiting for a reset (a bug)", session)
+        if reset_policy_for(self._job.risk_mode, kinds=pending.kinds) is not ResetPolicy.NEXT_SESSION:
+            return False  # an R hard stop: the halt stays and the cycle is blocked
         self._parts.clock.set(times.reset_at)
         outcome = apply_reset_policy(store, kinds=pending.kinds, at=times.reset_at)
         self._halts[-1] = replace(pending, reset_at=times.reset_at, peak_rebased_to=outcome.peak_rebased_to)
@@ -472,11 +478,15 @@ class _Run:
         return fills
 
     def _hard_stop(self) -> bool:
-        """A mode-R halt is in force (a hard stop): the only way a cycle may be blocked."""
+        """A mode-R hard stop is in force: the latest halt is one mode R never resets, it was
+        not reset, and it is still active. The only way a cycle may be blocked."""
         store = self._parts.store
+        latest = self._halts[-1] if self._halts else None
         return (
             self._job.risk_mode is RiskMode.R
-            and bool(self._halts)
+            and latest is not None
+            and reset_policy_for(RiskMode.R, kinds=latest.kinds) is ResetPolicy.NEVER
+            and latest.reset_at is None
             and store.read_halt().active
             and not store.read_kill().active
         )

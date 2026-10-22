@@ -5,16 +5,20 @@
 # and nothing else.
 #
 # How it was derived: derive_research_config(config/risk.yaml), i.e. config/risk.yaml with
-# exactly these leaves replaced, every other value copied unchanged:
-#   account.max_daily_loss_pct         0.5          (schema maximum; in R a halt is never reset)
-#   account.max_drawdown_pct           0.9          (schema maximum; in R a halt is never reset)
-#   account.equity_sanity_max_eur      1000000000   (far above any EUR 50 run)
+# exactly these five leaves loosened, every other value copied unchanged. Each one is
+# max(its value in config/risk.yaml, the relaxed value below), so mode R is never tighter
+# than the bot's own limits; with today's config/risk.yaml each takes the relaxed value:
+#   account.max_daily_loss_pct         0.5          (schema maximum; an R hard stop, never reset)
+#   account.max_drawdown_pct           0.9          (schema maximum; an R hard stop, never reset)
+#   account.equity_sanity_max_eur      1000000000   (far above any EUR 50 run; also a hard stop)
 #   markets.*.max_position_eur         1000000      (far above any EUR 50 run)
 #   markets.*.max_gross_exposure_eur   1000000      (far above any EUR 50 run)
 # Why: mode R shows a strategy's shape without the EUR 50 account's EUR caps and halts
 # binding (owner decision Q1). The edge verdict uses mode R; the realism block replays
 # config/risk.yaml verbatim (mode L). Percentage caps, collars, quote age, order sizes
 # (the EUR 20 maximum order stays), trade counts and everything else are equal in both.
+# So a position that drifts above its percentage cap halts in R as it does in L, and the
+# backtest's modeled owner resets that halt at the next session in both modes.
 #
 # Every backtest refuses to start unless this file equals
 # derive_research_config(config/risk.yaml) leaf by leaf. If config/risk.yaml changes,

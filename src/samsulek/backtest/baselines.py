@@ -24,13 +24,16 @@ Facts relied on:
   jobs' ``min_history``; a gross cap below 100% would scale the weights down in sizing,
   as for any strategy). The execution time must lie between that session's open print
   and its close. Each symbol is anchored at the adjusted close of the previous session
-  as visible at the execution time, i.e. the last bar the strategy sees there, so it
-  starts exactly at ``w0`` and then drifts without churning.
+  as visible at the execution time, i.e. the last bar the strategy sees there (adjusted
+  for the corporate actions in effect then), so it starts exactly at ``w0`` and then
+  drifts without churning.
 - The unconstrained buy-and-hold (equal weight, 100% invested at the first open, no costs,
   no caps) is shown for context only and is never used in a fact. It is valued at the
-  adjusted closes as known at the end of the window (one consistent adjustment basis, so
-  splits and distributions do not show as jumps) and stops at the first session where a
-  holding has no close (a delisting).
+  adjusted closes in effect at the close of the window's last session: adjusted for
+  every corporate action whose ``effective_at = max(known_at, open print of its
+  ex-session)`` is at or before that close (the dataset's rule; one consistent
+  adjustment basis, so splits and distributions do not show as jumps), and it stops at
+  the first session where a holding has no close (a delisting).
 
 Dataset methods used: ``calendar`` (``is_session``, ``previous_session``, ``close_utc``,
 ``open_print_utc``), ``listed``, ``adjusted_close``, ``sessions`` and ``adjusted_window``.

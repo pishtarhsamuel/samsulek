@@ -9,9 +9,12 @@
 - A position-cap halt is modeled only when it comes from price drift: one right after a
   buy of the same symbol in the same cycle is a sizing bug and voids the run.
 - Equity-sanity halts re-halt every session (no reset helps; the owner must change the
-  config). Mode R never resets: a hard stop freezes the account and later cycles are
-  blocked. The modeled owner never clears the KILL flag and rebases the peak only after a
-  drawdown halt.
+  config). In mode R the daily loss, drawdown and equity-sanity halts are hard stops: never
+  reset, the account freezes and later cycles are blocked. A cap-drift halt alone is reset
+  at the next session in R exactly as in L (follow-up G1); a cap drift together with a
+  hard-stop kind in one halt freezes. A cap-drift halt left standing by a broken reset
+  voids an R run as it does an L run. The modeled owner never clears the KILL flag and
+  rebases the peak only after a drawdown halt.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from typing import Any
 
 import pytest
 
+from samsulek.backtest import runner
 from samsulek.backtest.baselines import buy_and_hold_plan
 from samsulek.backtest.book import summarize_halts
 from samsulek.backtest.clock import session_times
@@ -32,6 +36,7 @@ from samsulek.backtest.dataset import Listing, PitDataset
 from samsulek.backtest.feed import BacktestFeed
 from samsulek.backtest.fence import RESEARCH_DATA_CUTOFF
 from samsulek.backtest.halts import (
+    R_RESETTABLE,
     ResetPolicy,
     apply_reset_policy,
     cap_drift_symbols,
@@ -61,7 +66,7 @@ from samsulek.backtest.types import (
 from samsulek.clock import FixedClock
 from samsulek.config import RiskConfig, load_risk_config
 from samsulek.costs.stocks import StockCostParams
-from samsulek.cycle import CycleSpec, run_unlocked_cycle
+from samsulek.cycle import CycleReport, CycleSpec, run_unlocked_cycle
 from samsulek.data.calendars import XetraCalendar
 from samsulek.execution.broker import BrokerError
 from samsulek.risk.engine import RiskEngine
@@ -471,10 +476,139 @@ def test_an_r_mode_hard_stop_freezes_the_account() -> None:
     assert l_run.frozen_equity and l_run.frozen_equity[0].session == CRASH
 
 
+# ------------------------------------------ mode R: cap drift is reset, hard stops freeze
+RESEARCH_LIMITS = derive_research_config(LIVE_LIMITS)
+HARD_KINDS = (HaltKind.DAILY_LOSS, HaltKind.DRAWDOWN, HaltKind.EQUITY_SANITY)
+
+
+def _cap_drift_case() -> tuple[EngineContext, BuyAndHoldPlan]:
+    """The cap-drift scenario of ``test_cap_drift_from_price_moves_is_a_modeled_halt``: the
+    research limits keep the 30% cap and the one trade a day, so it halts in R as well."""
+    ds = dataset(("A", "B"), gaps={GAP_DAY: 1.5})
+    ctx = context(ds, limits(stocks__max_trades_per_day=1))
+    return ctx, buy_and_hold(ds, ctx, ("A", "B"))
+
+
+def hard_stop_reason(kind: HaltKind) -> str:
+    """A real halt reason of ``kind``, written by the risk engine under the research limits."""
+    store = MemoryRiskStateStore()
+    engine = engine_on(store, FixedClock(T), RESEARCH_LIMITS)
+    if kind is HaltKind.DAILY_LOSS:
+        engine.observe_equity(Decimal(100))
+        reasons = engine.observe_equity(Decimal(40))  # -60%: past the 50% stop, not 90% down
+    elif kind is HaltKind.DRAWDOWN:
+        store.write_peak(Decimal(100))
+        reasons = engine.observe_equity(Decimal(5))  # 95% below the peak, a flat day
+    else:
+        reasons = engine.observe_equity(RESEARCH_LIMITS.account.equity_sanity_max_eur * 2)
+    (reason,) = reasons
+    assert classify_halt(reason) is kind
+    return reason
+
+
+def test_an_r_mode_cap_drift_halt_is_reset_at_the_next_session() -> None:
+    """Follow-up G1: in R a cap drift is the same real, resettable halt as in L, not a hard
+    stop. The modeled owner resets it at the next session (no peak rebase), B's sell goes
+    through, and trading goes on to the end."""
+    ctx, plan = _cap_drift_case()
+    result = run_backtest(job(plan, ("A", "B"), mode=RiskMode.R, label="bh_R"), ctx)
+    (event,) = result.halts
+    assert event.session == GAP_DAY and event.kinds == (HaltKind.CAP_DRIFT,)
+    assert cap_drift_symbols(event.reasons[0]) == ("B",)
+    nxt = CAL.next_session(GAP_DAY)
+    assert event.reset_at == session_times(CAL, nxt, ctx.timing).reset_at
+    assert event.peak_rebased_to is None and not event.immediate_rehalt
+    assert [(r.fill.symbol, r.fill.side) for r in result.fills if r.session == GAP_DAY] == [("A", Side.SELL)]
+    assert [(r.fill.symbol, r.fill.side) for r in result.fills if r.session == nxt] == [("B", Side.SELL)]
+    statuses = {s.session: s.status for s in result.sessions}
+    assert statuses[GAP_DAY] == "halted"
+    assert {st for d, st in statuses.items() if d != GAP_DAY} == {"done"}, "trading resumes"
+    assert [s.session for s in result.sessions if s.reset_before] == [nxt]
+    summary = summarize_halts(result)
+    assert (summary.n_halts, summary.cap_drift_halts, summary.sessions_halted) == (1, 1, 1)
+    assert not summary.hard_stop_active_at_end
+    assert result.frozen_equity == (), "the frozen-positions equity is a mode-L report"
+
+
+@pytest.mark.parametrize("hard", HARD_KINDS, ids=[k.value for k in HARD_KINDS])
+@pytest.mark.parametrize("with_cap_drift", [True, False], ids=["with_cap_drift", "alone"])
+def test_an_r_mode_hard_stop_wins_and_freezes(
+    monkeypatch: pytest.MonkeyPatch, hard: HaltKind, with_cap_drift: bool
+) -> None:
+    """Planted: a hard-stop reason in the engine's own wording (research limits), raised
+    mid-cycle; on the cap-drift day it comes in the same halt as the cap drift. Either
+    way the hard stop wins: never reset, every later cycle blocked, nothing traded."""
+    ctx, plan = _cap_drift_case()
+    at = GAP_DAY if with_cap_drift else SESSIONS[30]
+    execute = session_times(CAL, at, ctx.timing).execute
+    reason = hard_stop_reason(hard)
+    real = runner.run_unlocked_cycle
+
+    def plus_hard_stop(parts: Any, spec: CycleSpec) -> CycleReport:
+        report = real(parts, spec)
+        if parts.clock.now() == execute:
+            assert report.status == ("halted" if with_cap_drift else "done")
+            parts.engine.halt(reason)
+            report.status = "halted"
+        return report
+
+    monkeypatch.setattr(runner, "run_unlocked_cycle", plus_hard_stop)
+    result = run_backtest(job(plan, ("A", "B"), mode=RiskMode.R, label="bh_R"), ctx)
+    (stop,) = result.halts
+    kinds = (HaltKind.CAP_DRIFT, hard) if with_cap_drift else (hard,)
+    assert stop.session == at and stop.kinds == kinds and stop.reasons[-1] == reason
+    assert stop.reset_at is None and stop.peak_rebased_to is None
+    assert {s.status for s in result.sessions if s.session > at} == {"blocked"}
+    assert not any(s.reset_before for s in result.sessions)
+    assert all(r.session <= at for r in result.fills), "nothing trades after the stop"
+    summary = summarize_halts(result)
+    assert summary.hard_stop_active_at_end
+    assert summary.cap_drift_halts == int(with_cap_drift)
+    assert summary.sessions_halted == sum(1 for s in result.sessions if s.session >= at)
+
+
+@pytest.mark.parametrize("plant", ["reset_does_nothing", "reset_skipped"])
+def test_a_cap_drift_halt_a_reset_left_standing_voids_an_r_run(
+    monkeypatch: pytest.MonkeyPatch, plant: str
+) -> None:
+    """Planted: a modeled reset that runs but clears nothing, or a runner that skips it. In R
+    the cap-drift halt is still no hard stop, so the blocked cycle after it voids the run
+    instead of freezing the account quietly (and turning the verdict into a hard-stop FAIL)."""
+    from samsulek.risk.reset import ResetOutcome
+
+    def no_op(store: MemoryRiskStateStore, *, kinds: object, at: datetime) -> ResetOutcome:
+        return ResetOutcome(kill_cleared=False, peak_rebased_to=None)
+
+    def skipped(self: Any, session: date, times: Any) -> bool:
+        return False
+
+    if plant == "reset_does_nothing":
+        monkeypatch.setattr(runner, "apply_reset_policy", no_op)
+    else:
+        monkeypatch.setattr(runner._Run, "_reset", skipped)
+    ctx, plan = _cap_drift_case()
+    with pytest.raises(BacktestIntegrityError) as caught:
+        run_backtest(job(plan, ("A", "B"), mode=RiskMode.R), ctx)
+    assert "blocked without a mode-R hard stop" in caught.value.reason
+    assert caught.value.session == CAL.next_session(GAP_DAY)
+
+
 # ------------------------------------------------------------------- the modeled owner
 def test_reset_policies() -> None:
     assert reset_policy_for(RiskMode.L) is ResetPolicy.NEXT_SESSION
-    assert reset_policy_for(RiskMode.R) is ResetPolicy.NEVER
+    assert reset_policy_for(RiskMode.R) is ResetPolicy.NEVER  # no kinds given: a hard stop
+    assert {HaltKind.CAP_DRIFT} == R_RESETTABLE
+    for kinds in ([], *([k] for k in HaltKind), list(HaltKind), [HaltKind.CAP_DRIFT, HaltKind.DRAWDOWN]):
+        assert reset_policy_for(RiskMode.L, kinds=kinds) is ResetPolicy.NEXT_SESSION, kinds
+    assert reset_policy_for(RiskMode.R, kinds=[HaltKind.CAP_DRIFT]) is ResetPolicy.NEXT_SESSION
+    assert reset_policy_for(RiskMode.R, kinds=("cap_drift",)) is ResetPolicy.NEXT_SESSION  # type: ignore[arg-type]
+    assert reset_policy_for(RiskMode.R, kinds=[]) is ResetPolicy.NEVER
+    for hard in HARD_KINDS:
+        assert reset_policy_for(RiskMode.R, kinds=[hard]) is ResetPolicy.NEVER, hard
+        for mixed in ([HaltKind.CAP_DRIFT, hard], [hard, HaltKind.CAP_DRIFT]):
+            assert reset_policy_for(RiskMode.R, kinds=mixed) is ResetPolicy.NEVER, mixed
+    with pytest.raises(ValueError, match="not a valid HaltKind"):
+        reset_policy_for(RiskMode.R, kinds=["cap drift"])  # type: ignore[list-item]
 
 
 def test_the_modeled_owner_never_clears_the_kill_flag_and_rebases_only_after_drawdowns() -> None:
