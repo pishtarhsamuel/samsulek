@@ -1,9 +1,10 @@
-"""Collecting reference quotes for a set of symbols (M3 skeleton; WP1 fills it in).
+"""Collecting reference quotes for a set of symbols.
 
-``collect_quotes`` is the one implementation behind ``App.quotes_for`` and the
-backtest parts' ``quotes_for``: it iterates ``sorted(symbols)``, asks ``quote`` for each and
-skips symbols without a quote (callers fail closed on what is missing). WP1 moves today's
-``App.quotes_for`` body here unchanged.
+``collect_quotes`` is the one implementation behind ``App.quotes_for`` and the backtest
+parts' ``quotes_for``, so the bot and the backtest ask for prices the same way: it asks
+``quote`` once per symbol, in ``sorted(symbols)`` order (deterministic, whatever the set
+order), and leaves out symbols without a quote. It never invents a price: callers compare
+the result with what they asked for and fail closed on anything missing.
 """
 
 from __future__ import annotations
@@ -14,4 +15,9 @@ from samsulek.types import Quote
 
 
 def collect_quotes(quote: Callable[[str], Quote | None], symbols: Iterable[str]) -> dict[str, Quote]:
-    raise NotImplementedError("WP1")
+    quotes: dict[str, Quote] = {}
+    for s in sorted(symbols):
+        q = quote(s)
+        if q is not None:
+            quotes[s] = q
+    return quotes

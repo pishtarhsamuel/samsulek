@@ -13,6 +13,7 @@ from samsulek.execution.router import OrderRouter
 from samsulek.execution.sim_broker import SimBroker
 from samsulek.logging_setup import DecisionLog
 from samsulek.portfolio.ledger import Ledger
+from samsulek.quotes import collect_quotes
 from samsulek.risk.engine import RiskEngine
 from samsulek.risk.state import RiskStateStore
 from samsulek.strategies.demo import EqualWeightAboveAverageDemo
@@ -43,12 +44,7 @@ class App:
     strategy: EqualWeightAboveAverageDemo
 
     def quotes_for(self, symbols: set[str]) -> dict[str, Quote]:
-        quotes: dict[str, Quote] = {}
-        for s in sorted(symbols):
-            q = self.feed.quote(s)
-            if q is not None:
-                quotes[s] = q
-        return quotes
+        return collect_quotes(self.feed.quote, symbols)
 
 
 def load_configs(root: Path, config_path: Path) -> tuple[AppConfig, RiskConfig]:

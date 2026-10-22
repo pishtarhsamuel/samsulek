@@ -36,6 +36,7 @@ from samsulek.kill import execute_kill
 from samsulek.live_gate import LiveGateError, authorize_live
 from samsulek.logging_setup import RedactingFilter, setup_logging
 from samsulek.net.http import HttpClient, HttpError
+from samsulek.risk.reset import ResetStep, apply_owner_reset
 from samsulek.risk.state import RiskStateStore, StateCorruptError
 from samsulek.runlock import AlreadyRunningError, RunLock
 from samsulek.terminal import TerminalUnavailableError, confirm_phrase, new_code, require_interactive
@@ -266,16 +267,19 @@ def cmd_reset_halt(args: argparse.Namespace) -> int:
         return EXIT_REFUSED
     now = SystemClock().now()
     who = os.environ.get("USERNAME") or os.environ.get("USER") or "owner"
-    store.clear_halt(now, by=who)
-    _out("Halt cleared.")
-    if args.clear_kill:
-        store.clear_kill(now, by=who)
-        _out("KILL switch cleared.")
-    if args.rebase_peak:
-        day = store.read_day()
-        if day and day.last_equity > 0:
-            store.write_peak(day.last_equity)
-            _out(f"Peak equity reset to the last seen equity {_eur(day.last_equity)}.")
+
+    def report(step: ResetStep, value: Decimal | None) -> None:
+        # Printed right after each step, so what was done is shown even if a later step fails.
+        if step == "halt_cleared":
+            _out("Halt cleared.")
+        elif step == "kill_cleared":
+            _out("KILL switch cleared.")
+        elif step == "peak_rebased" and value is not None:
+            _out(f"Peak equity reset to the last seen equity {_eur(value)}.")
+
+    apply_owner_reset(
+        store, now, by=who, clear_kill=args.clear_kill, rebase_peak=args.rebase_peak, on_step=report
+    )
     return EXIT_OK
 
 

@@ -2,6 +2,13 @@
 
 A deterministic random walk per symbol (seeded), one bar per calendar day closing
 at 15:30 UTC, plus a "current" quote stamped at the time it is requested.
+
+The feed declares the calendar its bars follow (``SyntheticFeed.calendar``): an
+``EveryDayCalendar``, because these bars exist for every day, weekends and holidays
+included. The bot's freshness rule reads the calendar from the feed, so synthetic bars are
+never judged by Xetra's calendar (which refuses years it was not checked for), and a real
+stock feed declares ``XetraCalendar``. A feed that declared this calendar on Xetra data
+would fail closed: every Monday the Sunday bar would be due and missing.
 """
 
 from __future__ import annotations
@@ -9,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import random
 from collections.abc import Sequence
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 
 from samsulek.clock import Clock
@@ -19,12 +26,35 @@ CLOSE_TIME_UTC = time(15, 30, tzinfo=UTC)
 EPOCH = datetime(2020, 1, 1, 15, 30, tzinfo=UTC)
 
 
+class EveryDayCalendar:
+    """The synthetic feed's calendar: every day is a session closing at 15:30 UTC. Never raises."""
+
+    name = "SYNTHETIC-DAILY"
+    tz = "UTC"
+
+    def is_session(self, day: date) -> bool:
+        return True
+
+    def sessions(self, start: date, end: date) -> list[date]:
+        return [start + timedelta(days=i) for i in range((end - start).days + 1)]
+
+    def close_utc(self, day: date) -> datetime:
+        return datetime.combine(day, CLOSE_TIME_UTC)
+
+
+_CALENDAR = EveryDayCalendar()
+
+
 class SyntheticFeed:
     def __init__(self, symbols: Sequence[str], market: Market, clock: Clock, seed: int = 7) -> None:
         self._symbols = list(symbols)
         self._market = market
         self._clock = clock
         self._seed = seed
+
+    @property
+    def calendar(self) -> EveryDayCalendar:
+        return _CALENDAR
 
     def _rng(self, symbol: str) -> random.Random:
         digest = hashlib.sha256(f"{self._seed}:{symbol}".encode()).digest()

@@ -15,9 +15,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Literal, TypeGuard
-from zoneinfo import ZoneInfo
 
 from samsulek.data.bars import DailyBar, TradingCalendar
+from samsulek.data.freshness import expected_session
 from samsulek.types import require_aware
 
 Severity = Literal["error", "warning"]
@@ -181,7 +181,7 @@ def check_fresh(
     """Is the newest bar the newest one that should exist by ``now``? Also rejects bars from the future.
 
     A session's bar is due once its close plus ``publish_delay`` (how long the source
-    takes to publish) has passed.
+    takes to publish) has passed: the bot's own rule, ``freshness.expected_session``.
     """
     require_aware(now, "now")
     issues = [
@@ -189,13 +189,10 @@ def check_fresh(
         for b in bars
         if b.close_ts > now
     ]
-    today = now.astimezone(ZoneInfo(calendar.tz)).date()
-    recent = calendar.sessions(today - timedelta(days=14), today)
-    due = [d for d in recent if calendar.close_utc(d) + publish_delay <= now]
-    if not due:
+    expected = expected_session(calendar, now, publish_delay)
+    if expected is None:
         issues.append(Issue("error", "calendar_gap", symbol, None, "no trading day in the last 14 days?"))
         return issues
-    expected = due[-1]
     latest = max((b.session for b in bars if b.close_ts <= now), default=None)
     if latest is None:
         issues.append(Issue("error", "no_data", symbol, None, "no bars at all"))

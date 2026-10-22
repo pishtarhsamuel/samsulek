@@ -1,0 +1,61 @@
+# RESEARCH RISK LIMITS (backtest mode R). NEVER READ BY THE BOT.
+#
+# Only the backtester (src/samsulek/backtest/limits.py) loads this file. The bot, the
+# CLI's run/kill/reconcile commands and every paper or live path read config/risk.yaml
+# and nothing else.
+#
+# How it was derived: derive_research_config(config/risk.yaml), i.e. config/risk.yaml with
+# exactly these leaves replaced, every other value copied unchanged:
+#   account.max_daily_loss_pct         0.5          (schema maximum; in R a halt is never reset)
+#   account.max_drawdown_pct           0.9          (schema maximum; in R a halt is never reset)
+#   account.equity_sanity_max_eur      1000000000   (far above any EUR 50 run)
+#   markets.*.max_position_eur         1000000      (far above any EUR 50 run)
+#   markets.*.max_gross_exposure_eur   1000000      (far above any EUR 50 run)
+# Why: mode R shows a strategy's shape without the EUR 50 account's EUR caps and halts
+# binding (owner decision Q1). The edge verdict uses mode R; the realism block replays
+# config/risk.yaml verbatim (mode L). Percentage caps, collars, quote age, order sizes
+# (the EUR 20 maximum order stays), trade counts and everything else are equal in both.
+#
+# Every backtest refuses to start unless this file equals
+# derive_research_config(config/risk.yaml) leaf by leaf. If config/risk.yaml changes,
+# regenerate this file in the same reviewed change. Do not edit values by hand.
+
+version: 1
+base_currency: EUR
+
+account:
+  max_daily_loss_pct: 0.5
+  max_drawdown_pct: 0.9
+  max_trades_per_day: 8
+  equity_sanity_max_eur: 1000000000
+  risk_day_timezone: Europe/Athens
+
+markets:
+  stocks:
+    max_position_pct: 0.3
+    max_gross_exposure_pct: 1
+    max_position_eur: 1000000
+    max_order_eur: 20
+    max_gross_exposure_eur: 1000000
+    min_order_eur: 1
+    max_trades_per_day: 6
+    max_slippage_bps: 50
+    flatten_max_slippage_bps: 200
+    max_quote_age_seconds: 900
+    allow_market_orders: false
+    max_pool_liquidity_pct: null
+    require_safety_pass: false
+  memecoin:
+    max_position_pct: 0.05
+    max_gross_exposure_pct: 0.2
+    max_position_eur: 1000000
+    max_order_eur: 5
+    max_gross_exposure_eur: 1000000
+    min_order_eur: 1
+    max_trades_per_day: 5
+    max_slippage_bps: 300
+    flatten_max_slippage_bps: 1000
+    max_quote_age_seconds: 30
+    allow_market_orders: false
+    max_pool_liquidity_pct: 0.005
+    require_safety_pass: true

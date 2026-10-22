@@ -109,7 +109,7 @@ Stocks/ETFs (`config/risk.yaml`):
 | Max trades per day | 6 stocks, 8 total | |
 | Max slippage per order | 0.5% from the reference price (limit-price collar); emergency exits 2% | |
 | Price staleness | reference price older than 15 minutes → refuse | |
-| Data staleness | latest daily bar older than 4 days → halt | |
+| Data staleness | the latest daily bar must be the previous Xetra session's (calendar-aware; Q11) → halt | |
 | Market orders | not allowed (limit orders only) | |
 
 Memecoins (simulation): max position 5% of equity (€2.50, cap €5) and 0.5% of
