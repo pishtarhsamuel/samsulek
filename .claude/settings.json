@@ -1,6 +1,15 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
     "deny": [
+      "Read(./secrets/**)",
+      "Read(**/secrets/**)",
+      "Edit(./secrets/**)",
+      "Edit(**/secrets/**)",
+      "Read(./**/*.key)",
+      "Read(**/*.key)",
+      "Edit(**/*.key)",
+      "Read(./**/*keypair*.json)",
       "Read(./.env)",
       "Read(./.env.*)",
       "Read(**/.env)",

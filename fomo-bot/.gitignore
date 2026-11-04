@@ -1,0 +1,21 @@
+# fomo-bot: the owner's list from BUILD_PROMPT.md section 4.1.
+# data/ is anchored to this folder so a future src/**/data module is not ignored by accident.
+.env
+.env.*
+secrets/
+/data/
+*.sqlite*
+backups/
+node_modules/
+*.key
+
+# Also never commit: wallet keypair files, databases, logs, build output, coverage.
+*keypair*.json
+id.json
+*.db
+*.db-*
+*.log
+npm-debug.log*
+/logs/
+/dist/
+/coverage/

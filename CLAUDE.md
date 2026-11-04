@@ -26,6 +26,15 @@ Owner context (drives every design decision):
 - Cloud Claude sessions are for development only and must never hold live
   credentials.
 
+## Second project in this repo: `fomo-bot/`
+
+`fomo-bot/` is a separate TypeScript/Node.js project: a Solana memecoin bot that uses
+public on-chain FOMO activity as its signal (owner's brief: `fomo-bot/BUILD_PROMPT.md`).
+Read `fomo-bot/CLAUDE.md` before touching anything there. Every rule in this file still
+applies to it. Where the two briefs conflict (live memecoin trading, VPS hosting, limits,
+capital), the stricter rule applies until the owner decides; the open conflicts are
+listed in `fomo-bot/docs/FEASIBILITY.md`.
+
 ## Non-negotiable rules
 
 1. **Paper/simulation is the default.** Live requires ALL of: env `LIVE=true`,
