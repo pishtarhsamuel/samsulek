@@ -1,17 +1,19 @@
 # Status
 
-Updated: 2026-11-04
+Updated: 2026-11-06
 
-**Phase 0 (reality check): in progress.** There is no trading code, and there will be
-none until you approve the Phase 1 design.
+**Phase 0 (reality check): done, waiting for your answers.** There is no trading code,
+and there will be none until you approve the Phase 1 design.
 
-- Done: the team (8 specialist agents and 3 skills) is set up as your brief asks. Your
-  brief is saved as `fomo-bot/BUILD_PROMPT.md`, and the rules are in `fomo-bot/CLAUDE.md`.
-- Done: the security reviewer approved the setup (see `docs/REVIEWS.md`).
-- Done: the daily AI review on Claude Haiku 5.5 costs about $0.04-0.09 a month, well
-  under your $1 cap (`docs/research/phase0-anthropic.md`).
-- Running: research on the FOMO signal, data providers, launchpads, trading costs,
-  token safety, hosting and tools.
-- Next: `docs/VERIFIED_FACTS.md` and `docs/FEASIBILITY.md`, then a short summary and up
-  to 3 questions for you.
-- Unproven: whether any strategy can make money. Nothing has run on paper yet.
+- Done: the team (8 agents, 3 skills), 8 research reports, `docs/VERIFIED_FACTS.md` and
+  `docs/FEASIBILITY.md`. The security reviewer approved the setup.
+- Found: the FOMO signal is real and free to watch: every FOMO trade carries one
+  on-chain marker, about 650,000 trades a day.
+- Found: a $3-5 trade on pump.fun costs about 4.6% per round trip, so each trade must
+  gain about 5% just to break even. Mature tokens cost about 2.6%.
+- Running cost: about $4.40-8.40 a month (server, with Greek VAT; data free; AI review
+  about $0.05).
+- You decide (3 questions at the end of `docs/FEASIBILITY.md`): copy-trading and FOMO's
+  terms, making this repository private, and Helius's terms.
+- Next: Phase 1 design (no code), once you answer.
+- Unproven: whether any strategy makes money. Nothing has run on paper yet.
