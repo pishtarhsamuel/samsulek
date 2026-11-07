@@ -200,3 +200,8 @@ venue; everything listed under UNVERIFIED in `docs/VERIFIED_FACTS.md`.
    visibility, Private.
 3. **Helius's terms forbid personal use.** Start on free public endpoints (no sign-ups),
    and ask Helius by email before relying on it? Recommended: yes; I can draft the email.
+
+**Owner's answers (2026-11-07), recorded in `docs/DECISIONS.md`:** (1) test crowd flow
+and momentum first and skip copy-trading; (2) the owner will make the repository
+private; (3) paper trading on free public Solana endpoints with no sign-ups, and email
+Helius before relying on it (draft: `docs/drafts/helius-terms-question.md`).

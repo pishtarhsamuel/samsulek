@@ -1,6 +1,7 @@
 # CLAUDE.md - fomo-bot (FOMO-edge Solana memecoin bot)
 
-Start every session by reading this file and `fomo-bot/docs/STATUS.md`; read
+Start every session by reading this file, `fomo-bot/docs/STATUS.md` and
+`fomo-bot/docs/DECISIONS.md` (owner decisions; they override the brief); read
 `fomo-bot/BUILD_PROMPT.md` (the owner's full brief) before any design or build work.
 The root `CLAUDE.md` applies too: see "Relationship to the root project" below.
 All paths here are relative to the repository root.
@@ -10,8 +11,8 @@ All paths here are relative to the repository root.
 A safety-first, fully automated Solana memecoin bot, controlled by the owner from
 Telegram and meant to run 24/7 on a ~$5/month VPS near Frankfurt. Its hoped-for edge
 is the activity of FOMO (fomo.family) users, observed only through public on-chain
-data. Four switchable strategies: copy top FOMO traders, FOMO crowd flow, smart launch
-sniping (second wave, never block zero), momentum. Paper first; each strategy goes
+data. Switchable strategies: FOMO crowd flow, momentum, smart launch sniping (second
+wave, never block zero); copy-trading is skipped (decision D1). Paper first; each goes
 live only through its gate and the owner's tap. Bankroll under $50; running cost
 $5-10/month. Not affiliated with FOMO. Most memecoin trading loses money: the bot must
 prove an edge on paper, after every cost, before it touches real money.

@@ -1,19 +1,17 @@
 # Status
 
-Updated: 2026-11-06
+Updated: 2026-11-07
 
-**Phase 0 (reality check): done, waiting for your answers.** There is no trading code,
-and there will be none until you approve the Phase 1 design.
+**Phase 1 (design): in progress.** Design documents only. No code until you approve
+the design summary.
 
-- Done: the team (8 agents, 3 skills), 8 research reports, `docs/VERIFIED_FACTS.md` and
-  `docs/FEASIBILITY.md`. The security reviewer approved the setup.
-- Found: the FOMO signal is real and free to watch: every FOMO trade carries one
-  on-chain marker, about 650,000 trades a day.
-- Found: a $3-5 trade on pump.fun costs about 4.6% per round trip, so each trade must
-  gain about 5% just to break even. Mature tokens cost about 2.6%.
-- Running cost: about $4.40-8.40 a month (server, with Greek VAT; data free; AI review
-  about $0.05).
-- You decide (3 questions at the end of `docs/FEASIBILITY.md`): copy-trading and FOMO's
-  terms, making this repository private, and Helius's terms.
-- Next: Phase 1 design (no code), once you answer.
+- Phase 0 is done: `docs/VERIFIED_FACTS.md` and `docs/FEASIBILITY.md`.
+- Your decisions (`docs/DECISIONS.md`): crowd flow and momentum first, no
+  copy-trading; you make the repository private; paper trading on free public Solana
+  endpoints, no sign-ups.
+- For you to do: (1) make the GitHub repository private (Settings, General, Danger
+  Zone, Change visibility); (2) send the email in `docs/drafts/helius-terms-question.md`
+  when you like. Neither blocks Phase 1.
+- Next: the architecture, risk policy, threat model and test plan, reviewed by the
+  risk and security reviewers, then a 10-line summary for your OK.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.
