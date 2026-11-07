@@ -1,19 +1,21 @@
 # Architecture (Phase 1 design)
 
-Design for the owner's approval, 2026-11-07; no code exists. Facts only from
-`VERIFIED_FACTS.md`; UNVERIFIED items are designed around (section 13). Numbers:
-`RISK_POLICY.md`; attacks: `THREAT_MODEL.md`; tests: `TEST_PLAN.md`. D1-D3 apply: no
-copy-trading or per-user FOMO tracking, repository possibly public, free endpoints only.
+Design for the owner's approval, 2026-11-07, revised the same day after the risk-guardian
+and security-auditor reviews; no code exists. Facts only from `VERIFIED_FACTS.md`; UNVERIFIED
+items are designed around (section 13). Numbers: `RISK_POLICY.md`; attacks: `THREAT_MODEL.md`;
+tests: `TEST_PLAN.md`. D1-D3 apply: no copy-trading or per-user FOMO tracking, repository
+possibly public, free endpoints only.
 
 ## 1. In plain English
 
-- One program in one Docker container (VPS, or PowerShell on your PC) listens to the free
-  public Solana stream that carries every FOMO trade. Strategies only *suggest* trades.
+- One program in one Docker container (VPS, or your PC) listens to the free public Solana
+  stream that carries every FOMO trade. Strategies only *suggest* trades.
 - Every suggestion passes the safety filter, then the risk engine, which picks the size and
   issues a one-time permission slip. No slip, no trade. Exits are always allowed.
 - Until Phase 8 trades are a pessimistic paper simulation on real prices and fees; no key
   exists. Bad or silent data stops new trades and alerts you; exits keep running. In Phase 8
-  the key lives in a tiny offline container; arming live needs you at the server.
+  the key lives in a tiny offline container with its own rules; arming live needs you at the
+  server. No settings change can switch a strategy to live: only your Go live tap can.
 
 ## 2. Module map (`fomo-bot/src/`) and loops
 
@@ -23,8 +25,8 @@ enums, namespaces or parameter properties); `tsc --noEmit` type-checks; no build
 
 | Folder | Responsibility | May import |
 |---|---|---|
-| core/ | branded bigint units, checked integer math, ids, clock (UTC + Athens day), Result | nothing |
-| config/ | zod schemas, `HARD_CAPS`, layered loading, versioned tunables, /set and AI bounds | core, storage |
+| core/ | branded bigint units, checked integer math (caps round down, costs round up), ids, clock (UTC + Athens day), Result, redactor | nothing |
+| config/ | zod schemas, `HARD_CAPS`, `TUNABLE_BOUNDS`, `LIVE_CAPS`, layered loading, versioned tunables (no modes), /set and AI bounds | core, storage |
 | storage/ | `sqlite.ts` (only importer of `node:sqlite`), migrations, repositories, backup | core |
 | chain/ | ProviderClient (JSON-RPC over fetch, WebSocket), BudgetGovernor, v1-only reads, block height, clock drift | core, config |
 | venues/ | pump curve, PumpSwap, Raydium CPMM: decoders hand-written from the official IDLs, fee-config readers, exact quote math rounded in the venue's favour, PDAs; Phase 8 instruction builders | core |
@@ -32,14 +34,14 @@ enums, namespaces or parameter properties); `tsc --noEmit` type-checks; no build
 | fomo/ | invoke-stack log parser, trade decoder with completeness flags, aggregate crowd flow, health anchors, stream audit | core, venues |
 | safety/ | raw mint/TLV parser, extension policy, authorities, holders, sell probe, liquidity and cost estimate, verdict cache | core, chain, venues |
 | strategies/, exits/ | crowdflow, momentum, launch / universal exits, exit policies, tournament scoring: all pure and synchronous, data in, intents out | core, type-only imports |
-| risk/ | the only gate: sizing, caps, flags (kill, halt, pause, daily stop), breakers, approval tokens | core, config, storage, portfolio (read) |
+| risk/ | the only gate: sizing, caps, flags (kill, halt, pause, daily stop, strategy modes), breakers, approval transaction and tokens | core, config, storage, portfolio (read) |
 | execution/ | planner (`OrderPlan`), paper executor, reconciler; Phase 8 live executor and signer client | core, venues, chain, storage, risk (verify only) |
-| signer/ | Phase 8: own entry point, zero npm dependencies, no network, own policy | Node built-ins |
+| signer/ | Phase 8: separate image, own entry point, zero npm dependencies, no network, own policy, caps, counters and TTY arming | Node built-ins |
 | portfolio/, research/ | cost-line ledger, positions, marks, equity, PnL in SOL/USD/EUR / 2x-cost shadow ledger, random-entry twins, gate evaluator, `stats:export` | core, storage / portfolio, exits |
-| telegram/ | grammy long polling, pairing, owner auth, commands, confirmations, outbox | core, app services |
+| telegram/ | small Bot API client over fetch (getUpdates long polling, sendMessage, answerCallbackQuery; replaces grammy, THREAT_MODEL 6), pairing, owner auth, commands, confirmations, outbox | core, app services |
 | ai-review/ | stats builder, sanitiser, Anthropic call via fetch, cost guard, proposal validator | core, research, config (read) |
 | reports/, ops/ | alert texts, reports, CSV export / health, heartbeat, disk, memory, loop lag, run lock, backups | core, portfolio / storage |
-| app/, cli/ | composition root (the only place that constructs executors), scheduler / `kill`, `reset-halt`, `arm-live`, `pair`, `stats:export`, `backup` | all |
+| app/, cli/ | composition root (the only place that constructs executors), scheduler / `kill`, `reset-halt`, `arm-live`, `pair`, `apply-pending`, `stats:export`, `backup` | all |
 
 Import rules are enforced twice: eslint `no-restricted-imports` per folder and a vitest
 test that parses every import. Loops: exit marks 5 s (mint re-read 60 s, P0); strategy
@@ -50,10 +52,11 @@ review 08:30, daily summary 09:00 Athens.
 ## 3. Core types (design, not code to compile)
 
 ```ts
-type Lamports = bigint & { readonly u: 'lamports' };   type TokenUnits = bigint & { readonly u: 'token' }; // TEXT in SQLite
+type Lamports = bigint & { readonly u: 'lamports' };   type TokenUnits = bigint & { readonly u: 'token' }; // TEXT [0-9]+
+type SignedLamports = bigint & { readonly u: 'lamports-signed' };                  // PnL only; TEXT -?[0-9]+
 type MicroLamportsPerCu = bigint & { readonly u: 'uL/CU' }; type Bps = number & { readonly u: 'bps' };  // int 0..10_000
 type Address = string & { readonly u: 'b58-32' };       type UtcMs = number & { readonly u: 'utc-ms' };
-type StrategyId = 'crowdflow' | 'momentum' | 'launch';  type Mode = 'off' | 'paper' | 'live';
+type StrategyId = 'crowdflow' | 'momentum' | 'launch';  type Mode = 'off' | 'paper' | 'live'; // flags table only
 type Venue = 'pump-curve' | 'pumpswap' | 'raydium-cpmm'; /* else reject */ type Priority = 'P0-critical' | 'P1-safety' | 'P2-launch' | 'P3-crowdflow' | 'P4-momentum';
 interface Provenance { provider: string; method: string; contextSlot?: bigint; receivedAt: UtcMs }
 interface PoolState { venue: Venue; pool: Address; mint: Address; quoteMint: Address; // only wSOL-quoted pools tradable
@@ -61,7 +64,7 @@ interface PoolState { venue: Venue; pool: Address; mint: Address; quoteMint: Add
   feeBps: { buy: Bps; sell: Bps }; feeConfig: { account: Address; slot: bigint }; // re-read from chain for every plan
   layoutHash: string; slot: bigint; prov: Provenance }                              // unknown layout: never built
 type MarketEvent =
-  | { kind: 'fomo-trade'; id: string; ev: FomoTradeEvent }                          // id = signature:legIndex
+  | { kind: 'fomo-trade'; id: string; ev: FomoTradeEvent }                          // id = signature:legIndex, memory only
   | { kind: 'launch'; id: string; mint: Address; creator: Address; slot: bigint; prov: Provenance }
   | { kind: 'pool-state'; id: string; pool: PoolState } | { kind: 'slot'; id: string; slot: bigint; prov: Provenance }
   | { kind: 'trending'; id: string; source: 'jupiter' | 'geckoterminal' | 'dexscreener'; mints: Address[]; prov: Provenance }
@@ -80,9 +83,11 @@ interface CrowdFlowSnapshot { mint: Address; at: UtcMs; watermarkSlot: bigint; w
   firstFomoBuyAt: UtcMs; fomoShareOfVolumeBps?: Bps; priceChangeBps: { m5?: number; m15?: number };
   completeness: { streamHealthy: boolean; globalDecodeRateBps: Bps; familyCoverageBps: Bps; scoreBps: Bps } }
 interface TradeIntent { id: string;  // hash(strategy, mint, side, decision window): replays dedupe
-  strategy: StrategyId; mint: Address; side: 'buy' | 'sell'; createdAt: UtcMs; inputsAsOf: UtcMs;
+  strategy: StrategyId; mint: Address; side: 'buy'; createdAt: UtcMs; inputsAsOf: UtcMs;
   sizeHint: 'min' | 'normal'; confidenceBps: Bps; exitPolicy: ExitPolicyId;     // no amounts, no routes
   reasons: string[]; inputs: Readonly<Record<string, string | number | boolean>> }
+interface ExitIntent { id: string;   // hash(positionId, exitSeq); exitSeq + 1 after a failed or expired exit order
+  positionId: string; exitSeq: number; fractionBps: Bps; reason: string; urgency: 'normal' | 'protective' | 'emergency' }
 interface StrategyContext { now: UtcMs; flows: ReadonlyMap<Address, CrowdFlowSnapshot>; pools: ReadonlyMap<Address, PoolState>;
   trending: readonly TrendingEntry[]; positions: readonly PositionView[]; params: StrategyParams; health: HealthStatus }
 interface Strategy { readonly id: StrategyId; evaluate(ctx: DeepReadonly<StrategyContext>): TradeIntent[] } // pure, no I/O
@@ -91,12 +96,15 @@ type SafetyCheck = 'token-program' | 'extensions' | 'authorities' | 'metadata' |
 interface SafetyVerdict { mint: Address; verdict: 'pass' | 'reject'; checkedAt: UtcMs; expiresAt: UtcMs; ruleVersion: string;
   checks: { name: SafetyCheck; result: 'pass' | 'reject' | 'error'; detail: string }[];  // any error = reject
   tokenProgram: 'spl' | 'token-2022'; extensionTypes: number[]; estRoundTripCostBps: number; liquidityLamports: Lamports;
-  sellProbe: { method: 'holder-sim' | 'probe-payer-sim' | 'own-wallet-sim' | 'none'; lossBps?: number } }
+  sellProbe: { method: 'holder-sim' | 'probe-payer-sim' | 'own-wallet-sim' | 'none'; lossBps?: number } } // never the holder
 declare const approved: unique symbol;   // the constructor is not exported from risk/
-type ApprovalToken = { readonly [approved]: true; id: string; intentId: string; planHash: string;
-  maxSpendLamports: Lamports; minOut: bigint; expiresAt: UtcMs; mac: string };  // HMAC, per-boot key, single use in DB
+type ApprovalToken = { readonly [approved]: true; id: string; intentId: string; mode: 'paper' | 'live';
+  kind: OrderPlan['kind']; reduceOnly: boolean; positionId: string; planHash: string; maxSpendLamports: Lamports;
+  minOut: bigint; expiresAtSlot: bigint; mac: string };  // expiresAtSlot <= plan.quoteSlot + 25; HMAC, per-boot key; single use
+// planHash = sha256(canonical JSON of EVERY OrderPlan field, mode and kind included; keys sorted; bigints as decimal strings)
+// maxSpendLamports = inAmount + rentLamports + allowed attempts x (5,000 x signatures + ceil(cuPrice x cuLimit / 10^6) + tip)
 type RiskDecision = { approved: false; intentId: string; reasons: string[]; checks: string[] }
-  | { approved: true; intentId: string; checks: string[]; token: ApprovalToken; reduceOnly: boolean };
+  | { approved: true; intentId: string; checks: string[]; token: ApprovalToken };
 interface OrderPlan { orderId: string; intentId: string; mode: 'paper' | 'live';
   kind: 'buy' | 'sell' | 'close-account' | 'withdraw'; venue: Venue; route: 'direct' | 'jupiter-build' | 'jupiter-order';
   mint: Address; pool: Address; inAmount: bigint; expectedOut: bigint; minOut: bigint; slippageBps: Bps;
@@ -109,51 +117,73 @@ interface FillBase { orderId: string; mint: Address; side: 'buy' | 'sell'; lande
 interface PaperFill extends FillBase { mode: 'paper'; costMultiplier: 1 | 2; latencyMs: number; reservesSlot: bigint; seed: string }
 interface LiveFill extends FillBase { mode: 'live'; signature: string; confirmedSlot: bigint; reconciled: boolean }
 interface Position { id: string; mint: Address; strategy: StrategyId; mode: 'paper' | 'live'; openedAt: UtcMs;
-  tokenUnits: TokenUnits; costBasis: Lamports /* every fee and rent */; rentLocked: Lamports; realized: Lamports;
+  tokenUnits: TokenUnits; costBasis: Lamports /* every fee and rent */; rentLocked: Lamports; realized: SignedLamports;
   exitPolicy: ExitPolicyId; peakMark: Lamports; status: 'opening' | 'open' | 'exiting' | 'stuck' | 'closed';
+  exitSeq: number; failedExitFeesToday: Lamports;  // sellable = min(ledger, chain) tokenUnits - in-flight sells
   lastMark: { value: Lamports; slot: bigint; at: UtcMs; stale: boolean } } // exact sell quote, full size, after fees
-interface EquitySnapshot { at: UtcMs; mode: 'paper' | 'live'; sol: Lamports; positionsMark: Lamports;
-  equity: Lamports | null;  // null if any position cannot be valued: entries blocked
+interface EquitySnapshot { at: UtcMs; mode: 'paper' | 'live'; sol: Lamports /* min(ledger, chain) */; positionsMark: Lamports;
+  equity: Lamports | null;  // null if any position cannot be valued: entries blocked; unknown mints never counted
   staleMints: Address[]; dayStart: Lamports; peak: Lamports; dailyPnlBps: number; drawdownBps: number;
   solUsd?: string; eurUsd?: string }  // display only
 interface RpcOptions { feature: string; priority: Priority; timeoutMs: number; commitment?: 'confirmed' | 'finalized' }
 type RpcResult<T> = { ok: true; value: T; contextSlot?: bigint; latencyMs: number } | { ok: false;
   error: 'budget-denied' | 'rate-limited' | 'blocked' | 'timeout' | 'http' | 'rpc' | 'schema'; retryAfterMs?: number; detail: string };
-interface ProviderClient { readonly id: string; readonly capabilities: ReadonlySet<'http' | 'ws' | 'send'>;
-  rpc<M extends RpcMethod>(method: M, params: RpcParams[M], opt: RpcOptions): Promise<RpcResult<RpcReturn[M]>>;
+interface ProviderClient { readonly id: string; readonly capabilities: ReadonlySet<'http' | 'ws'>; // paper type: no 'send'
+  rpc<M extends ReadRpcMethod>(method: M, params: RpcParams[M], opt: RpcOptions): Promise<RpcResult<RpcReturn[M]>>;
   // getTransaction/getBlock always send maxSupportedTransactionVersion: 1; getTokenLargestAccounts refused locally
   subscribe(spec: SubscriptionSpec, onMessage: (m: unknown) => void, onState: (s: WsState) => void): Subscription;
-  health(): ProviderHealth }
+  health(): ProviderHealth }   // Phase 8: SendingProviderClient extends it with sendTransaction, built only in app/ live
 interface BudgetGovernor {
   acquire(provider: string, method: string, p: Priority, cost?: number): { granted: true } | { granted: false; reason: string; retryAt: UtcMs };
   observe(provider: string, method: string, status: number, headers: Headers): void; // learns x-ratelimit-*, Retry-After
   shedLevel(): 0 | 1 | 2 | 3; usage(): BudgetUsage[] }   // 1: P4 off, 2: +P3 off, 3: +P2 off; P0 never shed
-type HealthLevel = 'ok' | 'degraded' | 'down';
-interface HealthStatus { at: UtcMs; entriesAllowed: boolean; strategyEntries: Record<StrategyId, boolean>;
+type HealthLevel = 'ok' | 'degraded' | 'down'; interface HealthStatus { at: UtcMs; entriesAllowed: boolean; strategyEntries: Record<StrategyId, boolean>;
   exitsAllowed: true; components: { name: string; level: HealthLevel; since: UtcMs; detail: string }[];
   breakers: { id: BreakerId; open: boolean; openedAt?: UtcMs; reason?: string }[] }
 type ExitDecision = { action: 'hold' } | { action: 'sell'; fractionBps: Bps; reason: string; urgency: 'normal' | 'protective' | 'emergency' };
 interface ExitPolicy { readonly id: ExitPolicyId; params: Readonly<Record<string, number>>;
   decide(p: PositionView, mark: MarkSample, history: readonly MarkSample[], signals: ExitSignals): ExitDecision } // pure
-// config/caps.ts: ceilings in code; files, /set and the AI can only stay at or below them.
+// config/caps.ts: ceilings in code; files, /set and the AI can only stay at or below them (floors: at or above).
 export const HARD_CAPS = { tradePctBps: 1_000, openPositions: 4, exposurePctBps: 5_000, poolShareBps: 50,
   dailyStopBps: 3_000, peakHaltBps: 5_000, launchShareOfExposureCapBps: 2_500, entriesPerDay: 12, costRuleBps: 500,
   positionLamports: 60_000_000n, exposureLamports: 300_000_000n, equitySanityLamports: 2_000_000_000n,
-  feeReserveFloorLamports: 10_000_000n, buySlippageBps: 300, sellSlippageBps: 500, emergencySellSlippageBps: 1_000,
-  cuPriceMicroLamports: 200_000n, cuLimit: 300_000, tipLamports: [0n, 1_000n, 5_000n], aiMonthlyUsdMicros: 1_000_000n,
-  landingSpendBps: 30, exitLandingSpendBps: 60, curveProgressMaxBps: 9_500, minTradeFloorLamports: 10_000_000n } as const;
-const ServerFile = z.object({   // /config/fomo-bot.json: read-only mount, never in git, not editable from Telegram
+  equitySanityBankrollMultiple: 3, equityJumpBps: 5_000, planFreshSlots: 25, markStaleMs: 30_000, markProtectiveMs: 60_000,
+  priceCrossCheckMaxBps: 500, tokenAgeMinMs: 180_000, curveProgressMaxBps: 9_500, hardStopMaxBps: 4_000, timeStopMaxMin: 240,
+  feeReserveFloorLamports: 10_000_000n, feeReserveP95Multiple: 2, exitBudgetWindows: 9, exitAttemptsPerWindow: 3,
+  buySlippageBps: 300, sellSlippageBps: 500, emergencySellSlippageBps: 1_000, cuLimit: 300_000,
+  cuPriceMicroLamports: 200_000n, exitCuPriceMicroLamports: 400_000n, tipLamports: [0n, 1_000n, 5_000n],
+  landingSpendBps: 30, exitLandingSpendBps: 60, minTradeFloorLamports: 10_000_000n, aiMonthlyUsdMicros: 1_000_000n,
+  paperPFailMinBps: 2_000, paperExtraLatencyMinMs: 2_000, paperCompetitionMinBpsPerLeg: 50,
+  strategyLiveLossLamports: 50_000_000n, liveReconcileToleranceLamports: 500_000n,
+  signerDailyBuyLamports: 350_000_000n, signerDailyOtherFeeLamports: 20_000_000n, signerSignaturesPerHour: 150 } as const;
+// TUNABLE_BOUNDS: every /set bound of RISK_POLICY s.12; a test asserts each max <= its HARD_CAPS entry (floors: min >=).
+// LIVE_CAPS: the root's stricter values, used in live until owner decision 9 (RISK_POLICY s.2).
+const ServerFile = z.object({   // /config/fomo-bot.json from /etc/fomo-bot (read-only mount), never in git or Telegram
   providers: z.array(ProviderSpec).min(1), paperStartingLamports: LamportsString,
   withdrawAddress: AddressStr.optional(), probePayer: AddressStr.optional(), // public keys only: rejects 64-byte keys, arrays
-}).strict();
-const Tunables = z.object({     // versioned DB rows; /set and approved AI proposals create new versions
-  risk: RiskParams, strategies: z.record(StrategyIdEnum, z.object({ mode: ModeEnum, params: StrategyParams })),
-  exits: ExitParams, paper: PaperModelParams, ai: z.object({ model: z.enum(['claude-haiku-5-5', 'claude-sonnet-5-5']) }),
-}).strict().superRefine(withinHardCapsAndBounds); // mode 'live' only via the /golive flow, never /set
-// D2: tuned thresholds and the wallet address live only in the server file and the DB; git has placeholders.
+  strategyParams: TunedParams.optional(), emergencyTriggers: EmergencyTriggers.optional() }).strict(); // D2: out of git
+const Tunables = z.object({     // versioned DB rows; /set and approved AI proposals create new versions; NO modes here
+  risk: RiskParams, strategies: z.record(StrategyIdEnum, StrategyParams), exits: ExitParams,
+  paper: PaperModelParams,      // floors in HARD_CAPS; may only become more pessimistic; never the AI
+  ai: z.object({ model: z.enum(['claude-haiku-5-5', 'claude-sonnet-5-5']) }) }).strict().superRefine(withinHardCapsAndBounds);
 ```
 
-## 4. Sequence diagrams
+## 4. Money path and sequence diagrams
+
+Money-path transactions: each is one synchronous SQLite transaction (no `await` between
+`BEGIN IMMEDIATE` and `COMMIT`), so two intents can never both take the last room.
+- **T1 approve** (`risk/approve.ts`): re-read flags, modes, counters and every position in
+  opening, open, exiting or stuck (open at their mark, opening at `maxSpendLamports`); re-run
+  every buy cap (limits 1-8, 11, 13-24) and the fee reserve *after* this buy; insert the
+  position (opening), the day's entry count and the token. Partial unique index
+  `positions(mint) WHERE status IN ('opening','open','exiting','stuck')`.
+- **T2 submit**: consume the token (fails if already consumed) and insert the order
+  (`UNIQUE(intent_id)`, `UNIQUE(token_id)`). **T3 settle**: fill, cost lines and position.
+  A buy that never lands closes its opening row with its failed fees; the entry still counts.
+- **Exits**: sellable = min(ledger, chain) holding minus in-flight sells; partial unique index
+  `orders(position_id) WHERE kind = 'sell' AND status IN ('approved','submitted')`. A failed
+  or expired exit raises `exitSeq`, so the next ExitIntent is never deduplicated away.
+  Transactions using the wSOL helper account (one derived address) run one at a time.
 
 (a) FOMO stream to paper fill
 ```mermaid
@@ -162,16 +192,20 @@ sequenceDiagram
   FomoDecoder->>FomoDecoder: dedupe, invoke-stack parse, decode pump and PumpSwap events, flags
   FomoDecoder->>Strategy: every 5 s crowd-flow snapshots up to the slot watermark
   Strategy->>Risk: TradeIntent (no size, no route)
-  Risk->>Risk: kill, halt, pause, breakers, mode, cooldown, one per token
+  Risk->>Risk: kill, halt, pause, breakers, mode flag, cooldown, one per token
   Risk->>Safety: vet mint (cache or fresh, P1 budget)
   Safety-->>Risk: SafetyVerdict and estimated round-trip cost
-  Risk->>Planner: size = lowest of caps, reserve, pool share and cost rule
+  Risk->>Planner: size = lowest of caps, reserve after the buy, pool share and cost rule
   Planner-->>Risk: OrderPlan from fresh reserves and on-chain fee config, with minOut
-  Risk->>SQLite: intent, decision with reasons, single-use approval token
+  Risk->>SQLite: T1 BEGIN IMMEDIATE: re-check every cap, opening row, entry count, token
   Risk-->>PaperExec: plan and token
-  PaperExec->>SQLite: consume token, order submitted
-  PaperExec->>PaperExec: wait latency L, re-read reserves, seeded landing roll
-  PaperExec->>SQLite: PaperFill, cost lines, position, 2x shadow, random twins
+  PaperExec->>SQLite: T2 consume token and insert order
+  loop at most 3 attempts in one blockhash window
+    PaperExec->>PaperExec: KILL, HALT, PAUSE or daily stop set? stop, order failed
+    PaperExec->>PaperExec: wait L, re-read reserves (failed read = failed attempt), seeded roll
+  end
+  PaperExec->>SQLite: T3 PaperFill, cost lines, position, conservation check
+  PaperExec->>SQLite: 2x shadow, random twins (never able to build a live plan)
 ```
 
 (b) Exit loop
@@ -183,9 +217,10 @@ sequenceDiagram
     ExitLoop->>Exits: mark = exact full-size sell quote after fees and own-trade overlay
     Exits->>Exits: universal exits first, then the position's policy
     alt sell decided, or mark stale over 60 s
-      Exits->>Risk: reduce-only exit intent (protective if stale)
-      Risk-->>Executor: approved even when halted, killed or paused
-      Executor->>Executor: sell 100 percent, close the token account
+      Exits->>Risk: ExitIntent (positionId, exitSeq; protective if stale)
+      Risk-->>Executor: reduce-only token, approved even when halted, killed or paused
+      Executor->>Executor: sell the sellable amount, close our empty token account
+      Executor->>SQLite: failed or expired: exitSeq + 1, re-issued next tick
     end
     ExitLoop->>ExitLoop: record the mark for every counterfactual policy, twin and shadow
   end
@@ -198,8 +233,7 @@ sequenceDiagram
     Health->>Health: slot-stream age, marker rate, queue, loop lag, memory, disk, DB
     Health->>Chain: every 2 min signatures of signer, fee account and marker (P0)
     alt anchor under 30 percent for 10 min, ratio moved over 20 percent, or WS coverage under 80 percent
-      Health->>Risk: open FOMO_SIGNAL (crowdflow entries off)
-      Health->>Telegram: alert with a plain-English reason
+      Health->>Risk: open FOMO_SIGNAL (crowdflow entries off), Telegram alert with the reason
     end
     alt no slot notification for 5 s
       Health->>Risk: open DATA_STALE (all entries off), reconnect, exits poll over HTTP
@@ -212,28 +246,28 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
   actor Owner
-  Console->>Owner: first start prints a one-time code (10 min, single use)
-  Owner->>Bot: /pair CODE
-  Bot->>Bot: store numeric user id, burn code, ignore all other senders
+  Owner->>Server: fomo pair (at the server TTY)
+  Server-->>Owner: one-time code, 10 base32 characters, 10 min, 5 wrong tries burn it
+  Owner->>Bot: /pair CODE in a private chat
+  Bot->>Bot: chat.id == from.id, constant-time compare, store numeric id, burn code
   Owner->>Bot: /withdraw all
   Bot-->>Owner: Send 0.43 SOL to Ab12...yz89 from the server file? Confirm or Cancel (60 s nonce)
   Owner->>Bot: Confirm
   Bot->>Risk: WithdrawIntent (destination must equal the server file byte for byte)
-  Risk-->>Signer: approved, at most free SOL minus the fee reserve (Phase 8)
-  Signer-->>Owner: signature, Solscan link, new balance (paper mode refuses withdraw)
+  Risk-->>Signer: approved, at most free SOL minus the fee reserve (refused in paper)
+  Signer-->>Owner: signature, Solscan link, new balance (Phase 8)
 ```
 
 (e) Restart and reconciliation
 ```mermaid
 sequenceDiagram
-  Boot->>Boot: OS run lock in data/run, else exit
-  Boot->>SQLite: quick_check, backup, migrations, load kill, halt, pause, day state
-  Boot->>Boot: entries blocked until reconciled
+  Boot->>Boot: OS run lock in data/run, else exit; entries blocked until reconciled
+  Boot->>SQLite: quick_check, backup, migrations, load kill, halt, pause, modes, day state
   alt paper
     Boot->>SQLite: orders still submitted become failed on restart, fees charged
   else live (Phase 8)
     Boot->>Chain: getSignatureStatuses, getTransaction v1 for landed ones
-    Boot->>Chain: resend the same bytes while block height is at most lastValidBlockHeight
+    Boot->>Chain: resend the same bytes while block height <= lastValidBlockHeight and no buy block applies
     Boot->>Chain: wallet SOL and token accounts vs the ledger, mismatch means HALT
   end
   Boot->>Chain: connect WS, crowdflow warm-up 15 min before its entries
@@ -246,13 +280,12 @@ sequenceDiagram
   actor OW as Owner
   AI->>AI: 08:30 Athens, stats JSON from own ledger (enums, internal ids), cost guard vs cap
   AI->>API: claude-haiku-5-5, json_schema output, max_tokens 2000, timeout 60 s
-  API-->>AI: response and stop_reason
-  AI->>SQLite: log input, output, model id, tokens, cost, latency
+  API-->>AI: response and stop_reason, then logged with input, model id, tokens, cost, latency
   alt refusal, error or schema failure
     AI->>OW: review skipped today, nothing changed
   else valid
-    AI->>AI: drop proposals outside allowlist, bounds or step limit, or raising risk
-    AI->>OW: summary (at most 8 lines), at most 3 proposals with Approve and Reject
+    AI->>AI: drop proposals outside allowlist, bounds, step limit or direction rules
+    AI->>OW: summary (at most 8 lines, ASCII, no URLs), at most 3 proposals with Approve and Reject
     OW->>AI: Approve
     AI->>SQLite: new config version (author ai-approved), re-validated against HARD_CAPS
   end
@@ -261,25 +294,29 @@ sequenceDiagram
 ## 5. Paper engine realism model
 
 Live data, deliberately pessimistic. (P) = proposal the owner confirms; latency and
-landing stay UNVERIFIED until Phase 8 measures real sends.
+landing stay UNVERIFIED until Phase 8 measures real sends. The three model parameters have
+floors in `HARD_CAPS`; /set may only make them more pessimistic, the AI never touches them,
+and any change restarts every strategy's gate count (RISK_POLICY s.11).
 
 | Element | Model |
 |---|---|
-| No look-ahead, latency | a decision at t uses only events with `receivedAt` <= t; fill at t + L, L = measured detection lag + 2.0 s send-to-land (P, ~9 slots) |
-| Fill price | exact venue math on reserves re-read at the first slot after t + L; fee from the on-chain fee config; venue-favoured rounding (root `costs/memecoin.py` pattern) |
-| Competition, own impact | extra adverse 0.5% per leg (P), as others land ahead of us; a virtual overlay adds our buy to the reserves when quoting our exit |
-| Slippage cap, landing | fill below `minOut` = failed attempt; seeded p_fail 0.20 per attempt (P), at most 3 attempts in one blockhash window (~32 s, by block height); every failure pays base + priority, no fill |
-| Network fees | 5,000 lamports per signature + priority (p75 for the trade's own writable account, clamped) + tip when landed (5,000 SWQOS-only or 1,000 Jito) |
+| No look-ahead, latency | a decision at t uses only events with `receivedAt` <= t; fill at t + L, L = measured detection lag + at least 2.0 s send-to-land (~9 slots) |
+| Fill price | exact venue math on reserves re-read at the first slot after t + L; fee from the on-chain fee config; venue-favoured rounding (root `costs/memecoin.py` pattern). A failed re-read is a failed attempt with fees, never a fill at the decision quote |
+| Competition, own impact | extra adverse at least 0.5% per leg, as others land ahead of us; a virtual overlay adds our buy to the reserves when quoting our exit |
+| Slippage cap, landing | fill below `minOut` = failed attempt; seeded p_fail at least 0.20 per attempt, +0.20 (P, cap 0.95) when the priority clamp binds (our bid capped below p75); at most 3 attempts in one blockhash window (~32 s, by block height); every failure pays base + priority, no fill |
+| Network fees | 5,000 lamports per signature + priority charged on the requested CU limit (CU price p75 for the trade's own writable account, clamped) + tip when landed (5,000 SWQOS-only or 1,000 Jito) |
 | Rent, routes | rent from getMinimumBalanceForRentExemption (cached daily), paid on buy, refunded only after a 100% sell plus close, lost if stuck; direct venues only (Jupiter `/order` adds its fee, never under 24 h) |
 | Partial exits | each extra sell pays a full transaction; rent locked until the final close; moonbag policies are charged that rent |
+| Conservation | after every trade: starting SOL + fills - cost lines = paper SOL, exactly; a mismatch is HALT |
 | 2x shadow | same decisions; fees, priority and tip x2, p_fail x2 (cap 0.95), impact on halved reserves, latency x2 |
 | Random entries, tournament | per real entry K = 5 seeded twins from tokens that passed safety, liquidity and the cost rule then, same size, exits and costs (P3, shed first); every exit policy runs on every entry's price path, scored after costs |
 
-Sell probe in keyless paper (for the security-auditor): `simulateTransaction` with
-`sigVerify: false` needs an existing funded fee payer. Default `holder-sim`: simulate a sell
-of our planned amount by a current non-PDA holder with enough tokens and SOL. Optional
-`probe-payer-sim`: a public address the owner owns (server file) pays a full create-ATA, buy,
-sell round trip. No probe possible = reject. Paper code has no signer.
+Sell probe in keyless paper (`simulateTransaction`, `sigVerify: false`, needs a funded fee
+payer). Default `holder-sim` (decision 2): a sell of our planned amount by a random current
+holder who bought on the curve, never the creator, a top-10 or a launch-slot buyer; the holder
+is never stored or logged. Probe bytes carry zeroed signatures; the paper ProviderClient has
+no send capability. Blind spots: THREAT_MODEL s.6. Optional `probe-payer-sim`: an owner-owned
+public address (server file) pays a create-ATA, buy, sell round trip. No probe = reject.
 
 ## 6. Provider layer and budget governor
 
@@ -316,53 +353,79 @@ confirmations and reconciliation are P0, never shed; if P0 is denied, all entrie
 ## 7. Storage (SQLite WAL, only through `storage/sqlite.ts`)
 
 WAL, busy timeout 5 s, foreign keys, `readBigInts`; amounts are TEXT of decimal digits
-(CHECK), converted to bigint in one place; one writer; forward-only migrations with a backup
-before each. Nothing is acted on before it is persisted (intent, decision, order).
+(CHECK `[0-9]+`; signed PnL columns such as `positions.realized` allow a leading `-`),
+converted to bigint in one place; one writer; forward-only migrations with a backup before
+each. Nothing is acted on before it is persisted (intent, decision, order). Every free-text
+column (reasons, details, audit entries) passes the redactor on write; transaction
+signatures live only in typed `signature` columns.
 
 | Tables | Hold |
 |---|---|
-| schema_migrations, config_versions, flags, day_state, counters | migrations; every config version (json, author owner/ai-approved/default, parent, active); kill, halt reasons, pause, breakers; day start, peak; entries per day and strategy |
-| intents, risk_decisions, approvals, orders, attempts, fills, cost_lines | intents with inputs and reasons; decisions with checks; tokens (plan hash, expiry, consumed_at); order state machine; one row per cost item (venue fee, priority, tip, rent, failed attempt) |
-| positions, marks, equity_snapshots, shadow_fills, twin_trades, tournament_results | positions; sampled marks (feed the tournament); equity per minute; 2x-cost ledger; random twins; per-policy counterfactuals |
+| schema_migrations, config_versions, flags, day_state, counters | migrations; every config version (json, author owner/ai-approved/default, parent, active); kill, halt reasons, pause, breakers, strategy modes (written only by /off, /paper, /golive and auto-demote); pending live loosenings with their 24 h time; day start, peak; entries per day and strategy |
+| intents, risk_decisions, approvals, orders, attempts, fills, cost_lines | entry and exit intents with inputs and reasons; decisions with checks; tokens (plan hash, mode, kind, expiry slot, consumed_at); order state machine; one row per cost item (venue fee, priority, tip, rent, failed attempt) |
+| positions, marks, equity_snapshots, shadow_fills, twin_trades, tournament_results | positions; sampled marks (feed the tournament); equity per minute; 2x-cost ledger; random twins; per-policy counterfactuals (shadow, twin and tournament rows have no order or token columns) |
 | tokens, safety_verdicts, creator_blocklist, flow_minutes, health_events, budget_usage | mint facts; verdicts with TTL; creators of rugged tokens (token level, not FOMO users); per-mint per-minute counts (no user tags); health; requests per provider/method/minute |
 | telegram_auth, confirmations, outbox, audit_log, ai_reviews | owner id; nonces; alert queue; hash-chained log of config changes and dangerous commands; AI calls |
 
-Retention: flow_minutes 30 days, marks 90, raw decode samples 7, trades forever. Daily
-`sqlite.backup()` to `data/backups/` (gitignored), keep 7; `quick_check` at start and daily.
+Retention: flow_minutes 30 days, marks 90, trades forever. Raw decode samples (they hold FOMO
+users' wallets, D1) stay in memory only (ring of 500); decoder error logs carry program,
+discriminator, error class and slot, never an address or signature. Daily `sqlite.backup()`
+to `data/backups/` (gitignored), keep 7; `quick_check` at start and daily. The weekly
+Telegram copy (decision 6) is scanned for secret patterns and not sent on a hit.
 
 ## 8. Telegram (owner only, long polling, no open port)
 
-Numeric user id from pairing only; others ignored silently. 20 commands/min, 3 dangerous per
-10 min; confirmations use a 60 s single-use nonce in `callback_data` (under 64 bytes). No
-copy-trading commands (D1).
+Pairing: `fomo pair` at the server TTY prints a code of at least 10 base32 characters (10 min,
+constant-time compare); 5 wrong attempts in total burn it. Only a private chat with
+`chat.id == from.id ==` the paired id counts; all else is ignored. `allowed_updates`: message,
+callback_query; BotFather `/setjoingroups` Disable (owner guide). Re-pairing only at the
+server, announced in the old chat. 20 commands/min, 3 dangerous per 10 min; confirmations use
+a 60 s single-use nonce in `callback_data` (under 64 bytes). No copy-trading commands (D1).
 
 | Command | Does | Confirm |
 |---|---|---|
 | /status /pnl /positions /trades /why id /strategies /health /limits /report /help | read-only | no |
-| /pause, /resume | stop or allow entries (resume after a peak halt rebases the peak) | resume |
+| /pause, /resume | stop or allow entries (resume after a peak halt rebases the peak); live: /resume waits 24 h | resume |
 | /panic, /kill | sell all within the emergency cap then pause / set the persistent KILL flag (cleared only at the server) | yes |
-| /off s, /paper s, /golive s | strategy mode; golive shows the gate summary and needs the server armed | golive |
-| /set p v, /proposals, /approve id, /reject id, /rollback | bounded tunable change; AI proposals; previous config version | set, approve, rollback |
+| /off s, /paper s, /golive s | strategy mode in the flags table; off and paper apply at once; golive shows the gate summary and needs the bot and signer armed | golive |
+| /set p v, /proposals, /approve id, /reject id, /rollback, /cancel id | bounded tunable change, never a mode; live loosening waits 24 h; /cancel drops a pending change | set, approve, rollback |
 | /withdraw amount or all | live only: SOL to the address in the server file | yes |
 
-Alerts: each entry and exit (reason, size, price, fees, PnL, Solscan link), 09:00 summary,
-warnings (data, FOMO signal, budgets at 80%, stops, mismatches, restarts), weekly report.
+/set, /approve and /rollback never write a mode; changing a live strategy's signal or exit
+parameters demotes it to paper (its gate used the frozen config). Live loosening (unsafe-
+direction change, /resume) is announced in Telegram and via the separate Healthchecks check
+`fomo-notice` pinged on `/fail` (it emails), and applies after 24 h unless cancelled
+(`fomo apply-pending` at the server applies it at once).
+
+Alerts: each entry and exit (reason, size, price, fees, PnL), 09:00 summary, warnings, weekly
+report. No third-party text (names, symbols, URIs, API text): a short mint (first and last 4
+characters) and our own Solscan link built from typed fields after redaction; `parse_mode`
+unset; link previews off. AI-written text: ASCII only, at most 800 characters, no URLs.
 
 ## 9. Live path (Phase 8, interface level)
 
-Live entries need `FOMO_LIVE=true` in the server environment, `fomo arm-live` run by the
-owner via `docker compose exec -it` (checks the signed, fingerprinted, 30-day-fresh
-`fomo-bot/ops/go-live-checklist.md` like root `live_gate.py`, then reads a typed phrase
-with a fresh code from the TTY), and the per-strategy Telegram Go live tap. Arming ends at
-restart: live positions keep their exits; new live entries need re-arming. The signer
-container (`network_mode: none`, zero npm dependencies, Node `crypto` Ed25519, key mounted
-read-only, Unix socket) signs only if its own policy passes: bot wallet pays fees; programs
-allowlisted (System, ATA, Token, Token-2022, compute budget, pump, PumpSwap, Raydium CPMM);
-known instructions only, max-in arguments within its caps; SOL transfers only to tip
-accounts or the withdraw address; no SetAuthority, Approve or foreign close; own daily spend
-counter. No Jupiter routes live until the signer can verify them. Sending: persist signed
-bytes and signature first, `maxRetries: 0`, resend the same bytes until confirmed or block
-height passes `lastValidBlockHeight`, re-sign only after provable expiry.
+Arming: `FOMO_LIVE=true` in the server environment, then the owner runs `ops/arm-live.sh` at
+the server TTY: `fomo arm-live` in `bot` (signed, fingerprinted, 30-day-fresh
+`fomo-bot/ops/go-live-checklist.md` like root `live_gate.py`; SOL caps re-checked in EUR;
+typed phrase with a fresh code), then `signer arm` (its own phrase). Each ends when its
+container restarts; the signer also disarms at the first KILL it sees, yet still signs exits,
+closes and the withdraw. Then the per-strategy Go live tap. Live uses `LIVE_CAPS` until decision 9.
+
+Signer: own image from `src/signer/` only (no npm, no node_modules), `network_mode: none`,
+Node `crypto` Ed25519; key `/srv/fomo-signer/live-wallet.key` (0400) and policy
+`/srv/fomo-signer/policy.json` (tip allowlist, withdraw address, caps) mounted read-only and
+never sent over IPC; KILL via a read-only mount of `data/run` (missing or unreadable = KILL).
+Unix socket 0600 for the bot's uid only (mechanism UNVERIFIED, Phase 8); requests over 2,048
+bytes refused. It parses the unsigned wire message and signs exactly those bytes, only if
+every rule of the signer policy (THREAT_MODEL s.5) holds: allowlisted programs and
+instructions, value only to the bot wallet, its own ATAs, allowlisted tips or the pinned
+withdraw address, and its own daily caps (0.35 SOL buys, 0.02 SOL other fees, 150 signatures/h).
+
+No Jupiter routes live until the signer can verify them. Sending: persist signed bytes and
+signature first, `maxRetries: 0`, resend the same bytes until confirmed or block height
+passes `lastValidBlockHeight`. Before each buy resend, KILL, HALT, PAUSE and the daily stop
+are re-checked: if set, stop, let the blockhash expire, reconcile. After expiry a new
+attempt needs a new intent and approval.
 
 ## 10. Daily AI review
 
@@ -371,18 +434,22 @@ rejected signals did, from our ledger and chain data only. Mints appear as inter
 token names, symbols, third-party API data (Jupiter, DexScreener terms) and free text never
 enter the prompt. Output: `summary` (at most 8 lines) and at most 3 `{param, current,
 proposed, reason, expectedEffect, risk}`, `param` an enum of allowlisted tunables. $1/month
-enforced locally. No key: skip, remind about `/review-trades`. Never modes, live, withdraw,
-providers, hard caps or code.
+enforced locally. No key: skip, remind about `/review-trades`. Safety and anti-sybil
+parameters and `exits.hardStop` only in the tighter direction. Never modes, live, withdraw,
+providers, hard caps, the paper model or code.
 
 ## 11. Operations
 
 | Topic | Design |
 |---|---|
-| Containers | `bot`, plus `signer` in Phase 8. Node 26.13.0 image pinned by digest (UNVERIFIED), non-root, read-only root fs, tmpfs /tmp, memory 700 MB, `--max-old-space-size=400`, `restart: unless-stopped`, no published ports. Volumes `/data` (db, logs, backups, run lock), `/config` read-only, `/secrets` read-only for the signer only |
-| Health, heartbeat | Docker healthcheck `node src/ops/healthcheck.ts` (`data/run/heartbeat.json` older than 60 s = unhealthy); Healthchecks.io ping each minute while exits can be managed, `/fail` with reason after a breaker is open 10 min; 5 min grace, email and Telegram channels |
-| Logs | JSONL decisions `data/logs/decisions-YYYY-MM-DD.jsonl` (14 days); Docker json-file 10 MB x 5; ASCII; redactor on every line |
-| Update / rollback | `ops/update.sh`: tagged commit, `npm ci --ignore-scripts`, tests, image tagged by commit, DB backup, swap, health within 2 min else automatic rollback; `ops/rollback.sh`: previous image (DB restore only if a migration ran) |
-| Single instance; Windows | OS lock `data/run/run.lock`, Telegram 409 Conflict: alert and exit. PowerShell: `npm ci --ignore-scripts`, `npm run paper` (keyless, data in `fomo-bot\data\`); Telegram optional via `fomo-bot\.env`; LF, ASCII console |
+| Containers | `bot`, plus `signer` in Phase 8, separate images; no container mounts the Docker socket. Node 26.13.0 base pinned by digest (UNVERIFIED), separate numeric non-root uids, `cap_drop: [ALL]`, `no-new-privileges`, pids limit 256, read-only root fs, tmpfs /tmp, memory 700 MB, `--max-old-space-size=400`, core dumps off (`ulimits core 0`), no `--heapsnapshot-signal` or `--report` (start-up refuses them), `restart: unless-stopped`, no published ports; signer logging driver `none` |
+| Files on the server | checkout `/opt/fomo-bot` holds code only; `/etc/fomo-bot/` server file and bot secrets (Compose `secrets` file mounts, 0400, bot uid); `/srv/fomo-signer/` key, policy, counters; volume `/data` (db, logs, backups, run lock) |
+| Image build | multi-stage Dockerfile: `npm ci --ignore-scripts` plus the lockfile checks of TEST_PLAN s.11; tests, typecheck and lint in a throwaway stage with `RUN --network=none`; runtime stage `npm ci --omit=dev --ignore-scripts` and `src/`. Allowlist `.dockerignore`: `*`, then `!src/`, `!tests/`, `!package*.json`, `!.npmrc`, `!tsconfig.json`, `!eslint.config.js`, `!vitest.config.ts` |
+| Health, heartbeat | Docker healthcheck `node src/ops/healthcheck.ts` (`data/run/heartbeat.json` older than 60 s = unhealthy); Healthchecks.io ping each minute while exits can be managed, `/fail` with reason after a breaker is open 10 min; 5 min grace, email and Telegram channels; second check `fomo-notice` for live loosenings |
+| Logs | JSONL decisions `data/logs/decisions-YYYY-MM-DD.jsonl` (14 days); Docker json-file 10 MB x 5 (signer: none); ASCII; redactor on every line |
+| Update / rollback | npm and node never run on the host. `ops/update.sh` deploys only an owner-created tag on main: shows tag, commit hash and subject; the owner checks on GitHub that CI passed for that hash and types its first 8 characters; then `docker build` (tests inside), DB backup, swap, health within 2 min else automatic rollback; `ops/rollback.sh`: previous image (DB restore only if a migration ran) |
+| Host | SSH keys only: `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, no root login (cloud-init drop-ins in `/etc/ssh/sshd_config.d/` checked too); ufw with `IPV6=yes`; fail2ban; unattended security upgrades. Phase 8 checklist item: `authorized_keys` holds only the owner's key (or a fresh VPS for Phase 8) |
+| Single instance; owner PC | OS lock `data/run/run.lock`, Telegram 409 Conflict: alert and exit. PC: Docker Desktop with the same compose file and secrets in a folder outside the checkout (decision 11); LF, ASCII console |
 
 ## 12. Failure modes
 
@@ -404,48 +471,70 @@ providers, hard caps or code.
 | Unsupported or 99%-fee venue (Meteora DBC); unknown Token-2022 extension | venue list; own raw TLV parser | reject with the reason logged; jsonParsed never trusted alone |
 | Bait token passing static checks | holders, creator share and blocklist, identical-amount clusters, age, liquidity, non-FOMO activity | reject by default; at most 0.5% of pool; hard stop; thresholds out of git |
 | Sybil "crowd flow" | distinct-buyer floor, top-buyer, same-slot and identical-size shares, median buy size, non-FOMO volume and holder growth | no entry, confidence capped, creator blocklisted after a rug; no lookups of FOMO users' wallets (D1) |
-| Honeypot, sell tax, blocked transfer | sell probe; re-probe every 5 min while held | reject; a held position that fails is "stuck", valued 0, alert |
+| Honeypot, sell tax, blocked transfer | sell probe; re-probe every 5 min while held | reject; a held position that fails is "stuck", valued 0, alert; retries only after a passing sell simulation, within its failed-fee budget |
 | Freeze, pause, authority change; liquidity pulled, dev dump | mint re-read every 60 s while held; reserves down over 30% in 1 min; creator sell | emergency exit with the wide cap, creator blocklisted; empty pool: stuck, valued 0, rent lost |
 | Curve completes while held | `complete` flag | mark stale; exit on the canonical PumpSwap pool when readable; no entries above 90% curve progress |
 | Duplicate or out-of-order events | signature:leg seen (LRU 200k); DB unique keys; slot below the watermark (newest minus 10) | ignored; deterministic intent ids, one position per mint, single-use tokens; late events excluded from acceleration |
-| Restart mid-trade | orders still submitted at boot | paper: failed on restart, fees charged; live: diagram (e) |
-| Double buy on retry; blockhash expiry (live) | order state machine; block height past lastValidBlockHeight | resend identical bytes only; re-sign only after expiry with no status; then reconcile from chain |
+| Two intents race for the last cap room | T1 `BEGIN IMMEDIATE`; partial unique index on positions(mint) | the second sees the first's opening row at maxSpend and is rejected |
+| Exit order fails or expires | attempt result, block height | `exitSeq` + 1, re-issued at the next tick; one in-flight exit per position |
+| KILL, HALT, PAUSE or daily stop while a buy is in flight | flags re-read before every paper attempt and every live resend | paper: no further attempt, order failed with the fees so far; live: no resend, blockhash expires, reconcile; never re-signed |
+| Restart mid-trade; double buy on retry; blockhash expiry | orders still submitted at boot; order state machine; block height past lastValidBlockHeight | paper: failed on restart, fees charged; live: diagram (e), identical bytes only, after expiry reconcile, a new buy needs a new intent and approval |
+| Spam tokens, address-poisoning dust | token account for a mint without a position; SOL or held-mint inflow without a fill | unknown mints: out of equity, never sold, closed or touched; SOL inflows: equity uses min(ledger, chain); over 0.0005 SOL cumulative or any held-mint change: HALT |
 | Clock drift or jump | offset vs HTTP Date (3 sources) and blockTime; wall vs monotonic differ over 2 s | over 2 s entries off, over 10 s halt; timers monotonic; day moved backwards: halt |
-| Disk full | free space every 5 min; write errors | under 1 GB stop raw samples; under 300 MB or a failed write: entries off, alert |
-| SQLite damage; node:sqlite change | quick_check, SQLITE_CORRUPT or IOERR; storage tests on the pinned Node | halt entries, alert with restore steps, never auto-restore, live rebuilds from chain; Node pinned, one replaceable file |
+| Disk full; SQLite damage; node:sqlite change | free space every 5 min; write errors; quick_check, SQLITE_CORRUPT or IOERR; storage tests on the pinned Node | under 300 MB, a failed write or damage: halt entries, alert with restore steps, never auto-restore, live rebuilds from chain; Node pinned, one replaceable file |
 | Telegram outage | send and getUpdates errors | outbox retries; after 30 min no entries and heartbeat `/fail` so email reaches the owner |
-| Telegram account hijack | owner-id commands the owner did not send | bounded power (no address change, nothing above HARD_CAPS, live needs server arming, withdraw only to the fixed address); audit log; `fomo kill` at the server |
+| Telegram account hijack | owner-id commands the owner did not send | bounded power (no address change, nothing above HARD_CAPS, no mode via config, live loosening waits 24 h with an email, live needs server arming, withdraw only to the fixed address); audit log; `fomo kill` at the server |
 | Bot token leak | 409 Conflict, unexpected webhook | heartbeat fail, entries off; owner rotates the token with BotFather |
 | Heartbeat outage; VPS reboot | ping errors; run lock shows an unfinished run | heartbeat: logged, one note a day; reboot: restart policy, reconciliation, restart alert, Healthchecks alerts after grace |
 | OOM, leak, blocked event loop | RSS over 80% of limit; OOM kill; loop lag over 1 s | shed cold-token tracking; over 90% controlled restart; lag over 5 s for 30 s or over 3 restarts in 30 min: entries off, alert |
-| Equity misread; our own sizing or accounting bug | sanity max, +50% in 1 h without fills; runtime invariants re-checked by executor (and signer) | halt and alert; absolute SOL caps hold regardless; property tests before release |
-| Bad config, /set or AI proposal | zod + HARD_CAPS + bounds validator | rejected or dropped and logged, never auto-applied; invalid config at start: refuse to start |
-| Malicious dependency; second instance | lockfile, cooldown, no install scripts, isolated signer; run lock, Telegram 409 | THREAT_MODEL.md; exit with a clear message |
+| Equity misread; our own sizing or accounting bug | sanity max, +50% in 1 h (RISK_POLICY s.4); paper conservation; runtime invariants re-checked by executor (and signer) | halt and alert, baseline and peak never move on a breach; absolute SOL caps hold regardless; property tests before release |
+| Bad config, /set or AI proposal | zod + HARD_CAPS + TUNABLE_BOUNDS + direction rules | rejected or dropped and logged, never auto-applied; invalid config at start: refuse to start |
+| Malicious dependency or compromised bot process; second instance | lockfile approved list, cooldown, no install scripts; signer policy, caps and counters; run lock, Telegram 409 | THREAT_MODEL A1, A17: the signer refuses anything outside policy, loss bounded by its daily caps; second instance exits with a clear message |
 
 ## 13. UNVERIFIED items designed around
 
 Marker logsSubscribe (not a real account): first Phase 3 check, fallback = subscribe to the
 signer and keep only swap-program log lines. pubsub-limit meaning: 3 subscriptions, 1
-connection. WebSocket 24/7: Phase 7 soak. Landing and latency: pessimistic defaults. CU and
-fee medians: own recorder. Graduation timing: no entries above 90% curve progress. Legacy
-SPL holder query: else probe-payer or reject. AMM v4, CLMM, DLMM, Orca fees: unsupported.
-Jito tip floor: minimum tips only. Docker digest, Node env-file flag: Phase 2. Anthropic
-spend cap: enforced locally.
+connection. WebSocket 24/7: Phase 7 soak. Landing, latency: pessimistic defaults. CU and fee
+medians: own recorder. Graduation timing: no entries above 90% curve progress. Legacy SPL
+holder query: else probe-payer or reject. AMM v4, CLMM, DLMM, Orca fees: unsupported. Jito
+tip floor: minimum tips only. Anthropic spend cap: local. Phase 2 checks: Docker digest;
+Compose file-secret mode and uid without Swarm; BuildKit `RUN --network=none`; Bot API
+link-preview field; grammy's transitive packages. Phase 8: socket ownership, logging `none`.
 
 ## 14. Decisions for the owner
 
 1. **Signer in its own offline container (Phase 8)**, so a poisoned package cannot steal
    the key. Recommended: yes.
-2. **Paper sellability check**: simulate a sale by a current holder (needs nothing from you)
-   or also use a public address of a wallet you own. Recommended: holder only.
+2. **Paper sellability check**: simulate a sale by a random current holder (needs nothing
+   from you) or also use a public address of a wallet you own. Recommended: holder only.
 3. **Live needs a second data provider**, or exits fail if the free endpoint blocks us.
    Recommended: no live money until one is configured.
 4. **Who lifts the -50% halt**: Telegram (brief) or server only (root). Recommended:
-   Telegram in paper, server for live.
+   Telegram in paper, server for live (a live /resume would wait 24 h anyway).
 5. **Daily -30% stop** resets at 00:00 Athens; recommended: two in a row need /resume.
 6. **Weekly database copy to your Telegram** (no secrets inside). Recommended: yes.
 7. **Telegram down 30 minutes stops new entries.** Recommended: yes.
 8. **After a pump.fun upgrade**, paper resumes after a self-test; live waits for your tap.
-9. **Live limits**: brief (10% per trade, -30% daily, -50% peak) or root (5%, -3%, -15%).
-   Decide before Phase 8; paper uses the brief's.
+9. **Live limits**: brief (10% and 0.06 SOL per trade, 0.30 SOL ~ EUR 24 exposure, 12
+   entries/day, -30% daily, -50% peak) or root (5% and EUR 5 per trade, 20% and EUR 10 ~
+   0.12 SOL exposure, 5 trades/day, -3% daily, -15% peak; we would count entries only, as
+   exits are never blocked). Until you decide, live uses the root's, and the SOL caps are
+   re-checked in euros when you arm live. Paper uses the brief's.
 10. **No lookups of FOMO users' wallets** (D1) makes baiting easier; recommended: accept.
+11. **On your PC**: paper in Docker Desktop (a bad package cannot reach your SSH key) or
+    natively with npm (simpler, riskier). Recommended: Docker Desktop.
+12. **Live loosening waits 24 h** (unsafe-direction setting or /resume) with an email, so a
+    stolen Telegram cannot loosen and strike at once. Recommended: yes.
+13. **Guardrails, part 1 (your OK needed; not done)**: add `fomo-bot/src/config/caps.ts` and
+    `fomo-bot/ops/go-live-checklist.md` to the "ask" list in `.claude/settings.json`; block
+    writes to `fomo-bot/data/` (KILL flag, database) like the root `state/`. Recommended: yes.
+14. **Guardrails, part 2 (your OK needed; not done)**: Read and Edit deny for `**/*.pem`,
+    `**/*.key`, `**/secrets/**`; the hook blocks `wallet-create`, `wallet-backup`, `arm-live`,
+    `signer arm`, `apply-pending`, `docker inspect`, `docker compose config`, and `docker
+    exec`/`run`/`cp` aimed at the signer, secrets or live wallet; a hook test each. Regexes
+    miss indirection, so also enable the Claude Code sandbox with deny-read for `secrets/`,
+    `*.key`, `*.pem` and env files (settings verified first). Recommended: yes.
+15. **GitHub (you do this; not done)**: 2FA on your account; protect `main` (CI must pass,
+    review required); only you create release tags, which `ops/update.sh` deploys.
+    Recommended: yes, before Phase 7.
