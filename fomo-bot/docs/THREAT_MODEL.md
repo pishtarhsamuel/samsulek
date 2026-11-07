@@ -22,7 +22,7 @@ change Claude Code guardrails or GitHub settings are proposals only (section 7).
 |---|---|---|---|
 | Live wallet key | VPS `/srv/fomo-signer/live-wallet.key` (outside the checkout), mounted read-only into the signer container only | bankroll stolen (at most the bot's share of EUR 50) | Phase 8 |
 | Owner's Telegram account | owner's phone and desktop | bounded control of the bot (see A3) | Phase 2 |
-| Telegram bot token | VPS `/etc/fomo-bot/secrets/telegram_bot_token`; on the PC a folder outside the checkout | impersonate the bot, read updates, phish the owner, break polling | Phase 2 |
+| Telegram bot token | VPS `/etc/fomo-bot/secrets/telegram_bot_token`; on the PC only a separate paper-only bot's token, in a folder outside the checkout | impersonate the bot, read updates, phish the owner, break polling | Phase 2 |
 | Anthropic API key (optional) | same folder | spend on the owner's prepaid credits | Phase 5 |
 | Healthchecks.io ping URLs | same folder | fake "alive" pings hide an outage; fake failures | Phase 7 |
 | VPS access | owner's SSH key (owner PC), hosting-provider account | everything on the server, including the key | Phase 7 |
@@ -51,14 +51,14 @@ change Claude Code guardrails or GitHub settings are proposals only (section 7).
 | A14 | Base image, OS or deploy tampering | backdoored runtime or code | Node image pinned by digest; `ops/update.sh` deploys only an owner-created tag on protected `main` after the owner confirms the commit hash and green CI (decision 15); Ubuntu from the provider's LTS image; unattended security updates | trust in Docker Hub, GitHub and the provider |
 | A15 | Public repository readers (D2) | learn entry rules to bait the bot | no tuned thresholds or wallet address in git; placeholders only; if still public before Phase 8, emergency-trigger values become placeholders too (RISK_POLICY s.12); the owner makes the repository private | logic is still readable until then |
 | A16 | Terms enforcement (FOMO s.16, provider terms) | account bans, IP blocks | never touch FOMO's services; aggregate counts only; user tags in memory for 15 min; raw decode samples in memory only; no address or signature of a FOMO user in any log, DB row or fixture (D1); no Helius until it confirms in writing (D3); budget governor keeps us under public limits; DexScreener and Jupiter data never redistributed | FOMO could still object to any use of its on-chain footprint; not legal advice |
-| A17 | Compromised `bot` process (via A1) talking to the signer (Phase 8) | signs harmful transactions | signer policy (section 5): own parsing of the exact bytes, allowlists, value only to the bot wallet, its ATAs, allowlisted tips or the pinned withdraw address; pinned values never come over IPC; own TTY arming and KILL latch; own counters and daily caps; socket for the bot uid only | it can buy a token the attacker controls at a bad price, up to 0.35 SOL of buys per day, and burn up to 0.02 SOL/day in fees; in practice the bankroll is the limit |
+| A17 | Compromised `bot` process (via A1) talking to the signer (Phase 8) | signs harmful transactions | signer policy (section 5): own parsing of the exact bytes, allowlists, value only to the bot wallet, its ATAs, allowlisted tips or the pinned withdraw address; pinned values never come over IPC; own TTY arming and KILL latch; own counters and daily caps; socket for the bot uid only | it can buy a token the attacker controls at a bad price, up to 0.35 SOL of buys per day, burn up to 0.02 SOL/day in fees, and sell held positions with no minimum output into a sandwich (bounded by the open exposure); in practice the bankroll is the limit |
 | A18 | Spam tokens, address-poisoning dust | trick the bot or the owner into sending to a look-alike, or halt the bot | unknown mints never enter equity and are never touched; withdraw goes only to the pinned address, never to a "recent" one; SOL dust stays out of equity (min of ledger and chain) | dust over 0.0005 SOL or into a held mint halts entries (griefing); exits continue |
 
 ## 4. Secrets design
 
 | Secret | Where | How it is loaded | Never |
 |---|---|---|---|
-| Telegram bot token, Anthropic key, Healthchecks ping URLs, later Helius key | VPS `/etc/fomo-bot/secrets/` (files 0400, owned by the bot's numeric uid); on the PC a folder outside the checkout; `fomo-bot/env.example` in git with placeholders for non-secret settings | Docker Compose `secrets` file mounts into `bot` only; `src/config/secrets.ts` reads them once at start into a frozen object, only when the process is started with the owner's `--load-secrets` flag (set in the compose file) | environment variables; git, logs, Telegram, the DB, backups, `stats:export`, AI prompts, error messages, URLs in logs (query strings stripped) |
+| Telegram bot token, Anthropic key, Healthchecks ping URLs, later Helius key | VPS `/etc/fomo-bot/secrets/` (files 0400, owned by the bot's numeric uid); on the PC only a separate paper-only Telegram bot token (no Anthropic key, never a VPS secret), in a folder outside the checkout; `fomo-bot/env.example` in git with placeholders for non-secret settings | Docker Compose `secrets` file mounts into `bot` only; `src/config/secrets.ts` reads them once at start into a frozen object, only when the process is started with the owner's `--load-secrets` flag (set in the compose file) | environment variables; git, logs, Telegram, the DB, backups, `stats:export`, AI prompts, error messages, URLs in logs (query strings stripped) |
 | Live wallet key (Phase 8) | VPS `/srv/fomo-signer/live-wallet.key` (0400, signer uid), outside the checkout | file mounted read-only into the `signer` container only | in the `bot` container, logs, Telegram, backups, Claude's context, any machine but the VPS |
 | Creating the key | owner runs `docker compose run --rm signer wallet-create` | prints only the public address; refuses if the file exists | printed, logged or sent |
 | Backing it up | owner runs `ops/wallet-backup.sh` | the script refuses unless `docker inspect` shows logging driver `none` for the signer; inside, the command refuses unless stdin and stdout are TTYs, shows the key once with offline-storage steps, then clears the screen and scrollback; logs "backup shown" without content to the signer's own audit file | run by Claude; piped; screenshotted into chat |
@@ -77,8 +77,9 @@ name (token, key, secret, password, url, authorization) and by pattern: Telegram
 (digits, colon, 30+ token characters), `sk-ant-` keys, hc-ping URLs, base58 strings of 87-88
 characters (64-byte keys, and also signatures), JSON arrays of 64 small integers, `api-key=`
 and `api_key=` query parameters. Transaction signatures therefore live only in typed fields,
-and Solscan links are built from them after redaction. The weekly DB copy is scanned for the
-same patterns and not sent on a hit. Tests plant canary secrets and assert they never appear.
+and Solscan links are built from them after redaction. The weekly DB copy is scanned row by row
+in its free-text columns only (typed signature columns are 88-character base58 and would always
+match the key pattern), and not sent on a hit. Tests plant canary secrets and assert they never appear.
 
 Rules for Claude: never read, print, grep or copy env, key or `.pem` files or secret folders;
 never SSH into the VPS once it holds the key; the owner runs server commands from
@@ -89,9 +90,12 @@ messages under 48 h old, but rotation is still required).
 ## 5. Signer policy (Phase 8, complete rule list)
 
 The signer refuses every request unless all rules hold. Invariant 12 tests each rule.
-1. Transport: Unix socket mode 0600 for the bot's uid only; requests over 2,048 bytes refused;
-   the request carries the order id, kind and unsigned wire message. The signer parses the
-   message itself and signs exactly those bytes. Tip accounts, the withdraw address and the
+1. Transport: Unix socket 0660 owned by a dedicated group that only the bot and signer uids
+   share, in a 0750 directory (under cap_drop ALL the signer cannot chown, and pure Node cannot
+   check the peer uid); requests over 2,048 bytes refused; the request carries the order id,
+   kind and unsigned wire message. The signer parses the message itself, derives the kind
+   (buy, sell, close, withdraw) from the parsed instructions, refuses any request whose stated
+   kind differs, and signs exactly those bytes. Tip accounts, the withdraw address and the
    caps come only from `/srv/fomo-signer/policy.json`, never from the request.
 2. Message: the bot wallet is the fee payer and the only signer; no address lookup tables; no
    AdvanceNonceAccount (durable nonce) anywhere.
@@ -107,11 +111,15 @@ The signer refuses every request unless all rules hold. Invariant 12 tests each 
    is the bot wallet or its ATA derived inside the signer (`node:crypto`, tested on fixtures);
    buy max-in <= 0.06 SOL (or the live cap).
 7. Counters on its own volume, persisted in `/srv/fomo-signer/counters.json` per Athens day
-   (unreadable = no buys): buys' max-in plus fees <= 0.35 SOL/day; fees and tips of all other
-   transactions <= 0.02 SOL/day; <= 150 signatures per hour.
+   (unreadable = no buys): buys' max-in plus fees <= 0.35 SOL/day; reduce-only sells and closes
+   have their own fee budget per day, (max open positions + max entries per day) x 3,380,000
+   lamports plus close-account fees, derived from HARD_CAPS and LIVE_CAPS so a protective exit
+   is never refused (RISK_POLICY limit 30); fees and tips of all other transactions <= 0.02
+   SOL/day; <= 150 signatures per hour for non-exit transactions; alert at 80% of each cap.
 8. Arming: buys only after `signer arm` at the TTY (ends at restart) and while no KILL has been
    seen on the read-only `data/run` mount (missing or unreadable = KILL; KILL disarms until
-   re-armed). Sells, closes and the withdraw are signed while disarmed, within the caps.
+   re-armed). Sells, closes and the withdraw (by the derived kind, rule 1) are signed while disarmed,
+   within the caps.
 
 ## 6. For the security-auditor's review
 
@@ -133,7 +141,12 @@ The signer refuses every request unless all rules hold. Invariant 12 tests each 
    getUpdates, sendMessage, answerCallbackQuery), because grammy pulls node-fetch 2,
    whatwg-url, tr46, webidl-conversions, abort-controller, event-target-shim, debug and ms
    (list from the security review; not yet in VERIFIED_FACTS), eight more packages to approve
-   and watch for a few hundred lines of HTTPS JSON.
+   and watch for a few hundred lines of HTTPS JSON. The security-auditor agreed (2026-11-07),
+   with requirements: base URL a code constant, the token put into the path only at call
+   time; errors carry the method name and HTTP status only, never the URL; explicit timeouts
+   (long poll plus a margin) and a response-size cap; zod validates every update and unknown
+   update types are dropped; the update offset is stored after each batch; 429 `retry_after`
+   and 409 are handled; canary-token tests on every error path.
 6. Node 26.13.0 image tag and digest; gitleaks v8.30.1: verify the release SHA256 against its
    published checksums before installing (UNVERIFIED until done).
 
@@ -155,7 +168,10 @@ aimed at the signer, or readers like `python`, `node`, `cp`, `base64`, `git show
 - decision 15: GitHub 2FA, branch protection on `main` (required CI and review), owner-only
   release tags.
 Until the owner approves: no key exists before Phase 8, keys never exist where Claude runs,
-and .gitignore already covers `secrets/` and `*.key`.
+and .gitignore already covers `secrets/` and `*.key`. Timing: decision 15 must be done before
+Phase 7 (the VPS deploys tags from GitHub), decision 14 before any key exists. The sandbox does
+not run on native Windows and `docker` runs outside it, so on the owner's PC the control is
+that no VPS secret ever exists there.
 
 ## 8. Residual risks the owner accepts by going ahead
 

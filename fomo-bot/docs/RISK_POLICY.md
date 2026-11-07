@@ -65,7 +65,7 @@ the SOL and EUR cap applies; no price means no live entries.
 | 27 | Moonbags | not allowed live at this size; tournament may test them only when charged their locked rent | H | rent is ~5% of a 0.03 SOL position |
 | 28 | Strategy live loss budget | a strategy's cumulative realized live loss over 0.05 SOL (P) demotes it, from its first live trade | H | ramp protection before trade 20 |
 | 29 | Paper model floors | p_fail >= 0.20 per attempt; latency >= measured + 2.0 s; competition >= 0.5% per leg | H floors | paper must not flatter |
-| 30 | Signer caps (Phase 8) | buys' max-in plus fees <= 0.35 SOL/day; other fees and tips <= 0.02 SOL/day; <= 150 signatures/hour | H (signer's own copy) | bounds a compromised bot |
+| 30 | Signer caps (Phase 8) | buys' max-in plus fees <= 0.35 SOL/day; reduce-only sells and closes have their own fee budget per day of (max open positions + max entries per day) x 3,380,000 lamports plus close-account fees, derived from HARD_CAPS and LIVE_CAPS (a test asserts it covers s.3a for both), so the signer never refuses an exit the retry budget allows; all other fees and tips <= 0.02 SOL/day; <= 150 signatures/hour for non-exit transactions; alert at 80% of each cap | H (signer's own copy) | bounds a compromised bot without blocking protective exits |
 
 ### 3a. Fee reserve (limit 11), worked out
 
@@ -80,6 +80,8 @@ the SOL and EUR cap applies; no price means no live entries.
 - Failed-fee budget: at most 3,375,000 lamports of failed exit attempts per position per Athens
   day. A stuck position is re-simulated every 5 min (free) and gets a real attempt only after a
   passing sell simulation while budget remains; then it waits a day, the owner gets steps.
+  After 2 Athens days without a successful exit, automatic attempts stop for that position and
+  the owner decides, so a stuck position cannot bleed fees below the reserve day after day.
 
 ## 4. Equity
 
@@ -235,7 +237,9 @@ days; every change is a new config version (/rollback restores the previous one)
 /set or AI: a mode (flags table; only /golive sets live), HARD_CAPS, withdraw address,
 providers, tips, the AI's own cap or model (the owner may /set the model). Paper model: /set
 only more pessimistic, AI never. Live: any unsafe-direction /set or approval, and /resume,
-applies after 24 h with an immediate Telegram and email notice (ARCHITECTURE s.8).
+applies after 24 h with an immediate Telegram and email notice (ARCHITECTURE s.8). /rollback
+is compared field by field like /set: every field it would move in the unsafe direction waits
+24 h the same way; safer fields apply at once.
 
 | Parameter | /set bound | AI |
 |---|---|---|

@@ -2,16 +2,15 @@
 
 Updated: 2026-11-07
 
-**Phase 1 (design): in progress.** Design documents only. No code until you approve
-the design summary.
+**Phase 1 (design): done and reviewed, waiting for your approval.** Design documents only.
+There is no code, and none will be written until you approve.
 
-- Phase 0 is done: `docs/VERIFIED_FACTS.md` and `docs/FEASIBILITY.md`.
-- Your decisions (`docs/DECISIONS.md`): crowd flow and momentum first, no
-  copy-trading; you make the repository private; paper trading on free public Solana
-  endpoints, no sign-ups.
-- For you to do: (1) make the GitHub repository private (Settings, General, Danger
-  Zone, Change visibility); (2) send the email in `docs/drafts/helius-terms-question.md`
-  when you like. Neither blocks Phase 1.
-- Next: the architecture, risk policy, threat model and test plan, reviewed by the
-  risk and security reviewers, then a 10-line summary for your OK.
+- Done: `docs/ARCHITECTURE.md`, `docs/RISK_POLICY.md`, `docs/THREAT_MODEL.md` and
+  `docs/TEST_PLAN.md`. Both reviewers first blocked the drafts (31 findings), then approved
+  the fixed version (`docs/REVIEWS.md`).
+- You decide: the 15 decisions in `docs/ARCHITECTURE.md` section 14, each with a
+  recommended answer. Two of them change Claude Code's guardrails and need your explicit OK.
+- For you to do: make the GitHub repository private; send the Helius email when you like
+  (`docs/drafts/helius-terms-question.md`); before Phase 7, turn on GitHub 2FA.
+- Next: Phase 2 (foundations, tests first), after your approval.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.

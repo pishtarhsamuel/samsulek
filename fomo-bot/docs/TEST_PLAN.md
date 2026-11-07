@@ -142,6 +142,11 @@ at 1x and 10x speed with a fake clock and must produce identical decisions.
   loosening queued 24 h and cancellable.
 - AI review against a fake Messages API: valid, refusal, error, invalid schema, over cap.
 - Config: /set, AI approve, rollback, restart with each version; modes unchanged by all of them.
+- Live loosening by /rollback: rolling back to a looser risk version (e.g. tradePct, poolShare,
+  slippage) queues each looser field for 24 h with the notice; safer fields apply at once.
+- Signer budgets (Phase 8 code, test written with the caps in Phase 2): the exit fee budget
+  covers (max open positions + max entries per day) x 3,380,000 plus close fees for both
+  HARD_CAPS and LIVE_CAPS; a disarmed signer rejects a buy whose request says "sell".
 
 ## 8. Chaos tests
 
@@ -223,6 +228,10 @@ CI (GitHub Actions; actions pinned by commit SHA; `permissions: contents: read`;
 5. Once the owner approves ARCHITECTURE.md s.14 decisions 13-14: a root hook test
    (`tests.test_guard_hook`) for every new block and deny rule, each blocked and each
    harmless look-alike allowed.
+6. Compose file: a test parses it: no `docker.sock` mount anywhere, `/srv/fomo-signer`
+   mounted only into the signer, no published ports, the signer has `network_mode: none` and
+   logging `none`, and a `test` service with no secrets and no network (`ops/update.sh` and
+   the compose file come from the deployed tag).
 
 ## 12. What tests cannot show
 

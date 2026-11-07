@@ -392,8 +392,9 @@ a 60 s single-use nonce in `callback_data` (under 64 bytes). No copy-trading com
 | /withdraw amount or all | live only: SOL to the address in the server file | yes |
 
 /set, /approve and /rollback never write a mode; changing a live strategy's signal or exit
-parameters demotes it to paper (its gate used the frozen config). Live loosening (unsafe-
-direction change, /resume) is announced in Telegram and via the separate Healthchecks check
+parameters demotes it to paper (its gate used the frozen config). Live loosening (an unsafe-
+direction change by /set, /approve or /rollback, compared field by field; /resume) is
+announced in Telegram and via the separate Healthchecks check
 `fomo-notice` pinged on `/fail` (it emails), and applies after 24 h unless cancelled
 (`fomo apply-pending` at the server applies it at once).
 
@@ -415,11 +416,16 @@ Signer: own image from `src/signer/` only (no npm, no node_modules), `network_mo
 Node `crypto` Ed25519; key `/srv/fomo-signer/live-wallet.key` (0400) and policy
 `/srv/fomo-signer/policy.json` (tip allowlist, withdraw address, caps) mounted read-only and
 never sent over IPC; KILL via a read-only mount of `data/run` (missing or unreadable = KILL).
-Unix socket 0600 for the bot's uid only (mechanism UNVERIFIED, Phase 8); requests over 2,048
-bytes refused. It parses the unsigned wire message and signs exactly those bytes, only if
+Unix socket 0660 owned by a dedicated group shared only by the bot and signer uids, in a 0750
+directory (under cap_drop ALL the signer cannot chown; pure Node cannot check the peer uid;
+UNVERIFIED, Phase 8); requests over 2,048 bytes refused. It parses the unsigned wire message,
+derives the kind (buy, sell, close, withdraw) from the instructions, refuses a request whose
+stated kind differs, and signs exactly those bytes, only if
 every rule of the signer policy (THREAT_MODEL s.5) holds: allowlisted programs and
 instructions, value only to the bot wallet, its own ATAs, allowlisted tips or the pinned
-withdraw address, and its own daily caps (0.35 SOL buys, 0.02 SOL other fees, 150 signatures/h).
+withdraw address, and its own daily caps (0.35 SOL buys; a separate exit fee budget derived
+from HARD_CAPS and LIVE_CAPS, so exits are never refused; 0.02 SOL other fees; 150
+signatures/h for non-exit transactions; alerts at 80%).
 
 No Jupiter routes live until the signer can verify them. Sending: persist signed bytes and
 signature first, `maxRetries: 0`, resend the same bytes until confirmed or block height
@@ -498,9 +504,14 @@ signer and keep only swap-program log lines. pubsub-limit meaning: 3 subscriptio
 connection. WebSocket 24/7: Phase 7 soak. Landing, latency: pessimistic defaults. CU and fee
 medians: own recorder. Graduation timing: no entries above 90% curve progress. Legacy SPL
 holder query: else probe-payer or reject. AMM v4, CLMM, DLMM, Orca fees: unsupported. Jito
-tip floor: minimum tips only. Anthropic spend cap: local. Phase 2 checks: Docker digest;
-Compose file-secret mode and uid without Swarm; BuildKit `RUN --network=none`; Bot API
-link-preview field; grammy's transitive packages. Phase 8: socket ownership, logging `none`.
+tip floor: minimum tips only. Anthropic spend cap: local. Phase 2 checks, each with its
+fallback: Docker digest; Compose file secrets without Swarm (assume mode and uid are ignored:
+the owner sets 0400 and ownership on the host file, and the bot refuses to start on Linux if
+a secret file is readable by group or others); BuildKit `RUN --network=none` (else build the
+test stage as an image and run it with `docker run --network none --read-only`); Bot API
+link-preview field (we send no URLs except our own Solscan link anyway). grammy is replaced
+(THREAT_MODEL s.6). Phase 8: socket ownership (shared group, 0660 socket in a 0750
+directory); logging `none` (checked on the host with `docker inspect` by the backup script).
 
 ## 14. Decisions for the owner
 
@@ -534,7 +545,10 @@ link-preview field; grammy's transitive packages. Phase 8: socket ownership, log
     `signer arm`, `apply-pending`, `docker inspect`, `docker compose config`, and `docker
     exec`/`run`/`cp` aimed at the signer, secrets or live wallet; a hook test each. Regexes
     miss indirection, so also enable the Claude Code sandbox with deny-read for `secrets/`,
-    `*.key`, `*.pem` and env files (settings verified first). Recommended: yes.
+    `*.key`, `*.pem` and env files (settings verified first) where it runs. It does not run on
+    native Windows, and `docker` runs outside it everywhere, so on your PC the real control is
+    that no VPS secret ever exists there (a separate paper-only Telegram bot, no Anthropic
+    key). Recommended: yes; needed before any key exists.
 15. **GitHub (you do this; not done)**: 2FA on your account; protect `main` (CI must pass,
     review required); only you create release tags, which `ops/update.sh` deploys.
     Recommended: yes, before Phase 7.
