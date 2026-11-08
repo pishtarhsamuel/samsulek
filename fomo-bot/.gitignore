@@ -19,3 +19,6 @@ npm-debug.log*
 /logs/
 /dist/
 /coverage/
+# Raw recordings (may hold third-party data with redistribution limits, or FOMO users'
+# addresses before scrubbing): never committed. Only scrubbed or synthetic fixtures are.
+/tests/fixtures-raw/
