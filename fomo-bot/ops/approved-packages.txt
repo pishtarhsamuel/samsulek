@@ -1,0 +1,9 @@
+# Every package allowed in package-lock.json, as name@version sha512 integrity.
+# Added only after a security-auditor APPROVED verdict in docs/REVIEWS.md. CI fails if the
+# lockfile holds anything not listed here (new transitive packages included).
+# Approved 2026-11-08 (dev-only):
+typescript@6.0.3 sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==
+fast-check@4.10.2 sha512-iK2f+YrcmoeGqk6fA0ea2bptcu/itMIm4NfEozq6N25+aG6h7s5HZbB/k1aV7b5w5sFLMCbbtRUsTVR+BgC3xw==
+pure-rand@8.4.2 sha512-vvuOGgcuPJAirlHvuQw1TrOiw7ptaIXXmIbNuiNOY6lNGJJH49PQ1Kj4nd783nPdQhQdicgOjVI2yI/9BD6/Ng==
+@types/node@26.6.6 sha512-MzQj+8Kx3XI40OmUAE6Qoh58ZMNstNNMwn2nfd3qWsfe7nDNSqJNzes4njhz6AHwrSHOffSLwXU6yb474Q4aog==
+undici-types@8.9.0 sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg==

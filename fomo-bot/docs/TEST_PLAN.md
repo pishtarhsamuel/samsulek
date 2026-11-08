@@ -21,7 +21,7 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
 - No network in unit, property, integration or chaos tests: providers, Telegram and
   Anthropic are in-process fakes (node:http for HTTP-level fakes). Opt-in `@network` tests
   are read-only, paced under the budget table, never in CI.
-- No secrets: a vitest setup file makes the secrets loader throw (root `no_side_effects`
+- No secrets: `tests/setup/no-secrets.ts`, loaded with `node --import`, makes the secrets loader throw (root `no_side_effects`
   pattern), so no test and no command Claude runs can load the owner's secret files.
 - Deterministic: an injected clock (wall and monotonic), seeded random numbers (seed logged
   on failure), fixed fixtures. No `Date.now()` or `Math.random()` outside `core/clock` and
@@ -199,9 +199,12 @@ is a floor, not proof: the property and chaos tests above are required regardles
 
 Locally: inside Docker (`docker compose run --rm --build test`, which runs the test stage)
 or, for development only, natively from `fomo-bot/` with `npm ci --ignore-scripts`,
-`npm run typecheck` (`tsc --noEmit`), `npm run lint` (`eslint .`), `npm test`
-(`vitest run`) and `npm run test:coverage`. Root checks before every commit (repository
-root): `uv run pytest`, `uv run ruff check src tests`, `uv run mypy`.
+`npm run typecheck` (`tsc --noEmit`), `npm test` (Node's built-in `node:test`, running the
+`.ts` files directly), `npm run test:coverage` (Node's coverage, then
+`tests/tools/check-coverage.ts` checks every file of the lcov report against s.10) and
+`npm run check:lockfile`. The import rules are a node:test test using the TypeScript
+compiler API; eslint is deferred until it has its own review. Root checks before every
+commit (repository root): `uv run pytest`, `uv run ruff check src tests`, `uv run mypy`.
 
 Secret scanning: a committed `.gitleaks.toml` extends the default rules with: JSON arrays of
 64 integers, base58 strings of 87-88 characters, `hc-ping.com/` URLs, Telegram bot tokens
@@ -218,7 +221,8 @@ CI (GitHub Actions; actions pinned by commit SHA; `permissions: contents: read`;
    (new transitive packages fail the build), integrity sha512 only, every `resolved` URL on
    registry.npmjs.org; `npm ci --ignore-scripts`; `npm audit signatures`;
    `npm audit --audit-level=moderate`. The image build's first stage runs the same checks.
-2. Checks: typecheck, lint, vitest with coverage thresholds, on ubuntu-latest and
+2. Checks: typecheck, the node:test suite with the per-file coverage gate (and its canary
+   tests), and a check that `.npmrc` holds no `_auth`, `_authToken` or `//host:` lines, on ubuntu-latest and
    windows-latest (paths, LF endings, ASCII output, run lock); the Docker build with its
    no-network test stage on ubuntu-latest.
 3. Secrets: `gitleaks git --redact --verbose` with `.gitleaks.toml` over the full history

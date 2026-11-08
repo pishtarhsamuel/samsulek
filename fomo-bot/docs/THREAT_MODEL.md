@@ -67,7 +67,8 @@ change Claude Code guardrails or GitHub settings are proposals only (section 7).
 
 Process hygiene: core dumps off (`ulimits core 0`); start-up refuses `--heapsnapshot-signal`,
 `--report-*` and `--inspect` in `process.execArgv` or `NODE_OPTIONS`. Tests and any command
-Claude runs never load the secrets: a vitest setup file makes the loader throw, like the root
+Claude runs never load the secrets: `tests/setup/no-secrets.ts`, loaded with `node --import`
+before every test file and inherited by child processes, makes the loader throw, like the root
 `no_side_effects` fixture. Deleting values from `process.env` is not a control and is not used.
 Anthropic, Telegram and hc-ping base URLs are code constants, so no config can redirect a secret.
 
@@ -134,8 +135,9 @@ The signer refuses every request unless all rules hold. Invariant 12 tests each 
 4. Optional weekly database copy to the owner's Telegram: scanned, no secrets by design.
 5. Dependencies (exact versions after the 7-day cooldown): `@solana/kit`,
    `@solana-program/system`, `token`, `token-2022`, `compute-budget`, `zod` (pinned exactly;
-   4.6.7 is current); dev: `typescript` 6.0.3, `eslint`, `typescript-eslint`, `vitest`,
-   `fast-check`, a vitest coverage provider (not yet researched: UNVERIFIED). Excluded:
+   4.6.7 is current); dev (approved 2026-11-08, REVIEWS.md): `typescript` 6.0.3, `fast-check`
+   4.10.2 (+ `pure-rand` 8.4.2), `@types/node` 26.6.6 (+ `undici-types` 8.9.0). Tests use
+   Node's built-in `node:test` and coverage instead of vitest; eslint is deferred. Excluded:
    web3.js v1, `@pump-fun/*`, `dotenv`, `pino`, `@anthropic-ai/sdk`, `ws`, `undici`.
    **grammy: recommend replacing** it with our own small Bot API client over fetch (only
    getUpdates, sendMessage, answerCallbackQuery), because grammy pulls node-fetch 2,

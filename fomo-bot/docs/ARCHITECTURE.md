@@ -43,8 +43,9 @@ enums, namespaces or parameter properties); `tsc --noEmit` type-checks; no build
 | reports/, ops/ | alert texts, reports, CSV export / health, heartbeat, disk, memory, loop lag, run lock, backups | core, portfolio / storage |
 | app/, cli/ | composition root (the only place that constructs executors), scheduler / `kill`, `reset-halt`, `arm-live`, `pair`, `apply-pending`, `stats:export`, `backup` | all |
 
-Import rules are enforced twice: eslint `no-restricted-imports` per folder and a vitest
-test that parses every import. Loops: exit marks 5 s (mint re-read 60 s, P0); strategy
+Import rules are enforced by a node:test test that parses every source file with the
+TypeScript compiler API (`tests/architecture/import-graph.test.ts`; eslint deferred, its own
+review first). Loops: exit marks 5 s (mint re-read 60 s, P0); strategy
 ticks crowdflow 5 s, launch 15 s (P2), momentum 30 s (P4); health 10 s (anchors 2 min,
 drift 5 min); reconciliation 5 min and after every trade; equity 1 min; backup 03:30, AI
 review 08:30, daily summary 09:00 Athens.
@@ -158,6 +159,7 @@ export const HARD_CAPS = { tradePctBps: 1_000, openPositions: 4, exposurePctBps:
   signerDailyBuyLamports: 350_000_000n, signerDailyOtherFeeLamports: 20_000_000n, signerSignaturesPerHour: 150 } as const;
 // TUNABLE_BOUNDS: every /set bound of RISK_POLICY s.12; a test asserts each max <= its HARD_CAPS entry (floors: min >=).
 // LIVE_CAPS: the root's stricter values, used in live until owner decision 9 (RISK_POLICY s.2).
+// HARD_CAPS, TUNABLE_BOUNDS and LIVE_CAPS all live in config/caps.ts, the one file the guard hook makes ask (owner OK).
 const ServerFile = z.object({   // /config/fomo-bot.json from /etc/fomo-bot (read-only mount), never in git or Telegram
   providers: z.array(ProviderSpec).min(1), paperStartingLamports: LamportsString,
   withdrawAddress: AddressStr.optional(), probePayer: AddressStr.optional(), // public keys only: rejects 64-byte keys, arrays
@@ -450,7 +452,7 @@ providers, hard caps, the paper model or code.
 |---|---|
 | Containers | `bot`, plus `signer` in Phase 8, separate images; no container mounts the Docker socket. Node 26.13.0 base pinned by digest (UNVERIFIED), separate numeric non-root uids, `cap_drop: [ALL]`, `no-new-privileges`, pids limit 256, read-only root fs, tmpfs /tmp, memory 700 MB, `--max-old-space-size=400`, core dumps off (`ulimits core 0`), no `--heapsnapshot-signal` or `--report` (start-up refuses them), `restart: unless-stopped`, no published ports; signer logging driver `none` |
 | Files on the server | checkout `/opt/fomo-bot` holds code only; `/etc/fomo-bot/` server file and bot secrets (Compose `secrets` file mounts, 0400, bot uid); `/srv/fomo-signer/` key, policy, counters; volume `/data` (db, logs, backups, run lock) |
-| Image build | multi-stage Dockerfile: `npm ci --ignore-scripts` plus the lockfile checks of TEST_PLAN s.11; tests, typecheck and lint in a throwaway stage with `RUN --network=none`; runtime stage `npm ci --omit=dev --ignore-scripts` and `src/`. Allowlist `.dockerignore`: `*`, then `!src/`, `!tests/`, `!package*.json`, `!.npmrc`, `!tsconfig.json`, `!eslint.config.js`, `!vitest.config.ts` |
+| Image build | multi-stage Dockerfile: `npm ci --ignore-scripts` plus the lockfile checks of TEST_PLAN s.11; tests, typecheck and lint in a throwaway stage with `RUN --network=none`; runtime stage `npm ci --omit=dev --ignore-scripts` and `src/`. Allowlist `.dockerignore`: `*`, then `!src/`, `!tests/`, `!package*.json`, `!.npmrc`, `!tsconfig.json` |
 | Health, heartbeat | Docker healthcheck `node src/ops/healthcheck.ts` (`data/run/heartbeat.json` older than 60 s = unhealthy); Healthchecks.io ping each minute while exits can be managed, `/fail` with reason after a breaker is open 10 min; 5 min grace, email and Telegram channels; second check `fomo-notice` for live loosenings |
 | Logs | JSONL decisions `data/logs/decisions-YYYY-MM-DD.jsonl` (14 days); Docker json-file 10 MB x 5 (signer: none); ASCII; redactor on every line |
 | Update / rollback | npm and node never run on the host. `ops/update.sh` deploys only an owner-created tag on main: shows tag, commit hash and subject; the owner checks on GitHub that CI passed for that hash and types its first 8 characters; then `docker build` (tests inside), DB backup, swap, health within 2 min else automatic rollback; `ops/rollback.sh`: previous image (DB restore only if a migration ran) |
