@@ -10,11 +10,20 @@ DENY (Claude cannot do these at all):
   - dump environment variables or expand secret-looking variables (sh/PowerShell/cmd,
     python/node/perl/ruby/awk/jq, /proc/*/environ, Windows registry Environment)
   - move funds or create wallets via the Solana CLI
+  - read, write, or search key material: *.key and *.pem files and anything in a
+    `secrets` folder (any reader: cat, python, node, cp, base64, git show, ssh, scp)
+  - run owner-only fomo-bot commands (wallet-create, wallet-backup, arm-live,
+    signer arm, apply-pending)
+  - Docker commands that can print secrets or reach the signer (docker inspect,
+    docker compose config, exec/run/cp/attach/logs aimed at the signer, secrets or
+    the live wallet)
+  - modify fomo-bot runtime data (fomo-bot/data/: KILL flag, database, backups)
   - searches that ignore .gitignore, `git clean -x`, `git stash --all`
 
 ASK (the owner must approve in the permission prompt):
   - edit guardrail files: .claude/settings*.json, .claude/hooks/,
-    config/risk.yaml (hard risk limits), ops/go_live_checklist.md
+    config/risk.yaml (hard risk limits), ops/go_live_checklist.md,
+    fomo-bot/src/config/caps.ts (fomo-bot hard caps), fomo-bot/ops/go-live-checklist.md
 
 Wildcards are judged by what they could MATCH (brace expansion + fnmatch), not by
 how they look: bash rules for leading dots in the Bash tool, Windows rules (where
@@ -95,6 +104,41 @@ STATE_NAMES = (
 )
 
 KEYPAIR_RE = re.compile(r"(?:\.config[/\\]solana|\bid\.json\b|keypair[^\s/\\]*\.json)", re.I)
+
+# Key material (fomo-bot keeps server secrets in a `secrets` folder and the live key in a
+# `.key` file): any mention in a command is refused, whatever program would read it.
+SECRET_DIR_IN_SHELL_RE = re.compile(r"(?:^|[\s/\\'\"=:~])secrets(?=$|[\s/\\'\";|&)])", re.I)
+KEY_FILE_IN_SHELL_RE = re.compile(r"[\w./\\~-]\.(?:key|pem)\b", re.I)
+KEY_SAMPLE_NAMES = ("wallet.key", "live-wallet.key", "server.pem")
+
+# Owner-only fomo-bot commands: wallet creation and backup, arming live, applying a delayed
+# loosening. The owner runs them by hand at the server.
+FOMO_OWNER_ONLY_RE = re.compile(
+    r"\b(?:wallet-create|wallet-backup|arm-live|apply-pending)\b|\bsigner\s+arm\b", re.I
+)
+
+# Docker commands that can print secrets or reach the signer.
+DOCKER_SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"\bdocker(?:-compose)?\b[^|;&]*\binspect\b", re.I),
+        "docker inspect can print container environment and secret mounts",
+    ),
+    (
+        re.compile(r"\bdocker(?:\s+compose|-compose)\b[^|;&]*\bconfig\b", re.I),
+        "docker compose config prints the resolved configuration, secrets included",
+    ),
+    (
+        re.compile(
+            r"\bdocker(?:\s+compose|-compose)?\b[^|;&]*\b(?:exec|run|cp|attach|logs)\b[^|;&]*"
+            r"\b(?:signer|secrets|live-wallet)\b",
+            re.I,
+        ),
+        "docker command aimed at the signer, a secrets folder or the live wallet",
+    ),
+]
+
+# fomo-bot runtime data (KILL flag, database, backups): written only by the bot and the owner.
+FOMO_DATA_IN_SHELL_RE = re.compile(r"fomo-bot[/\\]+data(?=$|[\s/\\'\";|&)])", re.I)
 
 # Prefixes after which a command word starts (so `cmd /c set`, `bash -c env`, `{ env; }` count).
 _CMD_START = (
@@ -233,7 +277,9 @@ STATE_IN_SHELL_RE = re.compile(
 PROTECTED_IN_SHELL_RE = re.compile(
     r"(?:\.claude[/\\](?:settings[^\s/\\'\"]*\.json|hooks\b)"
     r"|config[/\\]risk\.ya?ml"
-    r"|ops[/\\]go_live_checklist\.md)",
+    r"|ops[/\\]go_live_checklist\.md"
+    r"|fomo-bot[/\\]src[/\\]config[/\\]caps\.ts"
+    r"|fomo-bot[/\\]ops[/\\]go-live-checklist\.md)",
     re.I,
 )
 DISABLE_HOOKS_RE = re.compile(r"disableAllHooks", re.I)
@@ -303,6 +349,36 @@ def glob_could_match(
     return False
 
 
+def key_file_glob(text: str, dotfiles_need_explicit_dot: bool) -> bool:
+    """Could a wildcard word with an extension-like last segment (``*.key``, ``*.*``) match a key file?"""
+    for word in _WORD_SPLIT_RE.split(text):
+        w = word.strip("'\"")
+        if not w or not (set(w) & _GLOB_CHARS):
+            continue
+        for alt in brace_expand(w):
+            for seg in _segments(alt, last_only=True):
+                seg = seg.split(":", 1)[0].rstrip(" ")
+                if "." in seg and pattern_matches(seg, KEY_SAMPLE_NAMES, dotfiles_need_explicit_dot):
+                    return True
+    return False
+
+
+def fomo_data_glob(text: str, dotfiles_need_explicit_dot: bool) -> bool:
+    """Could a wildcard word name fomo-bot/data (``fomo-bot/*``, ``fomo-bot/d*``, ``*/data``)?"""
+    for word in _WORD_SPLIT_RE.split(text):
+        w = word.strip("'\"")
+        if not w or not (set(w) & _GLOB_CHARS):
+            continue
+        for alt in brace_expand(w):
+            segs = [s.split(":", 1)[0].rstrip(" .") for s in re.split(r"[\\/]+", alt) if s]
+            for i in range(len(segs) - 1):
+                if pattern_matches(segs[i], ("fomo-bot",), dotfiles_need_explicit_dot) and pattern_matches(
+                    segs[i + 1], ("data",), dotfiles_need_explicit_dot
+                ):
+                    return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # File-tool path patterns (applied to normalised, lower-case paths)
 # ---------------------------------------------------------------------------
@@ -312,8 +388,11 @@ PROTECTED_PATH_RES = [
     re.compile(r"(?:^|/)\.claude/hooks(?:/|$)"),
     re.compile(r"(?:^|/)config/risk\.ya?ml$"),
     re.compile(r"(?:^|/)ops/go_live_checklist\.md$"),
+    re.compile(r"(?:^|/)fomo-bot/src/config/caps\.ts$"),
+    re.compile(r"(?:^|/)fomo-bot/ops/go-live-checklist\.md$"),
 ]
 STATE_PATH_RE = re.compile(r"(?:^|/)state(?:/|$)")
+FOMO_DATA_PATH_RE = re.compile(r"(?:^|/)fomo-bot/data(?:/|$)")
 PROC_ENVIRON_RE = re.compile(r"^/proc/.*/environ$")
 
 FILE_TOOLS = {"Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "NotebookRead"}
@@ -345,6 +424,8 @@ def is_secret_path(path: str) -> bool:
         return True
     if name == "id.json" or ("keypair" in name and name.endswith(".json")):
         return True
+    if name.endswith((".key", ".pem")) or "secrets" in p.split("/"):
+        return True
     return ".config/solana" in p or bool(PROC_ENVIRON_RE.match(p))
 
 
@@ -357,14 +438,27 @@ def is_state_path(path: str) -> bool:
     return bool(STATE_PATH_RE.search(_norm(path)))
 
 
+def is_fomo_data_path(path: str) -> bool:
+    return bool(FOMO_DATA_PATH_RE.search(_norm(path)))
+
+
 def secret_glob(pattern: str) -> bool:
-    """True if a Grep/Glob path or glob could target .env or keypair files (ripgrep rules: `*` matches dots)."""
+    """True if a Grep/Glob path or glob could target .env, keypair, .key/.pem files or a `secrets` folder.
+
+    ripgrep rules: `*` matches dots. Plain `*` and `**` segments are not compared with `secrets`,
+    so ordinary globs such as ``src/**/*.py`` stay usable; ignore files still skip those folders.
+    """
     p = _norm(pattern)
     if is_secret_path(p) or "keypair" in p or ENV_FILE_RE.search(p):
         return True
     for alt in brace_expand(pattern):
-        for seg in _segments(alt, last_only=True):
-            if seg and pattern_matches(seg, (*ENV_NAMES, "id.json"), dotfiles_need_explicit_dot=False):
+        segs = _segments(alt, last_only=False)
+        for i, seg in enumerate(segs):
+            if i == len(segs) - 1 and pattern_matches(
+                seg, (*ENV_NAMES, "id.json", *KEY_SAMPLE_NAMES), dotfiles_need_explicit_dot=False
+            ):
+                return True
+            if seg not in ("*", "**") and pattern_matches(seg, ("secrets",), dotfiles_need_explicit_dot=False):
                 return True
     return False
 
@@ -394,6 +488,16 @@ def check_shell(command: str, tool: str = "Bash") -> Decision:
             return ("deny", "Blocked: command touches a .env file. Claude never reads secrets.")
         if KEYPAIR_RE.search(cmd):
             return ("deny", "Blocked: command touches a wallet keypair file.")
+        if SECRET_DIR_IN_SHELL_RE.search(cmd) or KEY_FILE_IN_SHELL_RE.search(cmd):
+            return ("deny", "Blocked: command touches a secrets folder or a .key/.pem file. Claude never reads secrets.")
+        if FOMO_OWNER_ONLY_RE.search(cmd):
+            return (
+                "deny",
+                "Blocked: wallet creation and backup, arming live and applying delayed changes are owner-only.",
+            )
+        for pat, why in DOCKER_SECRET_PATTERNS:
+            if pat.search(cmd):
+                return ("deny", f"Blocked: {why}. Claude never reads secrets.")
         for pat, why in FUNDS_PATTERNS:
             if pat.search(cmd):
                 return ("deny", f"Blocked: command {why}. Only the owner moves funds or manages wallets.")
@@ -401,6 +505,8 @@ def check_shell(command: str, tool: str = "Bash") -> Decision:
         return ("deny", "Blocked: code calling the risk-state API. Only the bot and the owner change risk state.")
     if glob_could_match(command, ENV_NAMES, dotfiles_need_explicit_dot=not windows, last_only=True):
         return ("deny", "Blocked: a wildcard in this command could match the .env file. Name files explicitly.")
+    if key_file_glob(command, dotfiles_need_explicit_dot=not windows):
+        return ("deny", "Blocked: a wildcard in this command could match a .key or .pem file. Name files explicitly.")
     # Anchored "bare command" dumps are checked with quoted text blanked out (a grep
     # alternation like "a|env" is not a pipe); everything else is checked on the raw text.
     for pat, why in BARE_DUMP_PATTERNS:
@@ -423,6 +529,12 @@ def check_shell(command: str, tool: str = "Bash") -> Decision:
         or glob_could_match(command, STATE_NAMES, dotfiles_need_explicit_dot=not windows, last_only=False)
     ):
         return ("deny", "Blocked: command may modify bot state (halt/kill flags, ledger). Owner only.")
+    if writes and (
+        FOMO_DATA_IN_SHELL_RE.search(command)
+        or FOMO_DATA_IN_SHELL_RE.search(stripped)
+        or fomo_data_glob(command, dotfiles_need_explicit_dot=not windows)
+    ):
+        return ("deny", "Blocked: command may modify fomo-bot runtime data (KILL flag, database). Owner only.")
     for cmd in (command, stripped):
         if DISABLE_HOOKS_RE.search(cmd):
             return ("ask", "Command mentions disableAllHooks. Owner approval required.")
@@ -436,9 +548,11 @@ def check_file_tool(tool: str, tool_input: dict[str, Any]) -> Decision:
         tool_input.get("file_path") or tool_input.get("notebook_path") or tool_input.get("path") or ""
     )
     if path and is_secret_path(path):
-        return ("deny", "Blocked: .env, wallet keypair and process-environment files are off-limits.")
+        return ("deny", "Blocked: .env, keypair, .key/.pem, secrets-folder and process-environment files are off-limits.")
     if tool in WRITE_TOOLS and path and is_state_path(path):
         return ("deny", "Blocked: bot runtime state (halt/kill flags, ledger) is written only by the bot.")
+    if tool in WRITE_TOOLS and path and is_fomo_data_path(path):
+        return ("deny", "Blocked: fomo-bot runtime data (KILL flag, database) is written only by the bot and the owner.")
     if tool in WRITE_TOOLS and path and is_protected_path(path):
         return ("ask", f"Editing guardrail file {path} needs the owner's explicit approval.")
     return None
@@ -447,7 +561,7 @@ def check_file_tool(tool: str, tool_input: dict[str, Any]) -> Decision:
 def check_search_tool(path_like_values: list[Any]) -> Decision:
     for val in path_like_values:
         if isinstance(val, str) and val and secret_glob(val):
-            return ("deny", "Blocked: search could include .env or wallet keypair files.")
+            return ("deny", "Blocked: search could include .env, keypair, .key/.pem files or a secrets folder.")
     return None
 
 

@@ -9,6 +9,9 @@
       "Read(./**/*.key)",
       "Read(**/*.key)",
       "Edit(**/*.key)",
+      "Read(**/*.pem)",
+      "Edit(**/*.pem)",
+      "Edit(./fomo-bot/data/**)",
       "Read(./**/*keypair*.json)",
       "Read(./.env)",
       "Read(./.env.*)",
@@ -33,7 +36,9 @@
     "ask": [
       "Edit(./.claude/**)",
       "Edit(./config/risk.yaml)",
-      "Edit(./ops/go_live_checklist.md)"
+      "Edit(./ops/go_live_checklist.md)",
+      "Edit(./fomo-bot/src/config/caps.ts)",
+      "Edit(./fomo-bot/ops/go-live-checklist.md)"
     ]
   },
   "hooks": {

@@ -584,5 +584,161 @@ class FailsClosed(unittest.TestCase):
         self.assertIsNone(run_hook("{}"))
 
 
+class FomoBotKeyMaterial(unittest.TestCase):
+    """Owner decision 14 (2026-11-07): key files, secrets folders, owner-only commands, Docker."""
+
+    def test_file_tools_on_keys_and_secret_folders_denied(self) -> None:
+        for path in [
+            "fomo-bot/secrets/telegram_bot_token",
+            "/etc/fomo-bot/secrets/anthropic_key",
+            "/srv/fomo-signer/live-wallet.key",
+            "C:\\Users\\me\\wallet.KEY",
+            "certs/server.pem",
+            "fomo-bot/secrets",
+            "fomo-bot/Secrets/x",
+        ]:
+            for tool in ("Read", "Edit", "Write"):
+                with self.subTest(tool=tool, path=path):
+                    self.assertEqual(decide(tool, file_path=path, content="x"), "deny")
+
+    def test_file_tool_lookalikes_allowed(self) -> None:
+        for path in [
+            "fomo-bot/src/config/secrets.ts",
+            "fomo-bot/docs/THREAT_MODEL.md",
+            "src/samsulek/credentials.py",
+            "fomo-bot/src/core/keys.ts",
+            "notes/keynote.md",
+            "fomo-bot/src/config/secrets.test.ts",
+        ]:
+            with self.subTest(path=path):
+                self.assertIsNone(decide("Read", file_path=path))
+
+    def test_shell_reads_of_key_material_denied(self) -> None:
+        for cmd in [
+            "cat fomo-bot/secrets/telegram_bot_token",
+            "python3 -c \"print(open('/srv/fomo-signer/live-wallet.key').read())\"",
+            "node -e \"require('fs').readFileSync('wallet.key')\"",
+            "base64 server.pem",
+            "cp /etc/fomo-bot/secrets/anthropic_key /tmp/",
+            "git show HEAD:fomo-bot/secrets/x",
+            "ssh vps cat ~/bot/secrets/k",
+            "scp vps:/srv/fomo-signer/live-wallet.key .",
+            "tar czf b.tgz secrets",
+            "ls *.key",
+            "cat ~/keys/*.pem",
+            "xxd id_ed25519.pem",
+            "cat 'fomo-bot/secrets/x'",
+            "cat fomo-bot\\secrets\\x",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("Bash", command=cmd), "deny")
+
+    def test_shell_lookalikes_allowed(self) -> None:
+        for cmd in [
+            "git status",
+            'python3 -c "print(sorted(d.keys()))"',
+            "jq '.key' data.json",
+            "ls fomo-bot/src/config",
+            "cat fomo-bot/src/config/secrets.ts",
+            "docker compose run --rm --build test",
+            "grep -n keyboard notes.md",
+            "echo secret-sauce",
+            "ls fomo-bot/src/**/*.ts",
+            "uv run pytest -q",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(decide("Bash", command=cmd))
+
+    def test_owner_only_fomo_commands_denied(self) -> None:
+        for cmd in [
+            "docker compose run --rm signer wallet-create",
+            "ops/wallet-backup.sh",
+            "npx fomo arm-live",
+            "bash ops/arm-live.sh",
+            "node src/cli/main.ts apply-pending",
+            "fomo signer arm",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("Bash", command=cmd), "deny")
+
+    def test_docker_secret_exposure_denied(self) -> None:
+        for cmd in [
+            "docker inspect fomo-bot-bot-1",
+            "docker container inspect bot",
+            "docker compose config",
+            "docker-compose config",
+            "docker exec -it fomo-bot-signer-1 sh",
+            "docker compose run --rm signer sh",
+            "docker cp fomo-bot-signer-1:/srv/fomo-signer/x .",
+            "docker compose logs signer",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("Bash", command=cmd), "deny")
+
+    def test_docker_dev_commands_allowed(self) -> None:
+        for cmd in [
+            "docker compose build",
+            "docker ps",
+            "docker compose up -d bot",
+            "docker compose run --rm test",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(decide("Bash", command=cmd))
+
+    def test_search_tools_cannot_target_keys_or_secret_folders(self) -> None:
+        for pattern in ["*.key", "**/*.pem", "fomo-bot/secrets/**", "sec*/x", "**/secrets/*"]:
+            with self.subTest(pattern=pattern):
+                self.assertEqual(decide("Glob", pattern=pattern), "deny")
+        self.assertEqual(decide("Grep", pattern="x", path="fomo-bot/secrets"), "deny")
+        self.assertEqual(decide("Grep", pattern="x", glob="*.key"), "deny")
+        for pattern in ["src/**/*.py", "fomo-bot/src/**/*.ts", "*.md", "fomo-bot/docs/*.md"]:
+            with self.subTest(pattern=pattern):
+                self.assertIsNone(decide("Glob", pattern=pattern))
+        self.assertIsNone(decide("Grep", pattern="secrets", path="fomo-bot/src"))
+
+
+class FomoBotGuardrailsAndData(unittest.TestCase):
+    """Owner decision 13 (2026-11-07): fomo-bot hard caps, checklist and runtime data."""
+
+    def test_fomo_guardrail_files_ask(self) -> None:
+        for path in ["fomo-bot/src/config/caps.ts", "/home/me/samsulek/fomo-bot/ops/go-live-checklist.md"]:
+            for tool in ("Edit", "Write"):
+                with self.subTest(tool=tool, path=path):
+                    self.assertEqual(decide(tool, file_path=path, content="x"), "ask")
+        for cmd in ["sed -i 's/1/2/' fomo-bot/src/config/caps.ts", "rm fomo-bot/ops/go-live-checklist.md"]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("Bash", command=cmd), "ask")
+        self.assertIsNone(decide("Read", file_path="fomo-bot/src/config/caps.ts"))
+        self.assertIsNone(decide("Bash", command="cat fomo-bot/src/config/caps.ts"))
+
+    def test_fomo_runtime_data_writes_denied(self) -> None:
+        for cmd in [
+            "rm -rf fomo-bot/data",
+            "rm fomo-bot/data/run/KILL",
+            "echo x > fomo-bot/data/run/kill",
+            "cp a.db fomo-bot/data/bot.db",
+            "rm -rf fomo-bot/*",
+            "mv fomo-bot/d*/x /tmp",
+            "rm -rf fomo-bot\\data",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decide("Bash", command=cmd), "deny")
+        for path in ["fomo-bot/data/bot.db", "fomo-bot/data/run/KILL", "/home/u/samsulek/fomo-bot/data/x"]:
+            for tool in ("Write", "Edit"):
+                with self.subTest(tool=tool, path=path):
+                    self.assertEqual(decide(tool, file_path=path, content="x"), "deny")
+
+    def test_fomo_runtime_data_reads_and_root_data_allowed(self) -> None:
+        for cmd in [
+            "ls fomo-bot/data",
+            "cat fomo-bot/data/run/KILL",
+            "rm -rf data/solana/tmp",
+            "rm src/samsulek/data/x.pyc",
+        ]:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(decide("Bash", command=cmd))
+        self.assertIsNone(decide("Read", file_path="fomo-bot/data/run/KILL"))
+
+
 if __name__ == "__main__":
     unittest.main()
