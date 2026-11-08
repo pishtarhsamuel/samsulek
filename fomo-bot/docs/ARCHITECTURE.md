@@ -537,10 +537,11 @@ directory); logging `none` (checked on the host with `docker inspect` by the bac
     natively with npm (simpler, riskier). Recommended: Docker Desktop.
 12. **Live loosening waits 24 h** (unsafe-direction setting or /resume) with an email, so a
     stolen Telegram cannot loosen and strike at once. Recommended: yes.
-13. **Guardrails, part 1 (your OK needed; not done)**: add `fomo-bot/src/config/caps.ts` and
+13. **Guardrails, part 1 (approved; applied 2026-11-08, commit 4c2aa1b)**: add `fomo-bot/src/config/caps.ts` and
     `fomo-bot/ops/go-live-checklist.md` to the "ask" list in `.claude/settings.json`; block
     writes to `fomo-bot/data/` (KILL flag, database) like the root `state/`. Recommended: yes.
-14. **Guardrails, part 2 (your OK needed; not done)**: Read and Edit deny for `**/*.pem`,
+14. **Guardrails, part 2 (approved; applied 2026-11-08, commit 4c2aa1b, except the sandbox:
+    see THREAT_MODEL s.7)**: Read and Edit deny for `**/*.pem`,
     `**/*.key`, `**/secrets/**`; the hook blocks `wallet-create`, `wallet-backup`, `arm-live`,
     `signer arm`, `apply-pending`, `docker inspect`, `docker compose config`, and `docker
     exec`/`run`/`cp` aimed at the signer, secrets or live wallet; a hook test each. Regexes

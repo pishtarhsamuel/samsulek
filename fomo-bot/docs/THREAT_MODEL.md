@@ -150,7 +150,15 @@ The signer refuses every request unless all rules hold. Invariant 12 tests each 
 6. Node 26.13.0 image tag and digest; gitleaks v8.30.1: verify the release SHA256 against its
    published checksums before installing (UNVERIFIED until done).
 
-## 7. Guardrail and repository gaps (need the owner's OK; not done)
+## 7. Guardrail and repository gaps
+
+Status 2026-11-08: the owner approved decisions 13 and 14 (DECISIONS.md D4), and they are
+applied in commit 4c2aa1b, with a hook test for each new block, except the Claude Code
+sandbox. Its official docs show it cannot run in the cloud container (no bubblewrap) or on
+native Windows; where it runs it auto-approves sandboxed commands by default and starts
+with an empty network allowlist. So it stays off until the owner decides. Decision 15
+(GitHub 2FA, protected main) is the owner's to do before Phase 7. The text below is the
+original gap description.
 
 The root hook `.claude/hooks/guard.py` blocks `.env*` and keypair files, setting any
 `*_LIVE` variable to a truthy value (so `FOMO_LIVE=true` is blocked for Claude), and
