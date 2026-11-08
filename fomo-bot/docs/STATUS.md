@@ -2,16 +2,17 @@
 
 Updated: 2026-11-08
 
-**Phase 2 (foundations, tests first): starting.** Phase 1's design is approved with every
-recommended answer (`docs/DECISIONS.md` D4).
+**Phase 2 (foundations, tests first): in progress.** Paper-only building blocks; nothing
+can trade, and no key or account exists anywhere.
 
-- Done: the guardrail changes you approved. Claude is now blocked from key files, secret
-  folders, owner-only server commands, secret-printing Docker commands and the bot's data
-  folder; edits to the bot's hard caps and go-live checklist need your OK. 11 new tests.
-- Not done: the Claude Code sandbox. It can't run in this cloud container or on Windows,
-  and where it runs it would remove prompts and block the network by default. Your call.
-- Next: the security reviewer checks the guardrail change and the first dependencies; then
-  the toolchain (Node 26.13.0, TypeScript) and the core money math, tests first.
+- Done: the toolchain the security reviewer approved (Node 26.13.0, TypeScript 6.0.3,
+  fast-check; 5 dev packages, exact pins, no install scripts), with gates that keep it that
+  way: lockfile allowlist, per-file coverage gate, architecture rules, a no-secrets test setup.
+- Done (steps 1-2 of 6): money units and checked math, and venue quote math (pools, the
+  pump.fun curve, fee tiers). 63 tests pass, including property tests; coverage 100% lines.
+- Next: step 3, the portfolio ledger (costs, rent, PnL); then the risk engine, config caps,
+  storage; then chain clients, the paper engine, Telegram and logging.
+- Open before Phase 3: four guard-hook fixes from the security review (REVIEWS.md).
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.
