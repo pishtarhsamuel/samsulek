@@ -9,9 +9,9 @@
     "node": "26.13.0"
   },
   "scripts": {
-    "test": "node --import ./tests/setup/no-secrets.ts --test \"tests/**/*.test.ts\"",
+    "test": "node --disallow-code-generation-from-strings --import ./tests/setup/no-secrets.ts --test \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test:coverage": "node -e \"require('node:fs').mkdirSync('coverage',{recursive:true})\" && node --import ./tests/setup/no-secrets.ts --test --experimental-test-coverage --test-coverage-include-all --test-coverage-include=\"src/**/*.ts\" --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/lcov.info \"tests/**/*.test.ts\" && node tests/tools/check-coverage.ts coverage/lcov.info",
+    "test:coverage": "node -e \"require('node:fs').mkdirSync('coverage',{recursive:true})\" && node --disallow-code-generation-from-strings --import ./tests/setup/no-secrets.ts --test --experimental-test-coverage --test-coverage-include-all --test-coverage-include=\"src/**/*.ts\" --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/lcov.info \"tests/**/*.test.ts\" && node tests/tools/check-coverage.ts coverage/lcov.info",
     "check:lockfile": "node tests/tools/check-lockfile.ts package-lock.json ops/approved-packages.txt"
   },
   "devDependencies": {

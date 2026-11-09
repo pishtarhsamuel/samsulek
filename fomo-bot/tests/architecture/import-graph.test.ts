@@ -103,6 +103,9 @@ function isTypePosition(node: ts.Identifier): boolean {
 /** Inside a type (annotation, alias, interface, `implements`): erased, never run. */
 function inTypeContext(node: ts.Node): boolean {
   for (let p = node.parent; p !== undefined; p = p.parent) {
+    if (ts.isExpressionWithTypeArguments(p)) {
+      continue; // `extends X` runs, `implements X` does not: the heritage clause above decides
+    }
     if (ts.isTypeNode(p)) {
       return true;
     }
@@ -133,11 +136,52 @@ function isDeclarationName(node: ts.Identifier): boolean {
   );
 }
 
-/** Every name the file declares anywhere (scope-insensitive: a local can only shadow, never add I/O). */
+/** Inside a `declare ...` statement or block: a promise about the outside, not a binding. */
+function isAmbient(node: ts.Node): boolean {
+  for (let a: ts.Node | undefined = node; a !== undefined; a = a.parent) {
+    if (ts.canHaveModifiers(a) && (ts.getModifiers(a) ?? []).some((m) => m.kind === ts.SyntaxKind.DeclareKeyword)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The identifier is a value this file really binds at runtime: a variable, parameter, function,
+ * class, enum or value import. Object keys, members, labels, the source side of an import alias,
+ * type-only imports and `declare` lines bind nothing, so they cannot excuse a global of that name.
+ */
+function isRuntimeBinding(node: ts.Identifier): boolean {
+  const p = node.parent;
+  if (isAmbient(p) || inTypeContext(node)) {
+    return false;
+  }
+  if (ts.isVariableDeclaration(p) || ts.isParameter(p) || ts.isBindingElement(p)) {
+    return p.name === node;
+  }
+  if (
+    ts.isFunctionDeclaration(p) || ts.isFunctionExpression(p) || ts.isClassDeclaration(p) ||
+    ts.isClassExpression(p) || ts.isEnumDeclaration(p)
+  ) {
+    return p.name === node;
+  }
+  if (ts.isImportClause(p)) {
+    return p.name === node && !p.isTypeOnly;
+  }
+  if (ts.isNamespaceImport(p)) {
+    return !p.parent.isTypeOnly;
+  }
+  if (ts.isImportSpecifier(p)) {
+    return p.name === node && !p.isTypeOnly && !p.parent.parent.isTypeOnly;
+  }
+  return false;
+}
+
+/** Every runtime binding of the file (scope-insensitive: a real local can only shadow, never add I/O). */
 function declaredNames(source: ts.SourceFile): Set<string> {
   const names = new Set<string>();
   const walk = (node: ts.Node): void => {
-    if (ts.isIdentifier(node) && isDeclarationName(node)) {
+    if (ts.isIdentifier(node) && isRuntimeBinding(node)) {
       names.add(node.text);
     }
     ts.forEachChild(node, walk);
@@ -146,10 +190,13 @@ function declaredNames(source: ts.SourceFile): Set<string> {
   return names;
 }
 
-/** No arguments, only `undefined`, or a spread: formats "now". */
+/** No arguments, only `undefined` or `void x`, or a spread: formats "now". */
 function formatsNow(args: ts.NodeArray<ts.Expression>): boolean {
-  return args.every((a) => ts.isIdentifier(a) && a.text === 'undefined') || args.some((a) => ts.isSpreadElement(a));
+  const empty = (a: ts.Expression): boolean => (ts.isIdentifier(a) && a.text === 'undefined') || ts.isVoidExpression(a);
+  return args.every(empty) || args.some((a) => ts.isSpreadElement(a));
 }
+
+const FORMATTERS = new Set(['format', 'formatToParts']);
 
 /** Why this use of Date, Math, Temporal or performance can read the clock or randomness, or null. */
 function clockProblem(node: ts.Identifier): string | null {
@@ -264,16 +311,22 @@ export function checkSource(rel: string, text: string): string[] {
         }
       } else if (ts.isIdentifier(node.expression) && node.expression.text === 'require') {
         problems.push(`${rel}: require() is not allowed`);
-      } else if (
-        !CLOCK_FILES.has(rel) &&
-        ts.isPropertyAccessExpression(node.expression) &&
-        (node.expression.name.text === 'format' || node.expression.name.text === 'formatToParts') &&
-        formatsNow(node.arguments)
-      ) {
-        problems.push(`${rel}: a format() without a value formats the current time`);
+      } else if (!CLOCK_FILES.has(rel) && ts.isPropertyAccessExpression(node.expression)) {
+        const callee = node.expression;
+        const direct = FORMATTERS.has(callee.name.text) && formatsNow(node.arguments);
+        const indirect =
+          ts.isPropertyAccessExpression(callee.expression) &&
+          FORMATTERS.has(callee.expression.name.text) &&
+          ['call', 'apply', 'bind'].includes(callee.name.text);
+        if (direct || indirect) {
+          problems.push(`${rel}: a format() without a plain value formats the current time`);
+        }
       }
     } else if (ts.isIdentifier(node) && node.text === 'createRequire') {
       problems.push(`${rel}: createRequire is not allowed`);
+    }
+    if ((ts.isIdentifier(node) || ts.isStringLiteralLike(node)) && node.text === 'getBuiltinModule') {
+      problems.push(`${rel}: process.getBuiltinModule is a hidden require and is not allowed`);
     }
     if (ts.isIdentifier(node) && !isPropertyName(node)) {
       if (!CLOCK_FILES.has(rel) && !isTypePosition(node)) {
@@ -293,13 +346,26 @@ export function checkSource(rel: string, text: string): string[] {
         problems.push(`${rel}: the global ${node.text} is not allowed in ${folder}/ (pure code: plain ECMAScript only)`);
       }
     }
-    if (!CLOCK_FILES.has(rel) && ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression)) {
-      const owner = node.expression.text;
-      if (owner === 'process' && node.name.text === 'hrtime') {
+    const dotted = ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression);
+    const indexed = ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression);
+    if (!CLOCK_FILES.has(rel) && (dotted || indexed)) {
+      const owner = (node.expression as ts.Identifier).text;
+      const hostObject = owner === 'globalThis' || owner === 'global' || owner === 'process';
+      // a.b and a['b'] name the member; a[expr] could name any member.
+      let member: string | null = null;
+      if (ts.isPropertyAccessExpression(node)) {
+        member = node.name.text;
+      } else if (ts.isStringLiteralLike(node.argumentExpression)) {
+        member = node.argumentExpression.text;
+      }
+      if (hostObject && member === null) {
+        problems.push(`${rel}: computed access on ${owner} can reach the clock or randomness`);
+      }
+      if (owner === 'process' && member === 'hrtime') {
         problems.push(`${rel}: process.hrtime reads the clock outside core/clock.ts`);
       }
-      if ((owner === 'globalThis' || owner === 'global') && CLOCK_GLOBALS.has(node.name.text)) {
-        problems.push(`${rel}: ${owner}.${node.name.text} outside core/clock.ts and core/rng.ts`);
+      if ((owner === 'globalThis' || owner === 'global') && member !== null && CLOCK_GLOBALS.has(member)) {
+        problems.push(`${rel}: ${owner}.${member} outside core/clock.ts and core/rng.ts`);
       }
     }
     if (pure !== undefined) {
@@ -419,6 +485,31 @@ describe('architecture: imports and determinism', () => {
     ]);
   });
 
+  it('CANARY: a class heritage expression runs, and only real bindings can shadow a global', () => {
+    flagged([
+      ['risk/x.ts', 'export class X extends (structuredClone(1), Object) {}'],
+      ['execution/x.ts', 'export class X extends (crypto.randomUUID(), Object) {}'],
+      ['risk/x.ts', "const o = { Buffer: 1 }; const b = Buffer.from('x');"],
+      ['risk/x.ts', 'interface I { WebAssembly: number } const w = WebAssembly;'],
+      ['risk/x.ts', 'declare const structuredClone: (x: number) => number; const c = structuredClone(1);'],
+      ['risk/x.ts', "import { Buffer as B } from './a.ts'; const b = Buffer.from('x'); const c = B;"],
+      ['risk/x.ts', "import type { Buffer } from './a.ts'; const b = Buffer.from('x');"],
+      ['risk/x.ts', "Buffer: for (;;) { break Buffer; } const b = Buffer.from('x');"],
+    ]);
+  });
+
+  it('CANARY: host objects reached by string or computed keys, and hidden requires', () => {
+    flagged([
+      ['execution/x.ts', "const t = globalThis['Date'].now();"],
+      ['execution/x.ts', "const t = process['hrtime']();"],
+      ['execution/x.ts', "const k = 'Date'; const t = globalThis[k];"],
+      ['execution/x.ts', "const c = process.getBuiltinModule('node:crypto');"],
+      ['execution/x.ts', "const c = process['getBuiltinModule']('node:fs');"],
+      ['execution/x.ts', "const d = new Intl.DateTimeFormat('en'); const s = d.format(void 0);"],
+      ['execution/x.ts', "const d = new Intl.DateTimeFormat('en'); const s = d.format.call(d);"],
+    ]);
+  });
+
   it('allows type-only imports, same-folder imports, listed edges and fixed instants', () => {
     const cases: [string, string][] = [
       ['strategies/x.ts', "import type { Plan } from '../execution/planner.ts';"],
@@ -437,6 +528,9 @@ describe('architecture: imports and determinism', () => {
       ['risk/x.ts', "import type { Clock } from '../core/clock.ts'; export const x = (c: Clock): Clock => c;"],
       ['portfolio/x.ts', 'export class E extends Error { constructor(m: string) { super(m); } } const n = BigInt(Number.MAX_SAFE_INTEGER);'],
       ['execution/x.ts', "const s = new Intl.DateTimeFormat('en').format(0);"],
+      ['portfolio/x.ts', 'export function f(Buffer: number): number { return Buffer + 1; }'], // a real local shadow
+      ['portfolio/x.ts', 'interface Shape { area: number } export class Sq implements Shape { area = 1; }'],
+      ['execution/x.ts', "const v = process.env['HOME']; const a = process.argv[2];"],
       ['execution/x.ts', 'const t = setTimeout(() => 1, 5);'],
       ['execution/x.ts', 'const d = new Date(0); const u = Date.UTC(2026, 0, 1); const m = Math.max(1, Math.floor(2.5));'],
       ['core/x.ts', 'export function day(at: Date): number { return at.getUTCDate(); }'],
