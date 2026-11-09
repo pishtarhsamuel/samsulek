@@ -10,9 +10,11 @@
 //   Temporal never Now; no performance; no zero-argument format() (it formats "now");
 // - node:crypto only as named imports from an allowlist, never re-exported (its random
 //   functions live in core/rng.ts only);
-// - pure folders (PURE) import no Node built-in beyond their list and name no ambient global
-//   (process, globalThis, fetch, timers, Function, ...) and no `.constructor`, so "pure" is
-//   enforced, not only reviewed (security-auditor, REVIEWS.md entries D and E).
+// - pure folders (PURE) import no Node built-in beyond their list, no dynamic import, and
+//   core/clock.ts or core/rng.ts only as types; every global they name must be a plain
+//   ECMAScript global (ES_GLOBALS: no console, process, fetch, timers, Buffer, ...), and
+//   "constructor" never appears, so "pure" is enforced, not only reviewed (security-auditor,
+//   REVIEWS.md entries D, E and F).
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -63,10 +65,21 @@ const PURE: Readonly<Record<string, readonly string[]>> = {
 const AMBIENT = new Set([
   'process', 'globalThis', 'global', 'fetch', 'crypto', 'performance', 'WebSocket', 'XMLHttpRequest',
   'setTimeout', 'setInterval', 'setImmediate', 'queueMicrotask', 'eval', 'Function', 'Temporal',
-  'navigator',
+  'navigator', 'console', 'Reflect',
+]);
+/** The only globals pure code may name (Math and Date still pass the clock rule). */
+const ES_GLOBALS = new Set([
+  'Object', 'Array', 'Number', 'BigInt', 'String', 'Boolean', 'Symbol', 'Map', 'Set', 'WeakMap', 'WeakSet',
+  'Promise', 'Error', 'TypeError', 'RangeError', 'SyntaxError', 'AggregateError', 'JSON', 'Math', 'Date',
+  'RegExp', 'Intl', 'ArrayBuffer', 'DataView', 'Uint8Array', 'Int8Array', 'Uint8ClampedArray', 'Uint16Array',
+  'Int16Array', 'Uint32Array', 'Int32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array',
+  'TextEncoder', 'TextDecoder', 'isFinite', 'isNaN', 'parseInt', 'parseFloat', 'encodeURIComponent',
+  'decodeURIComponent', 'undefined', 'NaN', 'Infinity',
 ]);
 /** The node:crypto functions any file but core/rng.ts may import: hashing, MACs, comparison. */
 const CRYPTO_ALLOWED = new Set(['createHash', 'createHmac', 'timingSafeEqual']);
+/** Clock globals that must not be reached as properties of the global object either. */
+const CLOCK_GLOBALS = new Set(['Date', 'Math', 'performance', 'Temporal', 'crypto']);
 
 /** True when the identifier is only a property name (`a.process`, `{ fetch: 1 }`), not the global. */
 function isPropertyName(node: ts.Identifier): boolean {
@@ -85,6 +98,57 @@ function isPropertyName(node: ts.Identifier): boolean {
 /** `Date` in `at: Date` or `typeof Date` is only a type. */
 function isTypePosition(node: ts.Identifier): boolean {
   return ts.isTypeReferenceNode(node.parent) || ts.isTypeQueryNode(node.parent);
+}
+
+/** Inside a type (annotation, alias, interface, `implements`): erased, never run. */
+function inTypeContext(node: ts.Node): boolean {
+  for (let p = node.parent; p !== undefined; p = p.parent) {
+    if (ts.isTypeNode(p)) {
+      return true;
+    }
+    if (ts.isHeritageClause(p)) {
+      return p.token === ts.SyntaxKind.ImplementsKeyword || ts.isInterfaceDeclaration(p.parent);
+    }
+    if (ts.isStatement(p) || ts.isSourceFile(p)) {
+      return ts.isInterfaceDeclaration(p) || ts.isTypeAliasDeclaration(p);
+    }
+  }
+  return false;
+}
+
+/** The identifier names something this file declares (a variable, parameter, import, label...). */
+function isDeclarationName(node: ts.Identifier): boolean {
+  const p = node.parent;
+  const named =
+    ts.isVariableDeclaration(p) || ts.isParameter(p) || ts.isFunctionDeclaration(p) || ts.isFunctionExpression(p) ||
+    ts.isClassDeclaration(p) || ts.isClassExpression(p) || ts.isMethodDeclaration(p) || ts.isPropertyDeclaration(p) ||
+    ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p) || ts.isInterfaceDeclaration(p) ||
+    ts.isTypeAliasDeclaration(p) || ts.isTypeParameterDeclaration(p) || ts.isEnumDeclaration(p) || ts.isEnumMember(p) ||
+    ts.isModuleDeclaration(p) || ts.isPropertySignature(p) || ts.isMethodSignature(p) || ts.isPropertyAssignment(p);
+  return (
+    (named && p.name === node) ||
+    (ts.isBindingElement(p) && (p.name === node || p.propertyName === node)) ||
+    ts.isImportSpecifier(p) || ts.isImportClause(p) || ts.isNamespaceImport(p) || ts.isExportSpecifier(p) ||
+    ts.isLabeledStatement(p) || ts.isBreakOrContinueStatement(p)
+  );
+}
+
+/** Every name the file declares anywhere (scope-insensitive: a local can only shadow, never add I/O). */
+function declaredNames(source: ts.SourceFile): Set<string> {
+  const names = new Set<string>();
+  const walk = (node: ts.Node): void => {
+    if (ts.isIdentifier(node) && isDeclarationName(node)) {
+      names.add(node.text);
+    }
+    ts.forEachChild(node, walk);
+  };
+  walk(source);
+  return names;
+}
+
+/** No arguments, only `undefined`, or a spread: formats "now". */
+function formatsNow(args: ts.NodeArray<ts.Expression>): boolean {
+  return args.every((a) => ts.isIdentifier(a) && a.text === 'undefined') || args.some((a) => ts.isSpreadElement(a));
 }
 
 /** Why this use of Date, Math, Temporal or performance can read the clock or randomness, or null. */
@@ -119,11 +183,15 @@ export function checkSource(rel: string, text: string): string[] {
   }
   const source = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const pure = CLOCK_FILES.has(rel) ? undefined : PURE[folder];
+  const declared = pure === undefined ? new Set<string>() : declaredNames(source);
 
   const checkSpecifier = (spec: string, typeOnly: boolean): void => {
     if (spec.startsWith('node:')) {
       if (pure !== undefined && !typeOnly && !pure.includes(spec)) {
         problems.push(`${rel}: ${spec} is not allowed in ${folder}/ (pure code)`);
+      }
+      if (spec === 'node:perf_hooks' && !typeOnly && !CLOCK_FILES.has(rel)) {
+        problems.push(`${rel}: node:perf_hooks reads the clock outside core/clock.ts`);
       }
       return;
     }
@@ -135,6 +203,9 @@ export function checkSource(rel: string, text: string): string[] {
       if (target.startsWith('..')) {
         problems.push(`${rel}: import "${spec}" leaves src/`);
         return;
+      }
+      if (pure !== undefined && !typeOnly && CLOCK_FILES.has(target)) {
+        problems.push(`${rel}: pure code may import ${target} only as types (time and randomness are passed in)`);
       }
       const targetFolder = target.split('/')[0] ?? '';
       if (typeOnly || targetFolder === folder || allowed.includes('*') || allowed.includes(targetFolder)) {
@@ -180,8 +251,14 @@ export function checkSource(rel: string, text: string): string[] {
     } else if (ts.isCallExpression(node)) {
       if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
         const arg = node.arguments[0];
+        if (pure !== undefined) {
+          problems.push(`${rel}: no dynamic import in ${folder}/ (pure code)`);
+        }
         if (arg !== undefined && ts.isStringLiteral(arg)) {
           checkSpecifier(arg.text, false);
+          if (isCrypto(arg) && rel !== RNG_FILE) {
+            problems.push(`${rel}: node:crypto may not be imported dynamically`);
+          }
         } else {
           problems.push(`${rel}: dynamic import with a non-literal specifier`);
         }
@@ -191,9 +268,9 @@ export function checkSource(rel: string, text: string): string[] {
         !CLOCK_FILES.has(rel) &&
         ts.isPropertyAccessExpression(node.expression) &&
         (node.expression.name.text === 'format' || node.expression.name.text === 'formatToParts') &&
-        node.arguments.length === 0
+        formatsNow(node.arguments)
       ) {
-        problems.push(`${rel}: a format() without an argument formats the current time`);
+        problems.push(`${rel}: a format() without a value formats the current time`);
       }
     } else if (ts.isIdentifier(node) && node.text === 'createRequire') {
       problems.push(`${rel}: createRequire is not allowed`);
@@ -205,18 +282,32 @@ export function checkSource(rel: string, text: string): string[] {
           problems.push(`${rel}: ${problem} outside core/clock.ts and core/rng.ts`);
         }
       }
+      if (node.text === 'crypto' && rel !== RNG_FILE && !inTypeContext(node)) {
+        problems.push(`${rel}: the global crypto (randomness) outside core/rng.ts`);
+      }
       if (pure !== undefined && AMBIENT.has(node.text)) {
         problems.push(`${rel}: ${node.text} is not allowed in ${folder}/ (pure code)`);
       }
+      const free = !isDeclarationName(node) && !declared.has(node.text) && !inTypeContext(node);
+      if (pure !== undefined && free && !ES_GLOBALS.has(node.text)) {
+        problems.push(`${rel}: the global ${node.text} is not allowed in ${folder}/ (pure code: plain ECMAScript only)`);
+      }
+    }
+    if (!CLOCK_FILES.has(rel) && ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression)) {
+      const owner = node.expression.text;
+      if (owner === 'process' && node.name.text === 'hrtime') {
+        problems.push(`${rel}: process.hrtime reads the clock outside core/clock.ts`);
+      }
+      if ((owner === 'globalThis' || owner === 'global') && CLOCK_GLOBALS.has(node.name.text)) {
+        problems.push(`${rel}: ${owner}.${node.name.text} outside core/clock.ts and core/rng.ts`);
+      }
     }
     if (pure !== undefined) {
-      const viaConstructor =
-        (ts.isPropertyAccessExpression(node) && node.name.text === 'constructor') ||
-        (ts.isElementAccessExpression(node) &&
-          ts.isStringLiteral(node.argumentExpression) &&
-          node.argumentExpression.text === 'constructor');
-      if (viaConstructor) {
-        problems.push(`${rel}: .constructor is not allowed in ${folder}/ (pure code: it reaches Function)`);
+      const named =
+        (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+        node.text === 'constructor';
+      if (named) {
+        problems.push(`${rel}: "constructor" is not allowed in ${folder}/ (pure code: it reaches Function)`);
       }
     }
     ts.forEachChild(node, visit);
@@ -275,6 +366,13 @@ describe('architecture: imports and determinism', () => {
       ['execution/x.ts', 'const t = performance.timeOrigin;'],
       ['execution/x.ts', "const s = new Intl.DateTimeFormat('en').format();"],
       ['execution/x.ts', "const p = new Intl.DateTimeFormat('en').formatToParts();"],
+      ['execution/x.ts', "const s = new Intl.DateTimeFormat('en').format(undefined);"],
+      ['execution/x.ts', "const a: [] = []; const s = new Intl.DateTimeFormat('en').format(...a);"],
+      ['execution/x.ts', 'const id = crypto.randomUUID();'],
+      ['execution/x.ts', 'const t = process.hrtime.bigint();'],
+      ['execution/x.ts', 'const t = globalThis.Date.now();'],
+      ['execution/x.ts', "import { performance as p } from 'node:perf_hooks';"],
+      ['execution/x.ts', "import * as ns from 'node:perf_hooks';"],
     ]);
   });
 
@@ -288,6 +386,7 @@ describe('architecture: imports and determinism', () => {
       ['execution/x.ts', "import nodeCrypto from 'node:crypto';"],
       ['risk/x.ts', "export { randomBytes } from 'node:crypto';"],
       ['execution/x.ts', "export * from 'node:crypto';"],
+      ['execution/x.ts', "const c = await import('node:crypto');"],
     ]);
   });
 
@@ -307,6 +406,16 @@ describe('architecture: imports and determinism', () => {
       ['portfolio/x.ts', "const p = (() => 0)['constructor'];"],
       ['venues/x.ts', 'const n = navigator.userAgent;'],
       ['core/x.ts', "const d = Temporal.PlainDate.from('2026-11-09');"],
+      ['risk/x.ts', 'console.log(1);'],
+      ['risk/x.ts', "const b = Buffer.from('x');"],
+      ['portfolio/x.ts', 'const c = structuredClone({ a: 1 });'],
+      ['strategies/x.ts', 'const w = new WebAssembly.Memory({ initial: 1 });'],
+      ['risk/x.ts', "const m = await import('./a.ts');"],
+      ['risk/x.ts', "import { now } from '../core/clock.ts';"],
+      ['portfolio/x.ts', "export { draw } from '../core/rng.ts';"],
+      ['portfolio/x.ts', 'const f = (() => 0)[`constructor`];'],
+      ['portfolio/x.ts', 'const { constructor: F } = (() => 0);'],
+      ['portfolio/x.ts', "const F = Reflect.get(() => 0, 'constructor');"],
     ]);
   });
 
@@ -321,7 +430,13 @@ describe('architecture: imports and determinism', () => {
       ['risk/x.ts', "import { type KeyObject, timingSafeEqual } from 'node:crypto';"],
       ['core/rng.ts', "import { randomBytes } from 'node:crypto';"],
       ['core/x.ts', "import type { Stats } from 'node:fs';"],
-      ['portfolio/x.ts', 'const p = order.process; const o = { fetch: 1 }; interface I { setTimeout: number }'],
+      [
+        'portfolio/x.ts',
+        'export function f(order: { process: number }): number { const o = { fetch: 1 }; return order.process + o.fetch; } interface I { setTimeout: number }',
+      ],
+      ['risk/x.ts', "import type { Clock } from '../core/clock.ts'; export const x = (c: Clock): Clock => c;"],
+      ['portfolio/x.ts', 'export class E extends Error { constructor(m: string) { super(m); } } const n = BigInt(Number.MAX_SAFE_INTEGER);'],
+      ['execution/x.ts', "const s = new Intl.DateTimeFormat('en').format(0);"],
       ['execution/x.ts', 'const t = setTimeout(() => 1, 5);'],
       ['execution/x.ts', 'const d = new Date(0); const u = Date.UTC(2026, 0, 1); const m = Math.max(1, Math.floor(2.5));'],
       ['core/x.ts', 'export function day(at: Date): number { return at.getUTCDate(); }'],
