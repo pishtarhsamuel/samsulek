@@ -129,8 +129,10 @@ Honest note: pump.fun and PumpSwap trades start at about 2.5% in venue fees alon
 
 ## 6. Sizing order (risk/)
 
-1. Blocked first: kill, halt, pause, daily stop, open breakers, strategy mode (flags table),
-   cooldowns, token already held or opening, entries-per-day count, launch room.
+1. Blocked first: kill, halt, pause, daily stop, unknown equity (stale marks included) or a
+   pending "+50% in 1 h" check (s.4), open breakers, strategy mode (flags table; an entry runs
+   in exactly its strategy's mode), cooldowns, token already held or opening, entries-per-day
+   count, open positions at the cap, launch room (checked in sizing). All reasons are listed.
 2. size = lowest of: 10% x equity; 0.06 SOL (live: `LIVE_CAPS`); exposure room (percent and
    absolute, opening positions at maxSpend, the new position too); launch room; 0.5% x pool
    liquidity; free SOL (minus the maxSpend of buys in flight) minus the fee reserve after

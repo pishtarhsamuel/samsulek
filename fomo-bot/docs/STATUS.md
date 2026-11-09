@@ -17,17 +17,18 @@ can trade, and no key or account exists anywhere.
   the findings due now are fixed (REVIEWS.md, entry D).
 - Root project: 31 of its tests failed on some days because its demo prices follow the real
   date; they now use a fixed date (tests only). All 2,065 root tests pass.
-- Step 4 (risk engine), first part done: the fee reserve that keeps selling affordable and
+- Step 4 (risk engine), two parts done: the fee reserve that keeps selling affordable and
   entry sizing (every cap, rounded down; a pool can refuse an entry but never stop the
-  bot). Reviewed, both APPROVED (REVIEWS.md E). 168 tests pass.
+  bot); and the entry blocks (kill, halt, pause, daily stop, breakers, modes, cooldowns,
+  counters; every reason listed, selling never blocked). Reviewed (REVIEWS.md E and F).
+  202 tests pass.
 - Stricter than the design, for you to know: trade sizes use the lower of this morning's
   and the current account value, so a price spike never makes trades bigger.
-- Next: step 4 continued: entry blocks (kill, halt, pause, daily stop, breakers,
-  cooldowns), reduce-only exits, approval tokens; then config caps, storage; then chain
-  clients, the paper engine, Telegram and logging.
-- Open before step 4b: close the architecture-test gaps (REVIEWS.md E). Before Phase 3:
-  four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is deferred until it is
-  reviewed.
+- Next: step 4 continued: reduce-only exits, approval tokens; then config caps, storage;
+  then chain clients, the paper engine, Telegram and logging.
+- Open before the approval tokens: close the remaining architecture-test gaps (REVIEWS.md
+  F). Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
+  deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.
