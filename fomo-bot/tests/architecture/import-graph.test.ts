@@ -5,8 +5,12 @@
 //   (the import statement itself survives type stripping), so it counts as a runtime import;
 // - third-party packages only where PACKAGES allows them (each one reviewed first);
 // - no `require`, `createRequire`, `import x = require()` or dynamic import of a non-literal;
-// - no wall clock or randomness (Date.now, new Date(), performance.now, Math.random) outside
-//   core/clock.ts and core/rng.ts, so tests stay deterministic.
+// - no wall clock or randomness (Date.now, new Date(), Date(), performance.now, Math.random, the
+//   random functions of node:crypto) outside core/clock.ts and core/rng.ts, so tests stay
+//   deterministic;
+// - pure folders (PURE) import no Node built-in beyond their list and use no ambient I/O global
+//   (process, globalThis, fetch, timers, ...), so "pure" is enforced, not only reviewed
+//   (security-auditor, REVIEWS.md entry D).
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -43,6 +47,39 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
 const PACKAGES: Readonly<Record<string, readonly string[]>> = {};
 const CLOCK_FILES = new Set(['core/clock.ts', 'core/rng.ts']);
 
+/** Pure folders and the only Node built-ins each may import (core/clock.ts and core/rng.ts excepted). */
+const PURE: Readonly<Record<string, readonly string[]>> = {
+  core: [],
+  venues: [],
+  portfolio: [],
+  strategies: [],
+  exits: [],
+  risk: ['node:crypto'], // HMAC approval tokens and plan hashes; its random functions stay in core/rng.ts
+};
+/** Globals that reach the outside world, the clock or randomness: never named in pure code. */
+const AMBIENT = new Set([
+  'process', 'globalThis', 'global', 'fetch', 'crypto', 'performance', 'WebSocket', 'XMLHttpRequest',
+  'setTimeout', 'setInterval', 'setImmediate', 'queueMicrotask', 'eval',
+]);
+const RANDOM_CRYPTO = new Set([
+  'randomBytes', 'randomUUID', 'randomInt', 'randomFill', 'randomFillSync', 'getRandomValues',
+  'generateKey', 'generateKeySync', 'generateKeyPair', 'generateKeyPairSync', 'webcrypto',
+]);
+
+/** True when the identifier is only a property name (`a.process`, `{ fetch: 1 }`), not the global. */
+function isPropertyName(node: ts.Identifier): boolean {
+  const parent = node.parent;
+  return (
+    (ts.isPropertyAccessExpression(parent) && parent.name === node) ||
+    ((ts.isPropertyAssignment(parent) ||
+      ts.isPropertySignature(parent) ||
+      ts.isPropertyDeclaration(parent) ||
+      ts.isMethodDeclaration(parent) ||
+      ts.isMethodSignature(parent)) &&
+      parent.name === node)
+  );
+}
+
 export function checkSource(rel: string, text: string): string[] {
   const problems: string[] = [];
   const folder = rel.split('/')[0] ?? '';
@@ -51,9 +88,13 @@ export function checkSource(rel: string, text: string): string[] {
     return [`${rel}: unknown top-level folder "${folder}"`];
   }
   const source = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const pure = CLOCK_FILES.has(rel) ? undefined : PURE[folder];
 
   const checkSpecifier = (spec: string, typeOnly: boolean): void => {
     if (spec.startsWith('node:')) {
+      if (pure !== undefined && !typeOnly && !pure.includes(spec)) {
+        problems.push(`${rel}: ${spec} is not allowed in ${folder}/ (pure code)`);
+      }
       return;
     }
     if (spec.startsWith('.')) {
@@ -82,6 +123,20 @@ export function checkSource(rel: string, text: string): string[] {
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
       checkSpecifier(node.moduleSpecifier.text, node.importClause?.isTypeOnly === true);
+      const bindings = node.importClause?.namedBindings;
+      const fromCrypto = node.moduleSpecifier.text === 'node:crypto' || node.moduleSpecifier.text === 'crypto';
+      if (fromCrypto && !CLOCK_FILES.has(rel)) {
+        if (node.importClause?.name !== undefined || (bindings !== undefined && ts.isNamespaceImport(bindings))) {
+          problems.push(`${rel}: import named functions from node:crypto (no default or namespace import)`);
+        } else if (bindings !== undefined && ts.isNamedImports(bindings)) {
+          for (const element of bindings.elements) {
+            const imported = (element.propertyName ?? element.name).text;
+            if (RANDOM_CRYPTO.has(imported)) {
+              problems.push(`${rel}: ${imported} from node:crypto outside core/rng.ts`);
+            }
+          }
+        }
+      }
     } else if (ts.isExportDeclaration(node) && node.moduleSpecifier !== undefined && ts.isStringLiteral(node.moduleSpecifier)) {
       checkSpecifier(node.moduleSpecifier.text, node.isTypeOnly);
     } else if (ts.isImportEqualsDeclaration(node)) {
@@ -96,9 +151,14 @@ export function checkSource(rel: string, text: string): string[] {
         }
       } else if (ts.isIdentifier(node.expression) && node.expression.text === 'require') {
         problems.push(`${rel}: require() is not allowed`);
+      } else if (ts.isIdentifier(node.expression) && node.expression.text === 'Date' && !CLOCK_FILES.has(rel)) {
+        problems.push(`${rel}: Date() outside core/clock.ts`);
       }
     } else if (ts.isIdentifier(node) && node.text === 'createRequire') {
       problems.push(`${rel}: createRequire is not allowed`);
+    }
+    if (pure !== undefined && ts.isIdentifier(node) && AMBIENT.has(node.text) && !isPropertyName(node)) {
+      problems.push(`${rel}: ${node.text} is not allowed in ${folder}/ (pure code)`);
     }
     if (!CLOCK_FILES.has(rel)) {
       if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression)) {
@@ -151,6 +211,28 @@ describe('architecture: imports and determinism', () => {
       ['risk/x.ts', 'const r = Math.random();'],
       ['strategies/x.ts', "import { type Plan } from '../execution/planner.ts';"],
       ['nowhere/x.ts', 'export {};'],
+      ['telegram/x.ts', 'const s = Date();'],
+      ['execution/x.ts', "import { randomUUID as id } from 'node:crypto';"],
+      ['execution/x.ts', "import * as c from 'node:crypto';"],
+      ['execution/x.ts', "import nodeCrypto from 'node:crypto';"],
+    ];
+    for (const [rel, text] of cases) {
+      assert.ok(checkSource(rel, text).length > 0, `should flag ${rel}: ${text}`);
+    }
+  });
+
+  it('CANARY: pure folders get no Node built-ins beyond their list and no ambient I/O globals', () => {
+    const cases: [string, string][] = [
+      ['core/x.ts', "import { readFileSync } from 'node:fs';"],
+      ['risk/x.ts', "import { readFileSync } from 'node:fs';"],
+      ['risk/x.ts', "import { randomBytes } from 'node:crypto';"],
+      ['portfolio/x.ts', 'const env = process.env;'],
+      ['venues/x.ts', 'const g = globalThis;'],
+      ['risk/x.ts', "const r = await fetch('https://example.invalid');"],
+      ['strategies/x.ts', 'setTimeout(() => 1, 5);'],
+      ['exits/x.ts', 'const v = crypto.getRandomValues(new Uint8Array(4));'],
+      ['portfolio/x.ts', 'const o = { process };'],
+      ['core/x.ts', 'const t = performance.timeOrigin;'],
     ];
     for (const [rel, text] of cases) {
       assert.ok(checkSource(rel, text).length > 0, `should flag ${rel}: ${text}`);
@@ -163,7 +245,12 @@ describe('architecture: imports and determinism', () => {
       ['risk/x.ts', "import { lamports } from '../core/units.ts';"],
       ['risk/x.ts', "import { a } from './a.ts';"],
       ['core/clock.ts', 'export const now = (): number => Date.now();'],
-      ['core/x.ts', "import { readFileSync } from 'node:fs'; const d = new Date(0);"],
+      ['storage/x.ts', "import { readFileSync } from 'node:fs'; const d = new Date(0);"],
+      ['risk/x.ts', "import { createHash, createHmac } from 'node:crypto';"],
+      ['core/rng.ts', "import { randomBytes } from 'node:crypto';"],
+      ['core/x.ts', "import type { Stats } from 'node:fs';"],
+      ['portfolio/x.ts', 'const p = order.process; const o = { fetch: 1 }; interface I { setTimeout: number }'],
+      ['execution/x.ts', 'const t = setTimeout(() => 1, 5);'],
     ];
     for (const [rel, text] of cases) {
       assert.deepEqual(checkSource(rel, text), [], `should allow ${rel}: ${text}`);
