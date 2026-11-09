@@ -28,6 +28,9 @@ from samsulek.types import PortfolioSnapshot, Quote, Side
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = Path("config/default.yaml")
 
+# `samsulek run` must buy something for these tests to mean anything (see conftest.py).
+pytestmark = pytest.mark.usefixtures("sim_buy_instant")
+
 
 @pytest.fixture
 def root(tmp_path: Path) -> Path:

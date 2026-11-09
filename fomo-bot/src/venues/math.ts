@@ -28,14 +28,14 @@ function feeRate(fee: Bps): bigint {
 
 function positive(what: string, value: bigint): bigint {
   if (typeof value !== 'bigint' || value <= 0n) {
-    throw new AmountError(`${what} must be a positive bigint, got ${String(value)}`);
+    throw new AmountError(`${what} must be a positive bigint, got ${typeof value === 'bigint' ? value : typeof value}`);
   }
   return value;
 }
 
 function nonNegative(what: string, value: bigint): bigint {
   if (typeof value !== 'bigint' || value < 0n) {
-    throw new AmountError(`${what} must be a non-negative bigint, got ${String(value)}`);
+    throw new AmountError(`${what} must be a non-negative bigint, got ${typeof value === 'bigint' ? value : typeof value}`);
   }
   return value;
 }
@@ -150,8 +150,9 @@ export interface FeeTier {
   readonly creatorBps: Bps;
 }
 
+/** The tier's total fee. Each part is checked on its own, so a negative or fractional part cannot hide in a valid sum. */
 export function totalFeeBps(tier: FeeTier): number {
-  return tier.lpBps + tier.protocolBps + tier.creatorBps;
+  return bps(tier.lpBps) + bps(tier.protocolBps) + bps(tier.creatorBps);
 }
 
 /**
@@ -170,14 +171,16 @@ export function selectFeeTier(tiers: readonly FeeTier[], marketCap: bigint): Fee
   let chosen = first;
   let previous = -1n;
   for (const tier of tiers) {
-    if (tier.thresholdLamports <= previous) {
+    const threshold = lamports(tier.thresholdLamports);
+    if (threshold <= previous) {
       throw new AmountError('fee tier thresholds must be strictly increasing');
     }
-    if (totalFeeBps(tier) >= 10_000) {
-      throw new AmountError(`fee tier total must be below 100%, got ${totalFeeBps(tier)} bps`);
+    const total = totalFeeBps(tier);
+    if (total >= 10_000) {
+      throw new AmountError(`fee tier total must be below 100%, got ${total} bps`);
     }
-    previous = tier.thresholdLamports;
-    if (tier.thresholdLamports <= cap) {
+    previous = threshold;
+    if (threshold <= cap) {
       chosen = tier;
     }
   }

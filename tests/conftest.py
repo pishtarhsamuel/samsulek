@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,7 @@ import pytest
 from hypothesis import HealthCheck, settings
 
 from helpers import T0, UNIVERSE, make_risk_config
-from samsulek.clock import FixedClock
+from samsulek.clock import FixedClock, SystemClock
 from samsulek.logging_setup import DecisionLog
 from samsulek.risk.engine import RiskEngine
 from samsulek.risk.state import RiskStateStore
@@ -76,6 +77,19 @@ def _no_network() -> Iterator[None]:
 @pytest.fixture
 def clock() -> FixedClock:
     return FixedClock(T0)
+
+
+# The sim feed is a seeded random walk up to "now" (data/synthetic.py), so what the demo
+# strategy buys depends on the day the tests run: on some days it holds only cash and a
+# test that needs "the run bought something" fails (found 2026-11-09, 31 tests). CLI tests
+# that drive `samsulek run` pin the system clock to an instant on which it buys.
+SIM_BUY_INSTANT = datetime(2026, 11, 8, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def sim_buy_instant(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    monkeypatch.setattr(SystemClock, "now", lambda self: SIM_BUY_INSTANT)
+    return SIM_BUY_INSTANT
 
 
 @pytest.fixture

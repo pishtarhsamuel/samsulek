@@ -47,6 +47,9 @@ QUOTES = {"AAA": q("AAA", "100"), "BBB": q("BBB", "10"), "CCC": q("CCC", "50")}
 ALL_IN = {"DEMO_EQUITY": 0.3, "DEMO_BONDS": 0.3, "DEMO_GOLD": 0.3}
 DEMO_SYMBOLS = ["DEMO_BONDS", "DEMO_EQUITY", "DEMO_GOLD"]
 
+# `samsulek run` must buy something for these tests to mean anything (see conftest.py).
+pytestmark = pytest.mark.usefixtures("sim_buy_instant")
+
 
 @pytest.fixture
 def root(tmp_path: Path) -> Path:

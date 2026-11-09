@@ -15,6 +15,8 @@ import {
   minOut,
 } from '../../../src/venues/math.ts';
 
+fc.configureGlobal({ numRuns: 1_000 }); // TEST_PLAN.md s.4: 1,000 cases per property (this file's process only)
+
 const reserve = fc.bigInt({ min: 1n, max: 10n ** 18n });
 const amount = fc.bigInt({ min: 0n, max: 10n ** 18n });
 const fee = fc.integer({ min: 0, max: 9_999 });

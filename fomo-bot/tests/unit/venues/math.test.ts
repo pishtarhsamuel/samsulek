@@ -130,6 +130,21 @@ describe('market-cap fee tiers (PumpSwap-style)', () => {
     assert.throws(() => selectFeeTier(tiers, -1n), AmountError);
   });
 
+  it('checks every fee part and threshold on its own: a bad part cannot hide in a valid total', () => {
+    const raw = (lp: number, protocol: number, threshold: unknown = 0n): FeeTier =>
+      ({ thresholdLamports: threshold, lpBps: lp, protocolBps: protocol, creatorBps: 0 }) as unknown as FeeTier;
+    assert.throws(() => selectFeeTier([raw(-100, 200)], 1n), AmountError); // sums to a valid 100
+    assert.throws(() => selectFeeTier([raw(0.5, 99.5)], 1n), AmountError); // sums to a whole 100
+    assert.throws(() => selectFeeTier([raw(Number.NaN, 1)], 1n), AmountError);
+    assert.throws(() => selectFeeTier([tier(0n, 1, 1, 1), raw(1, 1, 5)], 1n), AmountError); // number threshold
+    assert.throws(() => totalFeeBps(raw(-1, 2)), /got -1/);
+  });
+
+  it('reports only the type of a wrongly typed amount', () => {
+    assert.throws(() => cpAmountOut('1\nx' as unknown as bigint, 1n, 1n, bps(0)), /got string$/);
+    assert.throws(() => cpAmountOut(1n, -5n, 1n, bps(0)), /got -5$/);
+  });
+
   it('market cap = quote reserve x supply / token reserve, rounded down', () => {
     // 85 SOL against 206_900_000 tokens (6 decimals) of a 1B supply -> floor(410.826 SOL)
     const mcap = marketCapLamports(85n * SOL, 206_900_000_000_000n, 1_000_000_000_000_000n);

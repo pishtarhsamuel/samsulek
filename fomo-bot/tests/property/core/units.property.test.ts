@@ -23,6 +23,8 @@ import {
   toText,
 } from '../../../src/core/units.ts';
 
+fc.configureGlobal({ numRuns: 1_000 }); // TEST_PLAN.md s.4: 1,000 cases per property (this file's process only)
+
 const u64 = fc.bigInt({ min: 0n, max: U64_MAX });
 const divisor = fc.bigInt({ min: 1n, max: U64_MAX });
 const rate = fc.integer({ min: 0, max: 10_000 });
@@ -88,7 +90,16 @@ describe('text round trips', () => {
     fc.assert(fc.property(signed, (v) => assert.equal(signedLamportsFromText(toText(signedLamports(v))), v)));
   });
 
-  it('SOL display text parses back to the same lamports', () => {
-    fc.assert(fc.property(u64, (v) => assert.equal(parseSolAmount(formatSol(lamports(v))), v)));
+  // Owner input allows at most 10 whole digits of SOL (RISK_POLICY.md s.14).
+  const MAX_TYPED = 9_999_999_999_999_999_999n;
+
+  it('SOL display text parses back to the same lamports, up to the largest typed amount', () => {
+    const typed = fc.bigInt({ min: 0n, max: MAX_TYPED });
+    fc.assert(fc.property(typed, (v) => assert.equal(parseSolAmount(formatSol(lamports(v))), v)));
+  });
+
+  it('larger amounts (11 whole digits) are refused, not wrapped or rounded', () => {
+    const large = fc.bigInt({ min: MAX_TYPED + 1n, max: U64_MAX });
+    fc.assert(fc.property(large, (v) => assert.throws(() => parseSolAmount(formatSol(lamports(v))), AmountError)));
   });
 });

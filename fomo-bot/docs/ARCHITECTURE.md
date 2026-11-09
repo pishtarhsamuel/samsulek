@@ -120,8 +120,9 @@ interface LiveFill extends FillBase { mode: 'live'; signature: string; confirmed
 interface Position { id: string; mint: Address; strategy: StrategyId; mode: 'paper' | 'live'; openedAt: UtcMs;
   tokenUnits: TokenUnits; costBasis: Lamports /* every fee and rent */; rentLocked: Lamports; realized: SignedLamports;
   exitPolicy: ExitPolicyId; peakMark: Lamports; status: 'opening' | 'open' | 'exiting' | 'stuck' | 'closed';
+  // exiting: every token sold, the account close pending (rent still locked); src/portfolio/ledger.ts
   exitSeq: number; failedExitFeesToday: Lamports;  // sellable = min(ledger, chain) tokenUnits - in-flight sells
-  lastMark: { value: Lamports; slot: bigint; at: UtcMs; stale: boolean } } // exact sell quote, full size, after fees
+  lastMark: { value: Lamports; tokenUnits: TokenUnits; slot: bigint; at: UtcMs; stale: boolean } } // exact sell quote of exactly tokenUnits, after fees
 interface EquitySnapshot { at: UtcMs; mode: 'paper' | 'live'; sol: Lamports /* min(ledger, chain) */; positionsMark: Lamports;
   equity: Lamports | null;  // null if any position cannot be valued: entries blocked; unknown mints never counted
   staleMints: Address[]; dayStart: Lamports; peak: Lamports; dailyPnlBps: number; drawdownBps: number;

@@ -90,6 +90,9 @@ the SOL and EUR cap applies; no price means no live entries.
   position: spam, address-poisoning dust) never count and are never sold, closed or touched.
 - If any position cannot be valued, equity is "unknown": entries are blocked and stops are
   not evaluated on a guess. A position stale for over 5 min is valued 0 for the stops.
+  A mark counts only if it quotes exactly the tokens held now (one taken before a partial
+  sell is stale). A position with no mark yet, or with a mark stamped in the future (a
+  clock problem), is unknown for the stops, never 0, so a restart cannot trip a stop.
 - Start-of-day baseline = the higher of the last equity seen and the first observation of
   the day (root rule: an overnight gap down counts against today).
 - A withdrawal lowers the day baseline and the peak by its amount; a confirmed deposit raises
@@ -293,8 +296,10 @@ zero at 1x and 2x costs (P). The change demotes the strategy and restarts its ga
 4. No buy is approved while kill, halt, pause, daily stop, a blocking breaker or mode off
    applies; a valid reduce-only exit is always approved.
 5. Sell amount <= sellable; the sum of in-flight sells <= holding; balances never negative.
-6. Ledger conservation (paper exact): starting SOL + sum of fills - sum of cost lines =
-   current SOL; cost basis = sum of the position's buy-side cost lines.
+6. Ledger conservation (paper exact), checked after every operation: starting SOL + sum of
+   fills - sum of cost lines = current SOL; cost basis = the position's buy-side cost lines
+   plus failed-order fees minus the basis released by sells; realized PnL = sale proceeds +
+   rent refunded - exit fees - basis released; tokens held = bought - sold.
 7. All amounts are bigint, at most 2^64 - 1, non-negative except signed PnL (`realized`); no
    NaN or Infinity anywhere a size is computed; SQLite TEXT round-trips exactly.
 8. Venue math: output < reserve; monotone; exact inverse; venue-favoured fees; minOut <= expectedOut.

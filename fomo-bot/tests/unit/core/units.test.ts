@@ -11,6 +11,7 @@ import {
   bpsOfCeil,
   bpsOfFloor,
   ceilDiv,
+  echoText,
   floorDiv,
   formatSol,
   lamports,
@@ -169,5 +170,38 @@ describe('SOL text for display and owner input', () => {
     for (const s of ['', '.5', '5.', '0.0000000001', '1e-3', '-1', '+1', ' 1', '1,5', '0x1', '01', 'NaN']) {
       assert.throws(() => parseSolAmount(s), AmountError, `should reject ${JSON.stringify(s)}`);
     }
+  });
+
+  it('allows at most 10 whole digits (RISK_POLICY.md s.14)', () => {
+    assert.equal(parseSolAmount('9999999999.999999999'), 9_999_999_999_999_999_999n);
+    assert.throws(() => parseSolAmount('10000000000'), AmountError);
+  });
+});
+
+describe('echoText: untrusted text in error messages', () => {
+  it('repeats short printable ASCII as it is', () => {
+    assert.equal(echoText('0,03'), '"0,03"');
+  });
+
+  it('escapes control, line-separator, bidi, non-ASCII and markup characters', () => {
+    assert.equal(echoText('1\n2'), '"1\\u{a}2"');
+    assert.equal(echoText(' ‮'), '"\\u{2028}\\u{202e}"');
+    assert.equal(echoText('<b>&"`\\'), '"\\u{3c}b\\u{3e}\\u{26}\\u{22}\\u{60}\\u{5c}"');
+    assert.equal(echoText('€😀'), '"\\u{20ac}\\u{1f600}"');
+  });
+
+  it('cuts long text to 32 characters and gives the full length', () => {
+    assert.equal(echoText('9'.repeat(40)), `"${'9'.repeat(32)}" (40 characters)`);
+  });
+
+  it('names only the type of anything that is not a string', () => {
+    assert.equal(echoText(12), 'number');
+    assert.equal(echoText(null), 'object');
+  });
+
+  it('is what parse errors show, so a hostile message cannot inject lines', () => {
+    assert.throws(() => parseSolAmount('1\nHALT cleared'), /not a SOL amount: "1\\u\{a\}HALT cleared"$/);
+    assert.throws(() => lamportsFromText(5 as unknown as string), /not a canonical integer string: number$/);
+    assert.throws(() => bps('5' as unknown as number), /got string$/);
   });
 });

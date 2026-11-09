@@ -24,6 +24,27 @@ export class AmountError extends Error {
   }
 }
 
+const MAX_ECHO = 32;
+const ECHO_SAFE = /^[\x20-\x7e]$/; // printable ASCII
+const ECHO_ESCAPED = new Set(['"', '\\', '<', '>', '&', '`']);
+
+/**
+ * Untrusted text (an owner's Telegram message, a stored value) made safe to repeat in an error:
+ * at most 32 characters, printable ASCII only, everything else escaped, so no control, bidi or
+ * line-separator character and no markup can travel into a log line or a reply.
+ */
+export function echoText(text: unknown): string {
+  if (typeof text !== 'string') {
+    return typeof text;
+  }
+  let out = '';
+  for (const ch of text.slice(0, MAX_ECHO)) {
+    out += ECHO_SAFE.test(ch) && !ECHO_ESCAPED.has(ch) ? ch : `\\u{${(ch.codePointAt(0) ?? 0).toString(16)}}`;
+  }
+  const more = text.length > MAX_ECHO ? ` (${text.length} characters)` : '';
+  return `"${out}"${more}`;
+}
+
 function asBigint(what: string, value: unknown): bigint {
   if (typeof value !== 'bigint') {
     throw new AmountError(`${what} must be a bigint, got ${typeof value}`);
@@ -77,7 +98,7 @@ export function signedLamports(value: bigint): SignedLamports {
 
 export function bps(value: number): Bps {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 10_000) {
-    throw new AmountError(`bps must be an integer from 0 to 10000, got ${String(value)}`);
+    throw new AmountError(`bps must be an integer from 0 to 10000, got ${typeof value === 'number' ? value : typeof value}`);
   }
   return value as Bps;
 }
@@ -147,7 +168,7 @@ export function toText(value: bigint): string {
 
 function parseText(what: string, text: unknown, pattern: RegExp): bigint {
   if (typeof text !== 'string' || text.length > MAX_TEXT_LENGTH || !pattern.test(text)) {
-    throw new AmountError(`${what}: not a canonical integer string: ${JSON.stringify(text)}`);
+    throw new AmountError(`${what}: not a canonical integer string: ${echoText(text)}`);
   }
   return BigInt(text);
 }
@@ -178,14 +199,15 @@ export function formatSol(value: Lamports): string {
   return `${whole.toString(10)}.${digits}`;
 }
 
-const SOL_DECIMAL = /^(0|[1-9][0-9]{0,10})(?:\.([0-9]{1,9}))?$/;
+// At most 10 whole digits (RISK_POLICY.md s.14) and 9 decimals; no leading zeros, sign or exponent.
+const SOL_DECIMAL = /^(0|[1-9][0-9]{0,9})(?:\.([0-9]{1,9}))?$/;
 
 /** Parse an owner-typed SOL amount ("0.03") into lamports exactly: at most 9 decimals, no float. */
 export function parseSolAmount(text: string): Lamports {
   const match = typeof text === 'string' ? SOL_DECIMAL.exec(text) : null;
   const whole = match?.[1];
   if (match === null || whole === undefined) {
-    throw new AmountError(`not a SOL amount: ${JSON.stringify(text)}`);
+    throw new AmountError(`not a SOL amount: ${echoText(text)}`);
   }
   const fraction = (match[2] ?? '').padEnd(SOL_DECIMALS, '0');
   return lamports(BigInt(whole) * LAMPORTS_PER_SOL + BigInt(fraction));
