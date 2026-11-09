@@ -36,8 +36,8 @@ the SOL and EUR cap applies; no price means no live entries.
 
 | # | Limit | Value | Kind | Source, why |
 |---|---|---|---|---|
-| 1 | Size per trade | at most 10% of equity (0.055 SOL at 0.55 SOL) | H 10%; T [1%, 10%]; D 10% | brief |
-| 2 | Absolute size per position | 0.06 SOL | H | root style: holds even if equity is misread (about EUR 5) |
+| 1 | Size per trade | at most 10% of equity (0.055 SOL at 0.55 SOL); size = the swap input; equity for sizing = the lower of start-of-day and current equity, so a mark pumped by someone else never raises sizes | H 10%; T [1%, 10%]; D 10% | brief; stricter sizing equity: reviews 2026-11-09 |
+| 2 | Absolute size per position | 0.06 SOL swap input (worst-case spend with rent and every attempt about 0.0617 SOL) | H | root style: holds even if equity is misread (about EUR 5) |
 | 3 | Open positions | 4 (opening positions count) | H 4; T [1, 4] | brief |
 | 4 | Total exposure | 50% of equity; opening positions count at their maxSpend | H 50%; T [10%, 50%] | brief |
 | 5 | Absolute exposure | 0.30 SOL (~EUR 24); live until decision 9: EUR 10 (~0.12 SOL) | H | root style; root memecoin cap |
@@ -132,12 +132,15 @@ Honest note: pump.fun and PumpSwap trades start at about 2.5% in venue fees alon
 1. Blocked first: kill, halt, pause, daily stop, open breakers, strategy mode (flags table),
    cooldowns, token already held or opening, entries-per-day count, launch room.
 2. size = lowest of: 10% x equity; 0.06 SOL (live: `LIVE_CAPS`); exposure room (percent and
-   absolute, opening positions at maxSpend); launch room; 0.5% x pool liquidity; free SOL
-   minus the fee reserve after this buy, rent and the fees of all allowed attempts.
+   absolute, opening positions at maxSpend, the new position too); launch room; 0.5% x pool
+   liquidity; free SOL (minus the maxSpend of buys in flight) minus the fee reserve after
+   this buy, rent and the fees of all allowed attempts. The binding cap is logged.
 3. Live ramp: half of that for a strategy's first 20 live trades. `sizeHint: 'min'` uses
-   the minimum trade.
-4. If the result is below the minimum trade: reject. If that is because 10% of equity is
-   below the minimum, stop all entries and tell the owner once.
+   the minimum trade (with the ramp on, only if the capped size is at least twice it).
+4. If the result is below the minimum trade (the larger of the pool's cost-rule minimum and
+   the configured minimum): reject this entry. Only if 10% of equity is below the
+   configured minimum: stop all entries and tell the owner once (a pool's cost rule can
+   never stop the bot).
 5. Risk re-checks the plan (spend, minOut, slippage, fees, cost rule) and issues the token in
    transaction T1 (ARCHITECTURE s.4), re-running every cap against open and opening positions;
    the token binds plan hash, mode, kind and expiry slot <= quote slot + 25. Confidence never
