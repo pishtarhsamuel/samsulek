@@ -17,7 +17,11 @@ fc.configureGlobal({ numRuns: 1_000 }); // TEST_PLAN.md s.4 (this file's process
 const SOL = 1_000_000_000n;
 const amount = (max: bigint) => fc.bigInt({ min: 0n, max }).map(lamports);
 
-const capsArb: fc.Arbitrary<SizingCaps> = fc.record({
+const between = (min: bigint, max: bigint) => fc.bigInt({ min, max }).map(lamports);
+
+// Wide ranges reach every edge; realistic ones (a 0.1-2 SOL account) make accepted sizes common, so
+// the properties are never vacuous (an acceptance count is asserted below).
+const wideCaps: fc.Arbitrary<SizingCaps> = fc.record({
   perTradeBps: fc.integer({ min: 100, max: 1_000 }).map(bps),
   maxPositionLamports: amount(60_000_000n),
   exposureBps: fc.integer({ min: 1_000, max: 5_000 }).map(bps),
@@ -25,12 +29,23 @@ const capsArb: fc.Arbitrary<SizingCaps> = fc.record({
   launchShareBps: fc.constant(bps(2_500)),
   poolShareBps: fc.integer({ min: 10, max: 50 }).map(bps),
   minTradeLamports: amount(30_000_000n),
-  minTradeFloorLamports: fc.bigInt({ min: 10_000_000n, max: 15_000_000n }).map(lamports),
+  minTradeFloorLamports: between(10_000_000n, 15_000_000n),
 });
+const realisticCaps: fc.Arbitrary<SizingCaps> = fc.record({
+  perTradeBps: fc.integer({ min: 500, max: 1_000 }).map(bps),
+  maxPositionLamports: between(40_000_000n, 60_000_000n),
+  exposureBps: fc.integer({ min: 3_000, max: 5_000 }).map(bps),
+  maxExposureLamports: between(200_000_000n, 300_000_000n),
+  launchShareBps: fc.constant(bps(2_500)),
+  poolShareBps: fc.integer({ min: 30, max: 50 }).map(bps),
+  minTradeLamports: between(10_000_000n, 20_000_000n),
+  minTradeFloorLamports: fc.constant(lamports(10_000_000n)),
+});
+const capsArb = fc.oneof(wideCaps, realisticCaps);
 
 const max = (a: bigint, b: bigint): bigint => (a > b ? a : b);
 
-const inputArb: fc.Arbitrary<SizingInput> = fc.record({
+const wideInput: fc.Arbitrary<SizingInput> = fc.record({
   strategy: fc.constantFrom(...STRATEGY_IDS),
   sizeHint: fc.constantFrom('min' as const, 'normal' as const),
   sizingEquity: amount(3n * SOL),
@@ -38,20 +53,37 @@ const inputArb: fc.Arbitrary<SizingInput> = fc.record({
   launchExposure: amount(300_000_000n),
   poolRealSolReserve: amount(1_000n * SOL),
   sol: amount(3n * SOL),
-  reserveAfterBuy: fc.bigInt({ min: 10_000_000n, max: 20_000_000n }).map(lamports),
+  reserveAfterBuy: between(10_000_000n, 20_000_000n),
   rent: amount(2_100_000n),
   buyAttemptFees: amount(1_000_000n),
   minTrade: amount(50_000_000n),
   liveRampHalf: fc.boolean(),
 });
+const realisticInput: fc.Arbitrary<SizingInput> = fc.record({
+  strategy: fc.constantFrom(...STRATEGY_IDS),
+  sizeHint: fc.constantFrom('min' as const, 'normal' as const),
+  sizingEquity: between(400_000_000n, 2n * SOL),
+  exposure: amount(100_000_000n),
+  launchExposure: amount(20_000_000n),
+  poolRealSolReserve: between(10n * SOL, 1_000n * SOL),
+  sol: between(300_000_000n, 2n * SOL),
+  reserveAfterBuy: between(10_000_000n, 16_000_000n),
+  rent: amount(2_100_000n),
+  buyAttemptFees: amount(400_000n),
+  minTrade: amount(25_000_000n),
+  liveRampHalf: fc.boolean(),
+});
+const inputArb = fc.oneof(wideInput, realisticInput);
 
 const floorBps = (value: bigint, rate: number): bigint => (value * BigInt(rate)) / 10_000n;
 
 describe('sizing properties', () => {
-  it('an accepted size meets the minimum, every cap and the fee reserve', () => {
+  it('an accepted size meets the minimum, every cap and the fee reserve (and sizes are accepted)', () => {
+    let accepted = 0;
     fc.assert(
       fc.property(inputArb, capsArb, (input, caps) => {
         const r = sizeEntry(input, caps);
+        accepted += r.ok ? 1 : 0;
         const accountMinimum = max(caps.minTradeLamports, caps.minTradeFloorLamports);
         const perTradeCap = floorBps(input.sizingEquity, caps.perTradeBps);
         // All entries stop only when 10% of equity misses the account minimum, never for one pool.
@@ -75,6 +107,7 @@ describe('sizing properties', () => {
         assert.ok(input.sol - (r.size + overhead) >= input.reserveAfterBuy, 'invariant 3: the reserve survives the buy');
       }),
     );
+    assert.ok(accepted >= 100, `only ${accepted} of 1,000 inputs were accepted: the property would be vacuous`);
   });
 
   it('more equity or more liquidity never lowers a cap or the size', () => {

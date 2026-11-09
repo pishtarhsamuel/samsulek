@@ -193,9 +193,13 @@ resending, lets the blockhash expire and reconciles; a new attempt needs a new a
 Reduce-only exits are approved under kill, halt, pause, daily stop and every breaker, only
 if: kind `sell` or `close-account`; input = the position's mint, output = SOL; inAmount <=
 sellable (min(ledger, chain) holding minus in-flight sells); one in-flight exit per position;
-`close-account` only of our own token account, empty on chain, to our wallet. A reduce-only
-token never authorizes a buy. Exits need a fresh quote (or protective mode after 60 s stale)
-and the slippage cap (10% emergency); the fee reserve pays and the governor never sheds them.
+tokens only from our own token account and SOL only to our own wallet (sells and closes);
+`close-account` only of our own token account, empty on chain and in the ledger (status
+exiting, no sell in flight). A reduce-only token never authorizes a buy. Every exit needs a
+fresh quote: after 60 s of stale marks an exit turns protective, which means it sells at the
+next fresh quote within the 10% cap, never on an old price. Slippage cap: normal 1% to 5%,
+protective and emergency from the normal cap to 10%. The fee reserve pays and the governor
+never sheds them.
 Exit intents are keyed by (position, exitSeq), so a failed exit is always re-issued. /panic
 sells every position within the emergency cap, then pauses. A position unsellable for 5 min
 is stuck, valued 0, and retries per section 3a; live, the owner gets manual steps.
