@@ -23,23 +23,41 @@
 // no flag can stop a valid reduce-only exit (s.9). It issues tokens for sells and closes only. It is
 // a thin wrapper: every exit fact (exits in flight, holdings, the intent id, the quote) comes from
 // the caller, so the transaction around it must re-read them inside the transaction.
-// The caps come from the engine's config. Until config/caps.ts clamps them against HARD_CAPS (and
-// LIVE_CAPS in live) in step 5, only the backstops in recheck.ts are hard (0.06, 0.01 and 0.07 SOL
-// per buy); the exposure, per-trade, pool-share and position caps are as good as the config
-// (REVIEWS.md K, risk-guardian N1: clamping inside sizeEntry and buyLimitViolations is a gate for step 5).
+// The caps come from the engine's config, and none is used as it is: sizing and the independent
+// limit check clamp every cap to its hard value (live: LIVE_CAPS and today's EUR caps; sizing.ts
+// capsInEffect), the entry blocks clamp the entries per day and the position cap, and the reserve
+// never counts below its hard inputs. A live entry without today's EUR caps is refused (no price,
+// no live entries). The re-check's backstops (0.06, 0.01 and 0.07 SOL per buy) hold on top.
+import { HARD_CAPS } from '../config/caps.ts';
 import { isIdText, isStrategyId, type StrategyId } from '../core/ids.ts';
 import { isTimestamp } from '../core/time.ts';
-import { U64_MAX, bpsOfFloor, lamports, tokenUnits, type Lamports } from '../core/units.ts';
+import { U64_MAX, bpsOfFloor, lamports, microLamportsPerCu, tokenUnits, type Lamports } from '../core/units.ts';
 import { type ApprovalIssuer, type ApprovalToken } from './approval.ts';
 import { entryBlocks, type EntryState } from './blocks.ts';
-import { BASE_FEE_PER_SIGNATURE, planMaxSpend, validatePlan, type OrderPlan } from './plan.ts';
+import { planMaxSpend, validatePlan, type OrderPlan } from './plan.ts';
 import { checkPlan, type ApprovedPool, type CheckedPlan, type PlanCaps, type PlanContext, type PlanProblem, type QuoteContext } from './recheck.ts';
-import { RiskError, attemptCost, feeReserve, type ReserveCaps } from './reserve.ts';
-import { sizeEntry, tradeMinimum, type SizeLimit, type SizingCap, type SizingCaps } from './sizing.ts';
+import { BASE_FEE_PER_SIGNATURE, RiskError, attemptCost, feeReserve, type ReserveCaps } from './reserve.ts';
+import { capsInEffect, sizeEntry, tradeMinimum, type LiveSolCaps, type SizeLimit, type SizingCap, type SizingCaps } from './sizing.ts';
 
 /** More positions than this is not a portfolio, it is a bug; it also bounds the work done per call. */
 const MAX_SNAPSHOT_POSITIONS = 1_000;
 const ACTIVE_STATUSES: readonly ActiveStatus[] = ['opening', 'open', 'exiting', 'stuck'];
+
+/**
+ * One buy attempt at the hard fee caps (limits 18 and 19): 5,000 + 200,000 uL/CU x 300,000 CU / 10^6
+ * + the 5,000 tip = 70,000 lamports. Sizing sets aside every allowed attempt at this price, never at
+ * the plan's own fee fields, so a planner cannot buy a larger size by declaring cheaper fees
+ * (REVIEWS.md K, risk-guardian N4); the re-check holds the plan's own fees to at most this.
+ */
+const RESERVED_BUY_ATTEMPT: Lamports = attemptCost(
+  {
+    signatures: 1,
+    cuPrice: microLamportsPerCu(HARD_CAPS.cuPriceMicroLamports),
+    cuLimit: HARD_CAPS.cuLimit,
+    tip: lamports(HARD_CAPS.tipLamports.reduce<bigint>((most, tip) => (tip > most ? tip : most), 0n)),
+  },
+  BASE_FEE_PER_SIGNATURE,
+);
 
 export type ActiveStatus = 'opening' | 'open' | 'exiting' | 'stuck';
 
@@ -136,6 +154,8 @@ export interface BuyCaps {
   readonly sizing: SizingCaps;
   readonly reserve: ReserveCaps;
   readonly plan: PlanCaps;
+  /** Today's live EUR caps in lamports (RISK_POLICY.md s.2); null when there is no price today, which refuses every live entry. */
+  readonly liveSol: LiveSolCaps | null;
 }
 
 export interface BuyApprovalInput {
@@ -231,6 +251,15 @@ function id(what: string, value: unknown): string {
     throw new RiskError(`${what} is not a valid id`);
   }
   return value;
+}
+
+/** Today's EUR caps, read once into a frozen copy; null (no price today) stays null. */
+function checkLiveSol(input: unknown): LiveSolCaps | null {
+  if (input === null) {
+    return null;
+  }
+  const { positionLamports, exposureLamports } = object<LiveSolCaps>('liveSol', input);
+  return Object.freeze({ positionLamports: lamports(positionLamports as bigint), exposureLamports: lamports(exposureLamports as bigint) });
 }
 
 interface CheckedIntent {
@@ -330,6 +359,9 @@ function checkPositions(input: unknown, newPositionId: string): Snapshot {
 export interface BuyLimitCheck {
   readonly plan: OrderPlan;
   readonly strategy: StrategyId;
+  /** The entry's mode: live applies LIVE_CAPS and today's EUR caps on top of the hard caps. */
+  readonly mode: 'paper' | 'live';
+  readonly liveSol: LiveSolCaps | null;
   readonly activePositions: number;
   readonly maxPositions: number;
   readonly sameMintActive: boolean;
@@ -364,7 +396,9 @@ export function buyLimitViolations(check: BuyLimitCheck): readonly LimitViolatio
   const plan = validatePlan(check.plan);
   const spend = planMaxSpend(plan);
   const equity = lamports(check.sizingEquity);
-  const caps = check.caps;
+  // Never the configured caps: each at most its hard value (live: LIVE_CAPS and today's EUR caps too).
+  const caps = capsInEffect(check.caps, check.mode, check.liveSol);
+  const maxPositions = Math.min(wholeNumber('maxPositions', check.maxPositions, 1), HARD_CAPS.openPositions);
   const exposureAfter = lamports(check.exposure) + spend;
   const exposureCap = bpsOfFloor(equity, caps.exposureBps);
   const maxExposure = lamports(caps.maxExposureLamports);
@@ -374,7 +408,7 @@ export function buyLimitViolations(check: BuyLimitCheck): readonly LimitViolatio
       found.push(violation);
     }
   };
-  add('positions', check.activePositions + 1 > wholeNumber('maxPositions', check.maxPositions, 1));
+  add('positions', wholeNumber('activePositions', check.activePositions, 0) + 1 > maxPositions);
   add('one-per-mint', check.sameMintActive);
   add('per-trade', plan.inAmount > bpsOfFloor(equity, caps.perTradeBps));
   add('per-position', plan.inAmount > lamports(caps.maxPositionLamports));
@@ -448,8 +482,9 @@ export function approveBuy(inputRaw: BuyApprovalInput, issuerRaw: ApprovalIssuer
   const newP95 = lamports(p95Raw as bigint);
   const wsolHelper = boolean('wsolHelper', helperRaw);
   const liveRampHalf = boolean('liveRampHalf', rampRaw);
-  // The caps are copied once: sizing, the minimum trade and the independent limit check all see the same ones.
-  const { sizing: sizingCaps, reserve: reserveCaps, plan: planCaps } = object<BuyCaps>('caps', capsRaw) as BuyCaps;
+  // The caps are read once: sizing, the minimum trade and the independent limit check all see the same ones.
+  const { sizing: sizingCaps, reserve: reserveCaps, plan: planCaps, liveSol: liveSolRaw } = object<BuyCaps>('caps', capsRaw) as BuyCaps;
+  const liveSol = checkLiveSol(liveSolRaw);
 
   // 1. the entry blocks, on the state derived from the snapshot
   const state: EntryState = {
@@ -469,24 +504,24 @@ export function approveBuy(inputRaw: BuyApprovalInput, issuerRaw: ApprovalIssuer
   if (blocks.length > 0 || equityNow === null) {
     return refuse('blocked', blocks);
   }
+  // A live entry is sized under today's EUR caps (RISK_POLICY.md s.2): no price today, no live entries.
+  if (intent.mode === 'live' && liveSol === null) {
+    return refuse('sizing', ['sizing:no-live-price']);
+  }
+  // The caps in effect, once, as a frozen copy: no configured cap above its hard (live: LIVE_CAPS) value.
+  const caps = capsInEffect(sizingCaps, intent.mode, liveSol);
 
   // 2. sizing: from the lower of start-of-day and current equity, with every position counted
   const sizingEquity = dayStart > 0n && dayStart < equityNow ? dayStart : equityNow;
   const sol = lamports(walletSol > book.held ? walletSol - book.held : 0n);
   const reserveAfterBuy = feeReserve({ p95ExitCosts: [...book.p95ExitCosts, newP95], wsolHelper }, reserveCaps);
-  const onePlannedAttempt = attemptCost(
-    { signatures: 1, cuPrice: plan.cuPrice, cuLimit: plan.cuLimit, tip: plan.tip.lamports },
-    BASE_FEE_PER_SIGNATURE,
-  );
-  // Sizing reserves the attempt fees at the plan's own fee fields, every allowed attempt. The re-check
-  // caps those fields (CU price, CU limit, tip, landing spend), so this is the cap in disguise; the
-  // plan cannot make itself larger by choosing cheaper fees except by the few thousand lamports of
-  // difference. Reserving at the hard caps instead is stricter by about 12,000 lamports and is left
-  // for the config step (REVIEWS.md K, risk-guardian N4).
-  const buyAttemptFees = lamports(BigInt(attemptsAllowed) * onePlannedAttempt);
+  // Every allowed attempt at the hard fee caps, never at the plan's own fee fields (RESERVED_BUY_ATTEMPT).
+  const buyAttemptFees = lamports(BigInt(attemptsAllowed) * RESERVED_BUY_ATTEMPT);
   const sized = sizeEntry(
     {
       strategy: intent.strategy,
+      mode: intent.mode,
+      liveSol,
       sizeHint: intent.sizeHint,
       sizingEquity,
       exposure: lamports(book.exposure),
@@ -499,7 +534,7 @@ export function approveBuy(inputRaw: BuyApprovalInput, issuerRaw: ApprovalIssuer
       minTrade: poolMinTrade,
       liveRampHalf,
     },
-    sizingCaps,
+    caps,
   );
   if (!sized.ok) {
     return refuse('sizing', [`sizing:${sized.reason}`]);
@@ -520,7 +555,7 @@ export function approveBuy(inputRaw: BuyApprovalInput, issuerRaw: ApprovalIssuer
     simulatedCu: simulatedCu as number | null,
     caps: planCaps,
     buy: {
-      minInAmount: tradeMinimum(poolMinTrade, sizingCaps),
+      minInAmount: tradeMinimum(poolMinTrade, caps),
       sizedInAmount: sized.size,
       sizedAttemptFees: buyAttemptFees,
       rentRequired,
@@ -538,6 +573,8 @@ export function approveBuy(inputRaw: BuyApprovalInput, issuerRaw: ApprovalIssuer
   const violations = buyLimitViolations({
     plan,
     strategy: intent.strategy,
+    mode: intent.mode,
+    liveSol,
     activePositions: book.count,
     maxPositions: state.maxPositions,
     sameMintActive: book.mints.has(intent.mint),
@@ -548,7 +585,7 @@ export function approveBuy(inputRaw: BuyApprovalInput, issuerRaw: ApprovalIssuer
     walletSol,
     held: lamports(book.held),
     reserveAfterBuy,
-    caps: sizingCaps,
+    caps,
   });
   if (violations.length > 0) {
     throw new RiskError(`the approval would break a hard limit (${violations.join(', ')}): refusing`);

@@ -14,6 +14,7 @@
 // accepts only an explicit `true` from the store. Issuing spends the plan's re-check
 // (recheck.ts consumeCheckedPlan): one checked plan, at most one token.
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { HARD_CAPS } from '../config/caps.ts';
 import { isIdText } from '../core/ids.ts';
 import { U64_MAX, type Lamports } from '../core/units.ts';
 import {
@@ -32,8 +33,8 @@ import { RiskError } from './reserve.ts';
 
 declare const approvedBrand: unique symbol;
 
-/** H 25 slots (RISK_POLICY.md limit 20); the caller may choose less. Moves to config/caps.ts in step 5. */
-const HARD_PLAN_FRESH_SLOTS = 25;
+/** H 25 slots (RISK_POLICY.md limit 20, config/caps.ts); the caller may choose less. */
+const HARD_PLAN_FRESH_SLOTS = HARD_CAPS.planFreshSlots;
 const MIN_KEY_BYTES = 32;
 const MAC_PURPOSE = 'fomo-bot approval token v1';
 /** The newest token ids kept to catch a repeated id; older ones are forgotten so memory stays bounded. */

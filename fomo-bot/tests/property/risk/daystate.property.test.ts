@@ -26,6 +26,7 @@ import {
 fc.configureGlobal({ numRuns: 1_000 }); // TEST_PLAN.md s.4 (this file's process only)
 
 const POLICY: EquityPolicy = {
+  mode: 'paper',
   dailyStopBps: bps(3_000),
   peakHaltBps: bps(5_000),
   sanityMaxLamports: lamports(2_000_000_000n),

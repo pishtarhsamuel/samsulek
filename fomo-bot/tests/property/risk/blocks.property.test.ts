@@ -65,10 +65,11 @@ const stateArb: fc.Arbitrary<EntryState> = fc.record({
   bannedMints: subset(MINTS),
   blockedCreators: subset(CREATORS),
   activeMints: subset(MINTS),
-  entriesToday: fc.integer({ min: 0, max: 12 }),
-  entriesPerDay: fc.integer({ min: 1, max: 12 }),
-  activePositions: fc.integer({ min: 0, max: 5 }),
-  maxPositions: fc.integer({ min: 1, max: 4 }),
+  entriesToday: fc.integer({ min: 0, max: 14 }),
+  // up to far above the hard values (12 a day, 4 positions): the hard values must still hold
+  entriesPerDay: fc.oneof(fc.integer({ min: 1, max: 12 }), fc.integer({ min: 13, max: 100 })),
+  activePositions: fc.integer({ min: 0, max: 6 }),
+  maxPositions: fc.oneof(fc.integer({ min: 1, max: 4 }), fc.integer({ min: 5, max: 40 })),
 });
 const entryArb: fc.Arbitrary<EntryCheck> = fc.record({
   strategy,
@@ -114,8 +115,9 @@ function expected(s: EntryState, e: EntryCheck): BlockReason[] {
   if (s.bannedMints.has(e.mint)) out.push('token-banned');
   if (e.creator !== null && s.blockedCreators.has(e.creator)) out.push('creator-blocked');
   if (s.activeMints.has(e.mint)) out.push('token-active');
-  if (s.entriesToday >= s.entriesPerDay) out.push('entries-per-day');
-  if (s.activePositions >= s.maxPositions) out.push('max-positions');
+  // the policy's numbers: 12 entries a day (a live entry 5) and 4 positions, whatever the config says
+  if (s.entriesToday >= Math.min(s.entriesPerDay, e.mode === 'live' ? 5 : 12)) out.push('entries-per-day');
+  if (s.activePositions >= Math.min(s.maxPositions, 4)) out.push('max-positions');
   return out;
 }
 

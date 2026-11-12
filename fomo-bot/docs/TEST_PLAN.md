@@ -43,7 +43,10 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    just above its value; the fee-reserve arithmetic of section 3a to the lamport; flags;
    breakers; approval transaction T1 and tokens; reduce-only rules.
 5. `config/`: HARD_CAPS and TUNABLE_BOUNDS enforcement, direction rules, versions, rollback,
-   modes only in the flags table.
+   modes only in the flags table. Done in step 5a: the tables' values, bounds and freezing;
+   every risk check given a config far above the hard values (and live caps, and a live entry
+   without today's EUR caps) decides exactly as under the hard values, in unit tests and in the
+   sizing, entry-block and approval properties, with planted bugs for each clamp.
 6. `storage/`: migrations, WAL, TEXT amounts, partial unique indexes, crash during write,
    quick_check failure.
 

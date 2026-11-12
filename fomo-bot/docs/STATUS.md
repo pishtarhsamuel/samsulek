@@ -39,16 +39,30 @@ can trade, and no key or account exists anywhere.
   top-tier first draft, good enough once an independent model reviews it, and nothing was
   at risk because nothing can trade yet. From now on new money code is reviewed by Opus.
   The Opus reviewers then re-checked the fixes and the new approval step: approved with
-  notes; one must be done in the config step (clamp every cap against the hard values).
-  501 tests pass, run with frozen built-ins and no code from strings.
+  notes; the one due in the config step is now done (next point).
+- Step 5a, the hard-limits file (`config/caps.ts`, created with your OK): every hard limit
+  lives in one protected file, and the risk engine caps every setting at it, so a setting
+  that asks for more gets the hard limit (40 open positions acts as 4). Live trades get the
+  stricter live limits: 5% of the account per trade, EUR 5 per position and EUR 10 in total,
+  5 entries a day, -3% daily stop, -15% peak halt; no euro price that day means no live
+  trades. 537 tests pass, run with frozen built-ins and no code from strings; each new limit
+  check was broken on purpose and a test caught it. Both Opus reviewers approved with notes
+  (REVIEWS.md L): the one fix due now, a gap in the architecture test, is done and
+  confirmed; two notes are due before live (warn when a setting is capped, and a SOL
+  backstop for the euro caps in case a price feed is wrong).
 - Stricter than the design, for you to know: trade sizes use the lower of this morning's
   and the current account value, so a price spike never makes trades bigger; and a single
   buy can never exceed 0.06 SOL, fall under 0.01 SOL or cost more than 0.07 SOL in the worst
   case, whatever the sizing says (the 0.07 SOL ceiling is new, a margin above the 0.0617 SOL
-  of limit 2; it loosens nothing).
-- Next: config caps (the protected file, which needs your OK when I change it), then storage
-  (the database, where the approval step's effects are written in one transaction); then
-  chain clients, the paper engine, Telegram and logging.
+  of limit 2; it loosens nothing); and sizing always assumes the highest allowed fees, never
+  the fees an order plan claims it will pay.
+- For you to know before live: at 5% per trade, live trading needs at least 0.4 SOL in the
+  account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
+  bot makes no trades. Paper and live entries share one daily count, so paper trades can use
+  up the 5 live entries, never the reverse (separate counts would need your OK).
+- Next: step 5b (the settings themselves: their bounds, which changes count as riskier,
+  versions and undo), then storage (the database, where the approval step's effects are
+  written in one transaction); then chain clients, the paper engine, Telegram and logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;

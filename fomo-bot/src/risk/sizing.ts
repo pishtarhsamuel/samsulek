@@ -2,17 +2,21 @@
 // engine gathers the inputs and, in the approval transaction, re-runs the same caps against the
 // exact plan. The size is the lowest cap; every cap rounds down. The new position counts against
 // the exposure caps at its worst-case spend (size + rent + every allowed attempt), like every
-// opening position. There is no confidence input: confidence never raises a size.
+// opening position. There is no confidence input: confidence never raises a size. The configured
+// caps are never used as they are: capsInEffect clamps each to its hard value (live: also LIVE_CAPS
+// and today's EUR caps), so a wrong config can only make sizing stricter (REVIEWS.md K, N1).
+import { HARD_CAPS, LIVE_CAPS } from '../config/caps.ts';
 import { isStrategyId, type StrategyId } from '../core/ids.ts';
-import { bpsOfFloor, lamports, type Bps, type Lamports } from '../core/units.ts';
+import { bps, bpsOfFloor, lamports, type Bps, type Lamports } from '../core/units.ts';
 import { RiskError } from './reserve.ts';
 
-/** RISK_POLICY.md limit 15, the H floor of the minimum trade (moves to config/caps.ts HARD_CAPS in step 5). */
-const HARD_MIN_TRADE_FLOOR = 10_000_000n;
+/** RISK_POLICY.md limit 15, the H floor of the minimum trade (config/caps.ts). */
+const HARD_MIN_TRADE_FLOOR = HARD_CAPS.minTradeFloorLamports;
 
 /**
- * Effective caps: the lower of each tunable and its HARD_CAPS (live: LIVE_CAPS) value. The size is
- * the swap input (limits 1 and 2); at the 0.06 SOL cap the worst-case spend is about 0.0617 SOL.
+ * The configured caps (tunables). Sizing and the independent limit check use them only through
+ * capsInEffect. The size is the swap input (limits 1 and 2); at the 0.06 SOL cap the worst-case
+ * spend is about 0.0617 SOL.
  */
 export interface SizingCaps {
   readonly perTradeBps: Bps;
@@ -29,8 +33,23 @@ export interface SizingCaps {
   readonly minTradeFloorLamports: Lamports;
 }
 
+export type EntryMode = 'paper' | 'live';
+
+/**
+ * Today's live EUR caps in lamports (RISK_POLICY.md s.2: EUR 5 per position, EUR 10 exposure),
+ * converted when live trading is switched on and at each 00:00 Athens, rounded down.
+ */
+export interface LiveSolCaps {
+  readonly positionLamports: Lamports;
+  readonly exposureLamports: Lamports;
+}
+
 export interface SizingInput {
   readonly strategy: StrategyId;
+  /** The mode the entry runs in: a live entry is sized under LIVE_CAPS and today's EUR caps too. */
+  readonly mode: EntryMode;
+  /** Today's EUR caps in lamports: required for a live entry (no price, no live entries); unused in paper. */
+  readonly liveSol: LiveSolCaps | null;
   readonly sizeHint: 'min' | 'normal';
   /** The lower of start-of-day and current equity (REVIEWS.md D): a pumped mark never raises sizes. */
   readonly sizingEquity: Lamports;
@@ -96,6 +115,59 @@ function room(cap: bigint, used: bigint): Lamports {
   return lamports(cap > used ? cap - used : 0n);
 }
 
+const lowerRate = (a: number, b: number): number => (a < b ? a : b);
+const lowerAmount = (a: bigint, b: bigint): bigint => (a < b ? a : b);
+
+function checkLiveSol(value: unknown): LiveSolCaps {
+  if (typeof value !== 'object' || value === null) {
+    throw new RiskError("a live entry needs today's EUR caps in lamports: no price means no live entries");
+  }
+  const { positionLamports, exposureLamports } = value as { readonly [K in keyof LiveSolCaps]?: unknown };
+  return { positionLamports: lamports(positionLamports as bigint), exposureLamports: lamports(exposureLamports as bigint) };
+}
+
+/**
+ * The caps sizing and the independent limit check apply (REVIEWS.md K, risk-guardian N1): each
+ * configured ceiling, never above its HARD_CAPS value, and for a live entry never above LIVE_CAPS
+ * and today's EUR caps either (the lower of the SOL and the EUR cap applies, RISK_POLICY.md s.2). A
+ * config can only make them stricter. The minimum trade and its floor are floors: they pass through
+ * (a higher one is only stricter), and a floor below the 0.01 SOL hard floor throws where it is used.
+ * Every field is read once. A live entry without today's EUR caps throws; so does a malformed value.
+ */
+export function capsInEffect(configured: SizingCaps, mode: EntryMode, liveSol: LiveSolCaps | null): SizingCaps {
+  if (typeof configured !== 'object' || (configured as unknown) === null) {
+    throw new RiskError('caps must be an object');
+  }
+  if (mode !== 'paper' && mode !== 'live') {
+    throw new RiskError('an entry runs in paper or live mode');
+  }
+  const { perTradeBps, maxPositionLamports, exposureBps, maxExposureLamports, launchShareBps, poolShareBps, minTradeLamports, minTradeFloorLamports } =
+    configured;
+  let perTrade = lowerRate(bps(perTradeBps), HARD_CAPS.tradePctBps);
+  let position = lowerAmount(lamports(maxPositionLamports), HARD_CAPS.positionLamports);
+  let exposure = lowerRate(bps(exposureBps), HARD_CAPS.exposurePctBps);
+  let maxExposure = lowerAmount(lamports(maxExposureLamports), HARD_CAPS.exposureLamports);
+  let poolShare = lowerRate(bps(poolShareBps), HARD_CAPS.poolShareBps);
+  if (mode === 'live') {
+    const live = checkLiveSol(liveSol);
+    perTrade = lowerRate(perTrade, LIVE_CAPS.tradePctBps);
+    position = lowerAmount(position, live.positionLamports);
+    exposure = lowerRate(exposure, LIVE_CAPS.exposurePctBps);
+    maxExposure = lowerAmount(maxExposure, live.exposureLamports);
+    poolShare = lowerRate(poolShare, LIVE_CAPS.poolShareBps);
+  }
+  return Object.freeze({
+    perTradeBps: bps(perTrade),
+    maxPositionLamports: lamports(position),
+    exposureBps: bps(exposure),
+    maxExposureLamports: lamports(maxExposure),
+    launchShareBps: bps(lowerRate(bps(launchShareBps), HARD_CAPS.launchShareOfExposureCapBps)),
+    poolShareBps: bps(poolShare),
+    minTradeLamports: lamports(minTradeLamports),
+    minTradeFloorLamports: lamports(minTradeFloorLamports),
+  });
+}
+
 /**
  * The account minimum (the configured minimum trade, never below its floor, which itself cannot be
  * below the 0.01 SOL hard floor) and the entry minimum (the larger of that and the pool's cost-rule
@@ -117,10 +189,12 @@ export function tradeMinimum(poolMinTrade: Lamports, caps: SizingCaps): Lamports
   return minimums(poolMinTrade, caps).entry;
 }
 
-export function sizeEntry(input: SizingInput, caps: SizingCaps): SizingResult {
+export function sizeEntry(input: SizingInput, configured: SizingCaps): SizingResult {
   if (!isStrategyId(input.strategy)) {
     throw new RiskError('unknown strategy');
   }
+  // The caps in effect, first: whatever the config says, no cap is looser than its hard (live: LIVE_CAPS) value.
+  const caps = capsInEffect(configured, input.mode, input.liveSol);
   if (input.sizeHint !== 'min' && input.sizeHint !== 'normal') {
     throw new RiskError("sizeHint must be 'min' or 'normal'");
   }

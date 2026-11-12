@@ -12,15 +12,16 @@
 // budget of s.3a; the plan's mode against the position's; a sell that also closes the account.
 // The caller takes wallet, ownTokenAccount and wsolMint from config or derivation, never from
 // the plan, and passes the highest slot it has seen as currentSlot.
+import { HARD_CAPS, TUNABLE_BOUNDS } from '../config/caps.ts';
 import { isIdText } from '../core/ids.ts';
 import { bps, tokenUnits, type Bps, type TokenUnits } from '../core/units.ts';
 import { RiskError } from './reserve.ts';
 
-/** RISK_POLICY.md limits 17 and 20 (H values and bounds; move to config/caps.ts in step 5). */
-const HARD_PLAN_FRESH_SLOTS = 25;
-const MIN_NORMAL_SLIPPAGE_BPS = 100;
-const HARD_NORMAL_SLIPPAGE_BPS = 500;
-const HARD_EMERGENCY_SLIPPAGE_BPS = 1_000;
+/** RISK_POLICY.md limits 17 and 20: the H values and the floor of the normal cap, from config/caps.ts. */
+const HARD_PLAN_FRESH_SLOTS = HARD_CAPS.planFreshSlots;
+const MIN_NORMAL_SLIPPAGE_BPS = TUNABLE_BOUNDS.risk.sellSlippageBps[0];
+const HARD_NORMAL_SLIPPAGE_BPS = HARD_CAPS.sellSlippageBps;
+const HARD_EMERGENCY_SLIPPAGE_BPS = HARD_CAPS.emergencySellSlippageBps;
 
 export type ExitUrgency = 'normal' | 'protective' | 'emergency';
 export type ExitPositionStatus = 'opening' | 'open' | 'exiting' | 'stuck' | 'closed';

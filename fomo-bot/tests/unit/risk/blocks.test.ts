@@ -177,6 +177,23 @@ describe('holdings and counters', () => {
     assert.deepEqual(blocks({ activePositions: 3 }), []);
     assert.deepEqual(blocks({ activePositions: 4 }), ['max-positions']);
   });
+
+  it('a config above the hard counts acts as the hard counts: 12 entries a day, 4 positions (REVIEWS.md K, N1)', () => {
+    assert.deepEqual(blocks({ entriesPerDay: 100, entriesToday: 11 }), []);
+    assert.deepEqual(blocks({ entriesPerDay: 100, entriesToday: 12 }), ['entries-per-day']);
+    assert.deepEqual(blocks({ maxPositions: 40, activePositions: 3 }), []);
+    assert.deepEqual(blocks({ maxPositions: 40, activePositions: 4 }), ['max-positions']);
+    assert.deepEqual(blocks({ entriesPerDay: 3, entriesToday: 3 }), ['entries-per-day']); // tighter stays
+  });
+
+  it('a live entry: at most 5 a day (LIVE_CAPS, owner decision 9), whatever the config; paper keeps its own count', () => {
+    const live = { modes: { ...CLEAR.modes, crowdflow: 'live' as const } };
+    assert.deepEqual(blocks({ ...live, entriesToday: 4 }, { mode: 'live' }), []);
+    assert.deepEqual(blocks({ ...live, entriesToday: 5 }, { mode: 'live' }), ['entries-per-day']);
+    assert.deepEqual(blocks({ ...live, entriesPerDay: 12, entriesToday: 5 }, { mode: 'live' }), ['entries-per-day']);
+    assert.deepEqual(blocks({ ...live, entriesPerDay: 2, entriesToday: 2 }, { mode: 'live' }), ['entries-per-day']);
+    assert.deepEqual(blocks({ entriesToday: 5 }), []); // a paper entry: 8 a day
+  });
 });
 
 describe('fail closed on a malformed state', () => {

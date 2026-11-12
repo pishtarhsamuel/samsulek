@@ -15,24 +15,31 @@
 //   anything (REVIEWS.md D, M3), so a dead price feed can trip a stop but cannot set a baseline.
 // - The day is the Europe/Athens calendar day (core/day.ts), so the daily stop resets at local
 //   midnight on 23- and 25-hour days too.
-// The thresholds can only be tighter than their hard values (config/caps.ts moves them in step 5).
+// The thresholds can only be tighter than their hard values (config/caps.ts), and a live account
+// is held to LIVE_CAPS (owner decision 9).
+import { HARD_CAPS, LIVE_CAPS } from '../config/caps.ts';
 import { athensDay, isDay, previousDay } from '../core/day.ts';
 import { isTimestamp } from '../core/time.ts';
 import { U64_MAX, type Bps, type Lamports, type SignedLamports } from '../core/units.ts';
 import { RiskError } from './reserve.ts';
 
 const HOUR_MS = 3_600_000;
-/** RISK_POLICY.md limits 9, 10 and 12: the H values. */
-const HARD_DAILY_STOP_BPS = 3_000;
-const HARD_PEAK_HALT_BPS = 5_000;
-const HARD_SANITY_MAX = 2_000_000_000n;
-const HARD_SANITY_MULTIPLE = 3;
-const HARD_JUMP_BPS = 5_000;
+/** RISK_POLICY.md limits 9, 10 and 12: the H values, from config/caps.ts. */
+const HARD_DAILY_STOP_BPS = HARD_CAPS.dailyStopBps;
+const HARD_PEAK_HALT_BPS = HARD_CAPS.peakHaltBps;
+const HARD_SANITY_MAX = HARD_CAPS.equitySanityLamports;
+const HARD_SANITY_MULTIPLE = HARD_CAPS.equitySanityBankrollMultiple;
+const HARD_JUMP_BPS = HARD_CAPS.equityJumpBps;
 
 export interface EquityPolicy {
-  /** Limit 9: -30% from the day baseline (H; tunable down to 5%). */
+  /**
+   * The account this state is for. A live account is held to LIVE_CAPS (owner decision 9: -3% daily,
+   * -15% from the peak), so a live policy with the paper thresholds is refused, not used.
+   */
+  readonly mode: 'paper' | 'live';
+  /** Limit 9: -30% from the day baseline (H; tunable down to 5%; live at most 3%). */
   readonly dailyStopBps: Bps;
-  /** Limit 10: -50% from the peak (H; tunable down to 10%). */
+  /** Limit 10: -50% from the peak (H; tunable down to 10%; live at most 15%). */
   readonly peakHaltBps: Bps;
   /** Limit 12: equity above this halts (2.0 SOL). */
   readonly sanityMaxLamports: Lamports;
@@ -203,6 +210,10 @@ interface CheckedPolicy {
 
 function checkPolicy(input: EquityPolicy): CheckedPolicy {
   const p = object('policy', input);
+  const mode = p.mode;
+  if (mode !== 'paper' && mode !== 'live') {
+    throw new RiskError('the equity policy is for a paper or a live account');
+  }
   const sanityMax = amount('sanityMaxLamports', p.sanityMaxLamports);
   const bankroll = amount('bankrollLamports', p.bankrollLamports);
   if (sanityMax < 1n || sanityMax > HARD_SANITY_MAX) {
@@ -211,9 +222,10 @@ function checkPolicy(input: EquityPolicy): CheckedPolicy {
   if (bankroll < 1n) {
     throw new RiskError('bankrollLamports must be positive');
   }
+  const live = mode === 'live';
   return {
-    dailyStopBps: BigInt(threshold('dailyStopBps', p.dailyStopBps, HARD_DAILY_STOP_BPS)),
-    peakHaltBps: BigInt(threshold('peakHaltBps', p.peakHaltBps, HARD_PEAK_HALT_BPS)),
+    dailyStopBps: BigInt(threshold('dailyStopBps', p.dailyStopBps, live ? LIVE_CAPS.dailyStopBps : HARD_DAILY_STOP_BPS)),
+    peakHaltBps: BigInt(threshold('peakHaltBps', p.peakHaltBps, live ? LIVE_CAPS.peakHaltBps : HARD_PEAK_HALT_BPS)),
     sanityMax,
     bankrollCap: bankroll * BigInt(threshold('sanityBankrollMultiple', p.sanityBankrollMultiple, HARD_SANITY_MULTIPLE)),
     jumpBps: BigInt(threshold('jumpBps', p.jumpBps, HARD_JUMP_BPS)),

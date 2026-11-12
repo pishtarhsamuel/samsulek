@@ -2,12 +2,14 @@
 // before it is sized. Pure: the engine reads flags, breakers, cooldowns and counters into an
 // EntryState, and an empty answer is the only "yes". Every reason that applies is reported, so the
 // owner sees all of them at once. Exits never pass through here: reduce-only exits are always
-// allowed (s.9). A malformed state throws RiskError, which the engine treats as "refuse".
+// allowed (s.9). A malformed state throws RiskError, which the engine treats as "refuse". The
+// configured entries per day and position cap never count above their hard values (live: LIVE_CAPS).
+import { HARD_CAPS, LIVE_CAPS } from '../config/caps.ts';
 import { STRATEGY_IDS, isIdText, isStrategyId, type StrategyId } from '../core/ids.ts';
 import { isMillis } from '../core/time.ts';
 import { RiskError } from './reserve.ts';
 
-/** s.7: entries wait for 15 minutes of clean data after a halt clears (moves to config in step 5). */
+/** s.7: entries wait for 15 minutes of clean data after a halt clears (a policy value; the tunables arrive in step 5b). */
 const HALT_RECOVERY_MS = 15 * 60_000;
 
 export type StrategyMode = 'off' | 'paper' | 'live';
@@ -260,7 +262,13 @@ export function entryBlocks(state: EntryState, entryInput: EntryCheck): readonly
   const creators = container('blockedCreators', state.blockedCreators, Set);
   add('creator-blocked', entry.creator !== null && creators.has(entry.creator));
   add('token-active', container('activeMints', state.activeMints, Set).has(entry.mint));
-  add('entries-per-day', counter('entriesToday', state.entriesToday, 0) >= counter('entriesPerDay', state.entriesPerDay, 1));
-  add('max-positions', counter('activePositions', state.activePositions, 0) >= counter('maxPositions', state.maxPositions, 1));
+  // The configured counts, never above the hard ones (limits 3 and 13; a live entry: 5 a day). The
+  // day's count is every entry of the day, paper and live, so a busy paper strategy can only use up
+  // live entries, never add to them.
+  const hardPerDay = entry.mode === 'live' ? Math.min(HARD_CAPS.entriesPerDay, LIVE_CAPS.entriesPerDay) : HARD_CAPS.entriesPerDay;
+  const perDay = Math.min(counter('entriesPerDay', state.entriesPerDay, 1), hardPerDay);
+  const positionCap = Math.min(counter('maxPositions', state.maxPositions, 1), HARD_CAPS.openPositions);
+  add('entries-per-day', counter('entriesToday', state.entriesToday, 0) >= perDay);
+  add('max-positions', counter('activePositions', state.activePositions, 0) >= positionCap);
   return Object.freeze(reasons);
 }

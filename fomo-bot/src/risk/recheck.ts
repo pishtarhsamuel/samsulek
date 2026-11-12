@@ -21,6 +21,7 @@
 // - An exit's origin is 'owner' only for an authenticated /panic or /sell; every other exit is
 //   'automatic' and bound by the failed-fee budget, the 2-day stop and the sell simulation.
 // Withdraw plans never come here (their own path, RISK_POLICY.md s.14).
+import { HARD_CAPS } from '../config/caps.ts';
 import { isIdText } from '../core/ids.ts';
 import {
   bps,
@@ -52,30 +53,30 @@ import { RiskError, attemptCost } from './reserve.ts';
 
 declare const checkedBrand: unique symbol;
 
-/** RISK_POLICY.md limits 16-20: the H values. Move to config/caps.ts HARD_CAPS in step 5. */
-const HARD_BUY_SLIPPAGE_BPS = 300;
-const HARD_CU_LIMIT = 300_000;
-const HARD_CU_PRICE_BUY = 200_000n;
-const HARD_CU_PRICE_EXIT = 400_000n;
-const HARD_LANDING_BUY_BPS = 30;
-const HARD_LANDING_EXIT_BPS = 60;
+/** RISK_POLICY.md limits 16-20: the H values, from config/caps.ts (the one place they live). */
+const HARD_BUY_SLIPPAGE_BPS = HARD_CAPS.buySlippageBps;
+const HARD_CU_LIMIT = HARD_CAPS.cuLimit;
+const HARD_CU_PRICE_BUY = HARD_CAPS.cuPriceMicroLamports;
+const HARD_CU_PRICE_EXIT = HARD_CAPS.exitCuPriceMicroLamports;
+const HARD_LANDING_BUY_BPS = HARD_CAPS.landingSpendBps;
+const HARD_LANDING_EXIT_BPS = HARD_CAPS.exitLandingSpendBps;
 /** Limit 19: 0, 1,000 (Jito) or 5,000 (Helius SWQOS-only) lamports; never a 0.001 SOL service. */
 const ALLOWED_TIPS = [
-  ['none', 0n],
-  ['jito', 1_000n],
-  ['helius-swqos', 5_000n],
+  ['none', HARD_CAPS.tipLamports[0]],
+  ['jito', HARD_CAPS.tipLamports[1]],
+  ['helius-swqos', HARD_CAPS.tipLamports[2]],
 ] as const;
 /** The CU limit is at most this many tenths of the simulated units (1.2 x), compared exactly. */
-const CU_SIMULATED_TENTHS = 12n;
+const CU_SIMULATED_TENTHS = BigInt(HARD_CAPS.cuSimulatedTenths);
 /**
  * Backstops that hold whatever sizing says (RISK_POLICY.md limit 2 "holds even if equity is
  * misread"): a buy's swap input is at most 0.06 SOL (limit 2) and at least 0.01 SOL (the floor of
  * limit 15), and its worst-case spend (input + rent + every attempt) at most 0.07 SOL, a margin
- * above limit 2's 0.0617. They never loosen anything and move to config/caps.ts with the others.
+ * above limit 2's 0.0617. They never loosen anything.
  */
-const HARD_MAX_BUY_IN = 60_000_000n;
-const HARD_MIN_BUY_IN = 10_000_000n;
-const HARD_MAX_BUY_SPEND = 70_000_000n;
+const HARD_MAX_BUY_IN = HARD_CAPS.positionLamports;
+const HARD_MIN_BUY_IN = HARD_CAPS.minTradeFloorLamports;
+const HARD_MAX_BUY_SPEND = HARD_CAPS.buyMaxSpendLamports;
 const STATUSES: readonly ExitPositionStatus[] = ['opening', 'open', 'exiting', 'stuck', 'closed'];
 
 export interface PlanCaps {

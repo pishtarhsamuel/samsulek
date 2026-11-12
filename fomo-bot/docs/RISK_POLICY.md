@@ -32,6 +32,17 @@ SOL) exposure, 5 entries/day, -3% daily, -15% peak, 0.5% of pool. EUR caps are c
 `arm-live` and each 00:00 Athens (Jupiter SOL/USD, ECB EUR/USD, rounded down); the lower of
 the SOL and EUR cap applies; no price means no live entries.
 
+The code enforces this whatever the config says (Phase 2 step 5; REVIEWS.md K, N1, and L):
+sizing and the independent limit check clamp every configured cap to its H value (a live
+entry: also to `LIVE_CAPS` and today's EUR caps in lamports, and a live entry without them is
+refused, `sizing:no-live-price`); the entry blocks count at most 12 entries a day (a live entry
+5) and 4 positions; the fee reserve never counts below its H inputs; the day state refuses a
+threshold looser than its H value (live: than `LIVE_CAPS`). Two consequences to know before
+live: at 5% per trade a live entry needs at least 0.4 SOL of equity at the 0.02 SOL minimum
+trade (0.2 SOL at the 0.01 SOL floor), below that all entries stop (s.6 step 4); and the day's
+entry count is every entry, paper and live, so paper entries can use up the 5 live ones (never
+the other way round; counting per mode needs the owner's OK).
+
 ## 3. Limits
 
 | # | Limit | Value | Kind | Source, why |
@@ -181,6 +192,10 @@ while they hold), so the engine sets and keeps the persistent flags itself.
    observation. A cap on "days since the last observation" would be wrong, because a restart
    after days of downtime is legitimate. An owner-only day rebase for the case where the
    stored day really is ahead of real time is still to be written (open, before Phase 7).
+9. The policy's mode is not checked against anything here (REVIEWS.md L, risk finding 3):
+   the live ledger's day state always gets the live policy (`mode: 'live'`, held to
+   `LIVE_CAPS`), taken from the same source as the live approval authority's mode, never
+   from a strategy, Telegram or the AI.
 
 ## 5. The 5% cost rule: exactly what it counts
 
@@ -212,11 +227,14 @@ Honest note: pump.fun and PumpSwap trades start at about 2.5% in venue fees alon
 2. size = lowest of: 10% x equity; 0.06 SOL (live: `LIVE_CAPS`); exposure room (percent and
    absolute, opening positions at maxSpend, the new position too); launch room; 0.5% x pool
    liquidity; free SOL (minus the maxSpend of buys in flight) minus the fee reserve after
-   this buy, rent and the fees of all allowed attempts. The binding cap is logged.
+   this buy, rent and the fees of all allowed attempts. Those fees are set aside at the hard
+   fee caps (5,000 + 200,000 uL/CU x 300,000 CU + the 5,000 tip = 70,000 lamports per
+   attempt), never at the fees the plan declares, so a planner cannot buy a larger size by
+   declaring cheaper fees (REVIEWS.md K, N4). The binding cap is logged.
 3. Live ramp: half of that for a strategy's first 20 live trades. `sizeHint: 'min'` uses
    the minimum trade (with the ramp on, only if the capped size is at least twice it).
 4. If the result is below the minimum trade (the larger of the pool's cost-rule minimum and
-   the configured minimum): reject this entry. Only if 10% of equity is below the
+   the configured minimum): reject this entry. Only if 10% of equity (live: 5%) is below the
    configured minimum: stop all entries and tell the owner once (a pool's cost rule can
    never stop the bot).
 5. Risk re-checks the plan and issues the token in transaction T1 (ARCHITECTURE s.4),
@@ -264,8 +282,9 @@ Honest note: pump.fun and PumpSwap trades start at about 2.5% in venue fees alon
    id, the quote) comes from the caller, so the transaction around it must re-read them inside
    the transaction. The approval step passes "no earlier buy order" for a new position only
    because the position is new: the partial unique index on positions(mint) stays in T1. Its
-   caps come from the config; until config/caps.ts clamps them against the hard values
-   (step 5; a gate recorded in REVIEWS.md K), only the re-check's backstops are hard.
+   caps come from the config and are clamped to the hard values (s.2): once by the approval
+   step itself and again inside sizing and the independent limit check, so one forgotten
+   clamp cannot loosen a limit. The re-check's backstops hold on top.
 
 ## 7. Cooldowns (P)
 

@@ -3,17 +3,19 @@
 // TEST_PLAN.md s.3 step 4. Written before the implementation.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { lamports, microLamportsPerCu } from '../../../src/core/units.ts';
+import { AmountError, lamports, microLamportsPerCu, type Lamports } from '../../../src/core/units.ts';
 import {
+  BASE_FEE_PER_SIGNATURE,
   RiskError,
   attemptCost,
   feeReserve,
   maxSpend,
   positionExitBudget,
+  reserveCapsInEffect,
   type ReserveCaps,
 } from '../../../src/risk/reserve.ts';
 
-// The HARD_CAPS values of RISK_POLICY.md s.3 and s.3a (config/caps.ts arrives in step 5).
+// The HARD_CAPS values of RISK_POLICY.md s.3 and s.3a (config/caps.ts).
 const CAPS: ReserveCaps = {
   baseFeePerSignature: lamports(5_000n),
   exitSignatures: 1,
@@ -74,6 +76,45 @@ describe('the reserve after a buy (N = positions including the new one)', () => 
   it('twice the measured p95 exit costs when they are the largest', () => {
     // 2 x (6,000,000 + 6,000,000) = 24,000,000 > 2 x 3,380,000 + 1,488,440 and > the floor
     assert.equal(feeReserve({ p95ExitCosts: p95(2, 6_000_000n), wsolHelper: true }, CAPS), 24_000_000n);
+  });
+});
+
+describe('a config can only raise the reserve (REVIEWS.md K, N1)', () => {
+  it('values below the hard ones count as the hard ones: 0.01 SOL floor, 2 x p95, 9 x 3 attempts at 400,000 x 300,000, the 5,000 tip and base fee', () => {
+    const low: ReserveCaps = {
+      ...CAPS,
+      baseFeePerSignature: lamports(0n),
+      exitCuPriceMax: microLamportsPerCu(1n),
+      cuLimitMax: 1,
+      retryWindows: 1,
+      attemptsPerWindow: 1,
+      landedTipMax: lamports(0n),
+      reserveFloor: lamports(0n),
+      p95Multiplier: 1,
+    };
+    assert.deepEqual(reserveCapsInEffect(low), CAPS);
+    assert.ok(Object.isFrozen(reserveCapsInEffect(low)));
+    assert.equal(positionExitBudget(low), 3_380_000n);
+    assert.equal(feeReserve({ p95ExitCosts: p95(4), wsolHelper: true }, low), 15_008_440n);
+    assert.equal(feeReserve({ p95ExitCosts: p95(1), wsolHelper: false }, low), 10_000_000n);
+    assert.equal(feeReserve({ p95ExitCosts: p95(2, 6_000_000n), wsolHelper: true }, low), 24_000_000n);
+  });
+
+  it('values above the hard ones raise it', () => {
+    const high: ReserveCaps = { ...CAPS, reserveFloor: lamports(20_000_000n), p95Multiplier: 3, retryWindows: 10 };
+    assert.equal(positionExitBudget(high), 10n * 3n * 125_000n + 5_000n);
+    assert.equal(feeReserve({ p95ExitCosts: p95(1), wsolHelper: false }, high), 20_000_000n);
+    assert.equal(feeReserve({ p95ExitCosts: p95(2, 6_000_000n), wsolHelper: true }, high), 36_000_000n); // 3 x 12M
+  });
+
+  it('the signature count and the helper rent are facts: checked, never raised or lowered; the base fee is 5,000', () => {
+    assert.equal(reserveCapsInEffect({ ...CAPS, exitSignatures: 2 }).exitSignatures, 2);
+    assert.equal(reserveCapsInEffect({ ...CAPS, wsolHelperRent: lamports(0n) }).wsolHelperRent, 0n);
+    assert.equal(BASE_FEE_PER_SIGNATURE, 5_000n);
+    assert.throws(() => reserveCapsInEffect({ ...CAPS, exitSignatures: 0 }), RiskError);
+    assert.throws(() => reserveCapsInEffect({ ...CAPS, wsolHelperRent: -1n as Lamports }), AmountError);
+    assert.throws(() => reserveCapsInEffect({ ...CAPS, exitCuPriceMax: -1n as ReserveCaps['exitCuPriceMax'] }), AmountError);
+    assert.throws(() => reserveCapsInEffect(null as unknown as ReserveCaps), RiskError);
   });
 });
 

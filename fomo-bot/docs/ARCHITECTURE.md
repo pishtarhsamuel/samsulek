@@ -111,7 +111,9 @@ type ApprovalToken = { readonly [approved]: true; id: string; intentId: string; 
 // counts), so a bad token is never burned, and it returns the frozen plan the executor must build its transaction from.
 // Only risk/ and app/ may import anything in risk/ at runtime (architecture test); everyone else imports types. app/ may not
 // re-export risk/ values and is reached at runtime only from cli/; pure folders (core, venues, portfolio, risk, strategies,
-// exits) import only pure folders at runtime, so purity holds across imports; there are no symlinks under src/.
+// exits) import only pure folders at runtime, so purity holds across imports, with one exception: config/caps.ts, held to
+// the pure rules itself, which imports and re-exports nothing at runtime and which any folder may import under its exact
+// name; no two source files differ only in case, and there are no symlinks under src/.
 // These rules are a lint: a tripwire for mistakes, not a sandbox against a hostile file. What holds against hostile code
 // is review, the issuer/verifier split, the signer's own policy, and (later) running untrusted parts in separate processes.
 type RiskDecision = { approved: false; intentId: string; reasons: string[]; checks: string[] }
@@ -174,6 +176,11 @@ export const HARD_CAPS = { tradePctBps: 1_000, openPositions: 4, exposurePctBps:
 // TUNABLE_BOUNDS: every /set bound of RISK_POLICY s.12; a test asserts each max <= its HARD_CAPS entry (floors: min >=).
 // LIVE_CAPS: the root's stricter values, used in live until owner decision 9 (RISK_POLICY s.2).
 // HARD_CAPS, TUNABLE_BOUNDS and LIVE_CAPS all live in config/caps.ts, the one file the guard hook makes ask (owner OK).
+// The tables are deep-frozen; risk/ and every check read their hard values from this one file. risk/ never uses a
+// configured cap as it is: sizing and the independent limit check clamp each ceiling to HARD_CAPS (a live entry: also
+// LIVE_CAPS and today's EUR caps in lamports; none means no live entry), the entry blocks clamp the entries per day and
+// the position cap, the fee reserve never counts below its hard inputs, and the day state refuses a looser threshold. So
+// a bad config can only be stricter; the config loader (step 5b) also refuses any tunable outside TUNABLE_BOUNDS.
 const ServerFile = z.object({   // /config/fomo-bot.json from /etc/fomo-bot (read-only mount), never in git or Telegram
   providers: z.array(ProviderSpec).min(1), paperStartingLamports: LamportsString,
   withdrawAddress: AddressStr.optional(), probePayer: AddressStr.optional(), // public keys only: rejects 64-byte keys, arrays

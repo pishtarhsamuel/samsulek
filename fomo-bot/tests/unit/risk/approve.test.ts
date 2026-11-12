@@ -61,8 +61,26 @@ const PLAN: OrderPlan = {
 };
 /** One attempt at the plan's fees: 5,000 + ceil(200,000 x 300,000 / 10^6) + 1,000. */
 const ATTEMPT = 66_000n;
-/** What sizing sets aside beyond the size: the rent and every allowed attempt (3). */
+/** The plan's own worst case beyond its input: the rent and every allowed attempt (3) at its fees. */
 const OVERHEAD = 1_488_440n + 3n * ATTEMPT;
+/**
+ * What sizing sets aside beyond the size: the rent and every allowed attempt at the HARD fee caps,
+ * 5,000 + 60,000 + the 5,000 tip = 70,000 each, whatever fees the plan declares (REVIEWS.md K, N4).
+ */
+const SET_ASIDE = 1_488_440n + 3n * 70_000n;
+
+/** Every sizing ceiling far above its hard value (REVIEWS.md K, N1). */
+const LOOSE = {
+  ...SIZING_CAPS,
+  perTradeBps: bps(10_000),
+  maxPositionLamports: L(10_000_000_000n),
+  exposureBps: bps(10_000),
+  maxExposureLamports: L(100_000_000_000n),
+  launchShareBps: bps(10_000),
+  poolShareBps: bps(10_000),
+};
+/** Today's EUR caps in lamports for a live entry: EUR 5 and EUR 10 at about EUR 125 per SOL. */
+const EUR_CAPS = { positionLamports: L(40_000_000n), exposureLamports: L(80_000_000n) };
 
 const SELL: OrderPlan = { ...PLAN, orderId: 'order-2', kind: 'sell', inAmount: 400_000n, rentLamports: lamports(0n) };
 const PAPER_MODES: Readonly<Record<StrategyId, 'paper'>> = { crowdflow: 'paper', momentum: 'paper', launch: 'paper' };
@@ -127,9 +145,26 @@ function scenario(patch: Patch = {}): BuyApprovalInput {
       liveRampHalf: false,
       ...patch.market,
     },
-    caps: { sizing: SIZING_CAPS, reserve: RESERVE_CAPS, plan: CAPS, ...patch.caps },
+    caps: { sizing: SIZING_CAPS, reserve: RESERVE_CAPS, plan: CAPS, liveSol: null, ...patch.caps },
   };
 }
+
+/** A live entry that passes under the live caps: a 0.04 SOL plan, simulated, with today's EUR caps. */
+const LIVE: Patch = {
+  intent: { mode: 'live' },
+  plan: { mode: 'live', inAmount: 40_000_000n, expectedOut: 800_000_000n, minOut: 784_000_000n },
+  flags: { modes: { ...PAPER_MODES, crowdflow: 'live' } },
+  market: { simulatedCu: 250_000, quotedOut: 800_000_000n },
+  caps: { liveSol: EUR_CAPS },
+};
+const live = (patch: Patch = {}): Patch => ({
+  intent: { ...LIVE.intent, ...patch.intent },
+  plan: { ...LIVE.plan, ...patch.plan },
+  world: { ...patch.world },
+  flags: { ...LIVE.flags, ...patch.flags },
+  market: { ...LIVE.market, ...patch.market },
+  caps: { ...LIVE.caps, ...patch.caps },
+});
 
 /** An opening position carries its worst-case spend, the others their value (what each counts for in the caps). */
 function pos(id: string, mint: string, status: ActivePosition['status'], value: bigint, strategy: StrategyId = 'crowdflow', p95 = 125_000n): ActivePosition {
@@ -284,8 +319,8 @@ describe('sizing sees every position and the SOL buys in flight still hold (s.6 
 
   it('a plan above what is left under a cap is refused by the re-check, to the lamport', () => {
     const exposed = (used: bigint) => decide({ world: { positions: [pos('p1', 'M1', 'open', used)] } }).decision;
-    // room = 300M - used - overhead; the plan needs 55M
-    const exact = 300_000_000n - 55_000_000n - OVERHEAD;
+    // room = 300M - used - what sizing sets aside; the plan needs 55M
+    const exact = 300_000_000n - 55_000_000n - SET_ASIDE;
     assert.equal(exposed(exact).approved, true);
     assert.deepEqual(refused(exposed(exact + 1n)).reasons, ['plan:in-amount-above-sized']);
   });
@@ -293,7 +328,7 @@ describe('sizing sees every position and the SOL buys in flight still hold (s.6 
   it('SOL held back for buys in flight: the free SOL is the wallet minus the opening positions\' spend, minus the reserve after this buy', () => {
     // one opening position holding 20M; N = 2 positions after this buy, so the reserve is the 10M floor
     const opening = [pos('p1', 'M1', 'opening', 20_000_000n)];
-    const need = 20_000_000n + 55_000_000n + 10_000_000n + OVERHEAD;
+    const need = 20_000_000n + 55_000_000n + 10_000_000n + SET_ASIDE;
     assert.equal(decide({ world: { positions: opening, walletSol: L(need) } }).decision.approved, true);
     assert.deepEqual(refused(decide({ world: { positions: opening, walletSol: L(need - 1n) } }).decision).reasons, ['plan:in-amount-above-sized']);
     // the same wallet with an OPEN position of that value holds nothing back
@@ -305,21 +340,21 @@ describe('sizing sees every position and the SOL buys in flight still hold (s.6 
     const three = [pos('p1', 'M1', 'open', 10_000_000n), pos('p2', 'M2', 'open', 10_000_000n), pos('p3', 'M3', 'open', 10_000_000n)];
     const reserve4 = feeReserve({ p95ExitCosts: [L(125_000n), L(125_000n), L(125_000n), L(125_000n)], wsolHelper: false }, RESERVE_CAPS);
     assert.equal(reserve4, 13_520_000n); // 4 x 3,380,000: above the 10M floor, so the count of positions matters
-    const need = 55_000_000n + reserve4 + OVERHEAD;
+    const need = 55_000_000n + reserve4 + SET_ASIDE;
     assert.equal(decide({ world: { positions: three, walletSol: L(need) } }).decision.approved, true);
     assert.deepEqual(refused(decide({ world: { positions: three, walletSol: L(need - 1n) } }).decision).reasons, ['plan:in-amount-above-sized']);
   });
 
   it('the wSOL helper rent is held back when any exit needs it', () => {
     const three = [pos('p1', 'M1', 'open', 10_000_000n), pos('p2', 'M2', 'open', 10_000_000n), pos('p3', 'M3', 'open', 10_000_000n)];
-    const need = 55_000_000n + 13_520_000n + 1_488_440n + OVERHEAD;
+    const need = 55_000_000n + 13_520_000n + 1_488_440n + SET_ASIDE;
     assert.equal(decide({ world: { positions: three, walletSol: L(need) }, market: { wsolHelper: true } }).decision.approved, true);
     assert.equal(refused(decide({ world: { positions: three, walletSol: L(need - 1n) }, market: { wsolHelper: true } }).decision).stage, 'plan');
   });
 
   it('the new position\'s own exit cost joins the reserve (2 x the sum of the p95 costs can be the larger)', () => {
     const big = L(10_000_000n); // a p95 exit cost of 0.01 SOL: 2 x (0 + 10M) = 20M > the 10M floor
-    const need = 55_000_000n + 20_000_000n + OVERHEAD;
+    const need = 55_000_000n + 20_000_000n + SET_ASIDE;
     assert.equal(decide({ world: { walletSol: L(need) }, market: { newPositionP95ExitCost: big } }).decision.approved, true);
     assert.equal(refused(decide({ world: { walletSol: L(need - 1n) }, market: { newPositionP95ExitCost: big } }).decision).stage, 'plan');
   });
@@ -376,7 +411,7 @@ describe('the plan is re-checked against what sizing decided (s.6 step 5)', () =
     ['another intent than the engine\'s', { plan: { intentId: 'intent-9' } }, 'plan:wrong-intent'],
     ['a cheaper fee than risk read (paper would look better)', { plan: { feeBps: bps(0) } }, 'plan:fee-config-mismatch'],
     ['a quote from another slot than risk\'s', { plan: { quoteSlot: 999n } }, 'plan:quote-slot-mismatch'],
-    // caps misconfigured far above the hard limits: sizing lets 70M through, the re-check's backstop does not (REVIEWS.md K, finding 5)
+    // caps misconfigured far above the hard limits: sizing clamps them, and the re-check's backstop holds on its own too (REVIEWS.md K, finding 5)
     ['a buy above 0.06 SOL under misconfigured caps', { plan: { inAmount: 70_000_000n }, caps: { sizing: { ...SIZING_CAPS, maxPositionLamports: L(500_000_000n) } } }, 'plan:in-amount-above-hard-max'],
   ];
   for (const [name, patch, reason] of planCases) {
@@ -458,9 +493,67 @@ describe('malformed input fails closed (any throw is a refusal for the engine)',
     assert.throws(() => approveBuy(scenario(), null as unknown as ApprovalAuthority['issuer']), RiskError);
     assert.throws(() => approveBuy(scenario(), {} as ApprovalAuthority['issuer']), RiskError);
     // live entry, live plan, paper authority: the issuer refuses (one mode per authority)
-    const live = scenario({ intent: { mode: 'live' }, plan: { mode: 'live' }, flags: { modes: { ...FLAGS.modes, crowdflow: 'live' } }, market: { simulatedCu: 250_000 } });
-    assert.throws(() => approveBuy(live, authority('paper').a.issuer), RiskError);
-    assert.equal(approveBuy(live, authority('live').a.issuer).approved, true);
+    const liveInput = scenario(live());
+    assert.throws(() => approveBuy(liveInput, authority('paper').a.issuer), RiskError);
+    assert.equal(approveBuy(liveInput, authority('live').a.issuer).approved, true);
+  });
+});
+
+describe('the caps in effect: no config loosens a hard limit, and a live entry gets the live ones (REVIEWS.md K, N1)', () => {
+  /** The same decision, to the token, with every sizing ceiling far above its hard value. */
+  const sameAsHard = (patch: Patch): void => {
+    const loose = approveBuy(scenario({ ...patch, caps: { ...patch.caps, sizing: LOOSE } }), authority().a.issuer);
+    const hard = approveBuy(scenario(patch), authority().a.issuer);
+    assert.deepEqual(loose, hard);
+  };
+
+  it('sizing caps far above the hard values give exactly the decisions of the hard values', () => {
+    sameAsHard({});
+    sameAsHard({ plan: { inAmount: 60_000_001n } }); // above 0.06 SOL
+    sameAsHard({ world: { equity: { current: L(400_000_000n), dayStart: L(400_000_000n) } } }); // 10% of 0.4 SOL is below the 55M plan
+    sameAsHard({ world: { positions: [pos('p1', 'M1', 'open', 250_000_000n)] } }); // 0.30 SOL of exposure
+    sameAsHard({ market: { poolRealSolReserve: L(5_000_000_000n) } }); // 0.5% of the pool
+    sameAsHard({ intent: { strategy: 'launch' }, world: { positions: [pos('p1', 'MintX', 'open', 60_000_000n, 'launch')] } }); // the launch share
+    sameAsHard({ world: { equity: { current: L(5_000_000_000n), dayStart: L(5_000_000_000n) }, walletSol: L(5_000_000_000n) } });
+    const big = approveBuy(scenario({ caps: { sizing: LOOSE }, world: { equity: { current: L(5_000_000_000n), dayStart: L(5_000_000_000n) }, walletSol: L(5_000_000_000n) } }), authority().a.issuer);
+    assert.equal(big.approved && big.size, 60_000_000n); // not 10% of 5 SOL, not 100% of it
+  });
+
+  it('a config of 40 positions or 100 entries a day still stops at 4 positions and 12 entries', () => {
+    const four = [pos('p1', 'M1', 'open', 1_000_000n), pos('p2', 'M2', 'open', 1_000_000n), pos('p3', 'M3', 'open', 1_000_000n), pos('p4', 'M4', 'open', 1_000_000n)];
+    assert.deepEqual(refused(decide({ world: { positions: four }, flags: { maxPositions: 40 } }).decision).reasons, ['max-positions']);
+    assert.deepEqual(refused(decide({ flags: { entriesPerDay: 100, entriesToday: 12 } }).decision).reasons, ['entries-per-day']);
+    assert.equal(decide({ flags: { entriesPerDay: 100, entriesToday: 11 } }).decision.approved, true);
+  });
+
+  it('a live entry is sized under the live caps: 5% per trade, EUR 5 per position, EUR 10 of exposure, 5 entries a day', () => {
+    const ok = approveBuy(scenario(live()), authority('live').a.issuer);
+    assert.equal(ok.approved && ok.size, 40_000_000n); // EUR 5 in lamports
+    assert.equal(ok.approved && ok.binding, 'per-position');
+    // the paper plan of 0.055 SOL is too big live: 5% of 1 SOL is 0.05 SOL and EUR 5 is 0.04 SOL
+    assert.deepEqual(refused(approveBuy(scenario(live({ plan: { inAmount: 55_000_000n } })), authority('live').a.issuer)).reasons, ['plan:in-amount-above-sized']);
+    // EUR caps worth more than the hard caps: 5% of equity binds
+    const rich = approveBuy(scenario(live({ caps: { liveSol: { positionLamports: L(1_000_000_000n), exposureLamports: L(1_000_000_000n) } } })), authority('live').a.issuer);
+    assert.equal(rich.approved && rich.size, 50_000_000n);
+    assert.equal(rich.approved && rich.binding, 'per-trade');
+    // EUR 10 of exposure: an open 0.04 SOL position leaves 80M - 40M - what sizing sets aside, below the 40M plan
+    const exposed = refused(approveBuy(scenario(live({ world: { positions: [pos('p1', 'M1', 'open', 40_000_000n)] } })), authority('live').a.issuer));
+    assert.deepEqual(exposed.reasons, ['plan:in-amount-above-sized']);
+    // 5 live entries a day, although the config says 8
+    assert.deepEqual(refused(approveBuy(scenario(live({ flags: { entriesToday: 5 } })), authority('live').a.issuer)).reasons, ['entries-per-day']);
+    assert.equal(approveBuy(scenario(live({ flags: { entriesToday: 4 } })), authority('live').a.issuer).approved, true);
+  });
+
+  it("a live entry needs today's EUR caps: none (no price today) refuses it at sizing, nothing minted", () => {
+    const { a, minted } = authority('live');
+    assert.deepEqual(refused(approveBuy(scenario(live({ caps: { liveSol: null } })), a.issuer)), { approved: false, stage: 'sizing', reasons: ['sizing:no-live-price'] });
+    assert.equal(minted(), 0);
+    assert.deepEqual(refused(approveBuy(scenario(live({ caps: { liveSol: null }, flags: { paused: true } })), a.issuer)).reasons, ['pause']); // the blocks come first
+    assert.equal(decide({ caps: { liveSol: null } }).decision.approved, true); // paper never needs them
+    const negative = { positionLamports: -1n, exposureLamports: L(1n) } as unknown as typeof EUR_CAPS;
+    assert.throws(() => approveBuy(scenario(live({ caps: { liveSol: negative } })), a.issuer), AmountError);
+    assert.throws(() => approveBuy(scenario({ caps: { liveSol: 'none' as unknown as typeof EUR_CAPS } }), authority().a.issuer), RiskError);
+    assert.throws(() => approveBuy(scenario({ caps: { liveSol: undefined as unknown as typeof EUR_CAPS } }), authority().a.issuer), RiskError);
   });
 });
 
@@ -468,6 +561,8 @@ describe('buyLimitViolations: the last, independent check of the hard limits, fr
   const ok: BuyLimitCheck = {
     plan: PLAN,
     strategy: 'crowdflow',
+    mode: 'paper',
+    liveSol: null,
     activePositions: 0,
     maxPositions: 4,
     sameMintActive: false,
@@ -510,10 +605,35 @@ describe('buyLimitViolations: the last, independent check of the hard limits, fr
     assert.deepEqual(buyLimitViolations({ ...launch, strategy: 'crowdflow' }), []);
     assert.deepEqual(buyLimitViolations({ ...launch, launchExposure: L(75_000_000n - spend) }), []);
     assert.deepEqual(buyLimitViolations({ ...launch, launchExposure: L(75_000_000n - spend + 1n) }), ['launch']);
-    // the effective cap is the lower of the percentage and the absolute one: 50% of 400M = 200M, so 25% of it is 50M < 56.7M
-    const small = { ...launch, launchExposure: L(0n), sizingEquity: L(400_000_000n), caps: { ...SIZING_CAPS, perTradeBps: bps(2_000) } };
+    // the effective cap is the lower of the percentage and the absolute one: 40% of 550M = 220M, so 25% of it is 55M < 56.7M
+    const small = { ...launch, launchExposure: L(0n), sizingEquity: L(550_000_000n), caps: { ...SIZING_CAPS, exposureBps: bps(4_000) } };
     assert.deepEqual(buyLimitViolations(small), ['launch']);
     assert.deepEqual(buyLimitViolations({ ...small, strategy: 'momentum' }), []);
+  });
+
+  it('caps far above the hard values are checked as the hard values; so is a cap of 40 positions', () => {
+    assert.deepEqual(buyLimitViolations({ ...ok, caps: LOOSE }), []);
+    assert.deepEqual(buyLimitViolations({ ...ok, caps: LOOSE, sizingEquity: L(549_999_999n) }), ['per-trade']); // 10%
+    assert.deepEqual(buyLimitViolations({ ...ok, caps: LOOSE, plan: { ...PLAN, inAmount: 60_000_001n } }), ['per-position']); // 0.06 SOL
+    assert.deepEqual(buyLimitViolations({ ...ok, caps: LOOSE, sizingEquity: L(550_000_000n), exposure: L(275_000_000n - spend + 1n) }), ['exposure']); // 50%
+    assert.deepEqual(buyLimitViolations({ ...ok, caps: LOOSE, exposure: L(300_000_000n - spend + 1n) }), ['exposure-absolute']); // 0.30 SOL
+    assert.deepEqual(buyLimitViolations({ ...ok, caps: LOOSE, poolRealSolReserve: L(4_999_999_999n) }), ['pool-share']); // 0.5%
+    assert.deepEqual(buyLimitViolations({ ...ok, caps: LOOSE, strategy: 'launch', launchExposure: L(75_000_000n - spend + 1n) }), ['launch']); // 25% of 0.30 SOL
+    assert.deepEqual(buyLimitViolations({ ...ok, maxPositions: 40, activePositions: 4 }), ['positions']);
+    assert.deepEqual(buyLimitViolations({ ...ok, maxPositions: 40, activePositions: 3 }), []);
+  });
+
+  it("a live entry is checked against the live caps, and needs today's EUR caps", () => {
+    const liveCheck: BuyLimitCheck = { ...ok, mode: 'live', liveSol: EUR_CAPS };
+    assert.deepEqual(buyLimitViolations(liveCheck), ['per-trade', 'per-position']); // 55M: above 5% of 1 SOL and above EUR 5
+    const forty: BuyLimitCheck = { ...liveCheck, plan: { ...PLAN, mode: 'live', inAmount: 40_000_000n } };
+    const fortySpend = 40_000_000n + OVERHEAD;
+    assert.deepEqual(buyLimitViolations(forty), []);
+    assert.deepEqual(buyLimitViolations({ ...forty, exposure: L(80_000_000n - fortySpend) }), []);
+    assert.deepEqual(buyLimitViolations({ ...forty, exposure: L(80_000_000n - fortySpend + 1n) }), ['exposure-absolute']); // EUR 10
+    assert.deepEqual(buyLimitViolations({ ...forty, sizingEquity: L(799_999_999n) }), ['per-trade']); // 5% of it is 39,999,999
+    assert.deepEqual(buyLimitViolations({ ...forty, sizingEquity: L(200_000_000n), caps: SIZING_CAPS }), ['per-trade', 'exposure']); // 5% = 10M, 20% = 40M
+    assert.throws(() => buyLimitViolations({ ...liveCheck, liveSol: null }), RiskError);
   });
 
   it('several violations are all reported, in a fixed order', () => {
@@ -523,6 +643,8 @@ describe('buyLimitViolations: the last, independent check of the hard limits, fr
   it('a malformed check fails closed', () => {
     assert.throws(() => buyLimitViolations({ ...ok, walletSol: -1n as Lamports }), Error);
     assert.throws(() => buyLimitViolations({ ...ok, maxPositions: 0 }), RiskError);
+    assert.throws(() => buyLimitViolations({ ...ok, activePositions: -1 }), RiskError);
+    assert.throws(() => buyLimitViolations({ ...ok, mode: 'demo' as 'paper' }), RiskError);
     assert.throws(() => buyLimitViolations({ ...ok, plan: { ...PLAN, attempts: 0 } }), RiskError);
   });
 });

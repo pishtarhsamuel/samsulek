@@ -71,6 +71,18 @@ const RUNTIME_ONLY_FROM: Readonly<Record<string, readonly string[]>> = {
 const CLOCK_FILES = new Set(['core/clock.ts', 'core/rng.ts']);
 const RNG_FILE = 'core/rng.ts';
 
+/**
+ * Single files outside the pure folders that any folder may import at runtime: config/caps.ts holds
+ * only the hard limits, and the risk code clamps every configured cap against them. Such a file is
+ * held to the pure rules, and it imports and re-exports nothing at runtime (its list is the only
+ * Node built-ins it may use), so it cannot hand its importers anything from its own folder's edges
+ * (REVIEWS.md L, security finding 1). Keys are lower case; the exception is granted only to an
+ * import that names the file in its exact case, and no two source files may differ only in case.
+ */
+const PURE_FILES: Readonly<Record<string, readonly string[]>> = {
+  'config/caps.ts': [],
+};
+
 /** Pure folders and the only Node built-ins each may import (core/clock.ts and core/rng.ts excepted). */
 const PURE: Readonly<Record<string, readonly string[]>> = {
   core: [],
@@ -252,10 +264,16 @@ export function checkSource(rel: string, text: string): string[] {
     return [`${rel}: unknown top-level folder "${folder}"`];
   }
   const source = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const pure = CLOCK_FILES.has(rel) ? undefined : PURE[folder];
+  // A pure file is found whatever the case of its name (a look-alike `Caps.ts` is held to the same rules).
+  const pureFile = Object.hasOwn(PURE_FILES, rel.toLowerCase()) ? PURE_FILES[rel.toLowerCase()] : undefined;
+  const pure = CLOCK_FILES.has(rel) ? undefined : (pureFile ?? PURE[folder]);
   const declared = pure === undefined ? new Set<string>() : declaredNames(source);
 
   const checkSpecifier = (spec: string, typeOnly: boolean, reexport = false): void => {
+    if (pureFile !== undefined && !typeOnly && !spec.startsWith('node:')) {
+      problems.push(`${rel}: a pure file outside the pure folders imports and re-exports nothing at runtime ("${spec}")`);
+      return;
+    }
     if (spec.startsWith('node:')) {
       if (pure !== undefined && !typeOnly && !pure.includes(spec)) {
         problems.push(`${rel}: ${spec} is not allowed in ${folder}/ (pure code)`);
@@ -286,7 +304,8 @@ export function checkSource(rel: string, text: string): string[] {
       if (onlyFrom !== undefined && !typeOnly && reexport && folder.toLowerCase() !== targetFolder.toLowerCase()) {
         problems.push(`${rel}: ${target} may not be re-exported outside ${targetFolder}/ (types are fine)`);
       }
-      if (typeOnly || targetFolder === folder || allowed.includes('*') || allowed.includes(targetFolder)) {
+      // A pure file only under its exact name: a look-alike in another case is another file on Linux.
+      if (typeOnly || targetFolder === folder || allowed.includes('*') || allowed.includes(targetFolder) || Object.hasOwn(PURE_FILES, target)) {
         return;
       }
       problems.push(`${rel}: ${folder}/ may not import ${targetFolder}/ ("${spec}")`);
@@ -459,6 +478,22 @@ function sourceFiles(): string[] {
     .filter((f) => f.endsWith('.ts'))
     .map((f) => f.split(path.sep).join('/'))
     .sort();
+}
+
+/** Paths that differ only in case: one file on Windows and macOS, two on Linux, so a rule keyed by name could miss one. */
+function caseCollisions(files: readonly string[]): string[] {
+  const seen = new Map<string, string>();
+  const clashes: string[] = [];
+  for (const file of files) {
+    const key = file.toLowerCase();
+    const first = seen.get(key);
+    if (first === undefined) {
+      seen.set(key, file);
+    } else {
+      clashes.push(`${first} and ${file}`);
+    }
+  }
+  return clashes;
 }
 
 const flagged = (cases: readonly (readonly [string, string])[]): void => {
@@ -675,6 +710,41 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       const bad = (ALLOWED[folder] ?? []).filter((target) => target !== folder && !(target in PURE));
       assert.deepEqual(bad, [], `${folder}/ may import only pure folders (${Object.keys(PURE).join(', ')})`);
     }
+  });
+
+  it('config/caps.ts is the one file of config/ that pure code may import at runtime, and it is held to the pure rules itself', () => {
+    assert.deepEqual(checkSource('risk/x.ts', "import { HARD_CAPS } from '../config/caps.ts';"), []);
+    assert.deepEqual(checkSource('portfolio/x.ts', "import { HARD_CAPS } from '../config/caps.ts';"), []);
+    assert.deepEqual(checkSource('config/caps.ts', "import type { Lamports } from '../core/units.ts'; export const x = 1;"), []); // types are erased
+    flagged([
+      ['config/caps.ts', "import { readFileSync } from 'node:fs';"],
+      ['config/caps.ts', 'export const now = Date.now();'],
+      ['config/caps.ts', 'console.log(1);'],
+      ['risk/x.ts', "import { load } from '../config/tunables-loader.ts';"],
+    ]);
+  });
+
+  it('CANARY: the caps exception cannot be widened (REVIEWS.md L, security finding 1)', () => {
+    flagged([
+      // a: a look-alike name is another file on Linux: never granted the exception, and held to the pure rules itself
+      ['risk/x.ts', "import { HARD_CAPS } from '../config/Caps.ts';"],
+      ['risk/x.ts', "import { HARD_CAPS } from '../Config/caps.ts';"],
+      ['config/Caps.ts', "import { readFileSync } from 'node:fs';"],
+      // b: caps.ts imports nothing at runtime, not even along config/'s own edges
+      ['config/caps.ts', "import { readFileSync } from '../storage/fsx.ts';"],
+      ['config/caps.ts', "import { lamports } from '../core/units.ts';"],
+      ['config/caps.ts', "import { x } from 'some-package';"],
+      ['config/caps.ts', "const m = import('../storage/fsx.ts');"],
+      // c: nor does it re-export another file, of its own folder or any other
+      ['config/caps.ts', "export { loader } from './loader.ts';"],
+      ['config/caps.ts', "export * from './loader.ts';"],
+      ['config/caps.ts', "export * as all from '../storage/fsx.ts';"],
+    ]);
+    assert.deepEqual(caseCollisions(['config/caps.ts', 'config/Caps.ts', 'risk/a.ts']), ['config/caps.ts and config/Caps.ts']);
+  });
+
+  it('no two source files differ only in case (one file on Windows and macOS, two on Linux)', () => {
+    assert.deepEqual(caseCollisions(sourceFiles()), []);
   });
 
   it('CANARY: a pure folder importing storage/ or config/ at runtime is flagged, types are fine', () => {

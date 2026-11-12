@@ -24,6 +24,7 @@ import {
 } from '../../../src/risk/daystate.ts';
 
 const POLICY: EquityPolicy = {
+  mode: 'paper',
   dailyStopBps: bps(3_000),
   peakHaltBps: bps(5_000),
   sanityMaxLamports: lamports(2_000_000_000n),
@@ -166,6 +167,32 @@ describe('the peak halt (limit 10): -50% from the peak', () => {
 
   it('with no peak yet there is nothing to fall from', () => {
     assert.deepEqual(run(state({ peak: null }), obs(500_000_000n)).trips, []);
+  });
+});
+
+describe('a live account is held to LIVE_CAPS (owner decision 9): -3% a day, -15% from the peak', () => {
+  const LIVE: EquityPolicy = { ...POLICY, mode: 'live', dailyStopBps: bps(300), peakHaltBps: bps(1_500) };
+
+  it('the live stops trip at the live thresholds, exact to the lamport', () => {
+    assert.deepEqual(run(state(), obs(485_000_001n), LIVE).trips, []); // just under 3% down
+    assert.deepEqual(run(state(), obs(485_000_000n), LIVE).trips, ['daily-stop']); // exactly 3%
+    const s = state({ dayStart: L(400_000_000n), lastEquity: L(1_000_000_000n), peak: L(1_000_000_000n) });
+    assert.deepEqual(run(s, obs(850_000_001n), LIVE).trips, []);
+    assert.deepEqual(run(s, obs(850_000_000n), LIVE).trips, ['peak-halt']); // exactly 15% below the peak
+  });
+
+  it('a live policy with the paper thresholds, or anything above the live ones, is refused, not used', () => {
+    for (const patch of [{ dailyStopBps: bps(3_000) }, { dailyStopBps: bps(301) }, { peakHaltBps: bps(5_000) }, { peakHaltBps: bps(1_501) }]) {
+      assert.throws(() => run(state(), obs(500_000_000n), { ...LIVE, ...patch }), RiskError, JSON.stringify(patch));
+    }
+    // tighter is fine; the paper ceilings still apply to paper
+    assert.deepEqual(run(state(), obs(495_000_000n), { ...LIVE, dailyStopBps: bps(100) }).trips, ['daily-stop']);
+    assert.deepEqual(run(state(), obs(495_000_000n), { ...POLICY, dailyStopBps: bps(3_000) }).trips, []);
+  });
+
+  it('the mode must be paper or live', () => {
+    assert.throws(() => run(state(), obs(500_000_000n), { ...POLICY, mode: 'demo' as 'paper' }), RiskError);
+    assert.throws(() => run(state(), obs(500_000_000n), { ...POLICY, mode: undefined as unknown as 'paper' }), RiskError);
   });
 });
 

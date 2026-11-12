@@ -9,7 +9,7 @@
 import { createHash } from 'node:crypto';
 import { isIdText } from '../core/ids.ts';
 import { U64_MAX, echoText, lamports, type Bps, type Lamports, type MicroLamportsPerCu } from '../core/units.ts';
-import { RiskError, attemptCost, maxSpend } from './reserve.ts';
+import { BASE_FEE_PER_SIGNATURE, RiskError, attemptCost, maxSpend } from './reserve.ts';
 
 export const PLAN_MODES = Object.freeze(['paper', 'live'] as const);
 export const PLAN_KINDS = Object.freeze(['buy', 'sell', 'close-account', 'withdraw'] as const);
@@ -262,8 +262,9 @@ export function planHash(plan: OrderPlan): string {
 
 // ---------------------------------------------------------------- worst-case spend
 
-/** The Solana base fee per signature (a protocol constant). Plans carry one signature: ours. */
-export const BASE_FEE_PER_SIGNATURE: Lamports = lamports(5_000n);
+// The Solana base fee per signature lives in reserve.ts (the reserve never counts below it); it is
+// exported here too, where the worst-case spend of a plan uses it.
+export { BASE_FEE_PER_SIGNATURE };
 
 /**
  * The most SOL a plan can cost: a buy's swap input plus the rent plus every allowed attempt at its
