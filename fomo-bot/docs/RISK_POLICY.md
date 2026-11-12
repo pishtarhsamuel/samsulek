@@ -51,10 +51,10 @@ the SOL and EUR cap applies; no price means no live entries.
 | 13 | Entries per day | 8 (P); live until decision 9: 5 | H 12; T [1, 12] | root (8 trades/day; memecoin 5) |
 | 14 | Cost rule | expected round trip at most 5% (section 5) | H 5%; T [2%, 5%] | brief |
 | 15 | Minimum trade | smallest size that meets the cost rule, never below 0.02 SOL (P) | H floor 0.01 SOL | brief |
-| 16 | Buy slippage tolerance (minOut) | 2% (P) | H 3%; T [0.5%, 3%] | root 300 bps |
-| 17 | Sell slippage tolerance | 3% normal (P); protective and emergency 10% | H 5% normal, 10% emergency; T [1%, 5%] | root flatten 1000 bps |
-| 18 | Landing spend per transaction | priority + tip at most 0.2% of the position (P); CU price at most 200,000 uL/CU (exits 400,000); CU limit 1.2 x simulated, at most 300,000 | H 0.3% (exits 0.6%); T [0.05%, 0.3%] | phase0-execution |
-| 19 | Tips | 0, 1,000 (Jito) or 5,000 (Helius SWQOS-only) lamports; never a 0.001 SOL service | H | VERIFIED_FACTS s.4 |
+| 16 | Buy slippage tolerance (minOut) | 2% (P); the plan's minOut is at least expectedOut x (1 - declared slippage), so a plan cannot declare 2% and accept anything | H 3%; T [0.5%, 3%] | root 300 bps |
+| 17 | Sell slippage tolerance | 3% normal (P); protective and emergency 10% (the same minOut floor) | H 5% normal, 10% emergency; T [1%, 5%] | root flatten 1000 bps |
+| 18 | Landing spend per transaction | priority + tip at most 0.2% of the position (P) for buys and normal exits; CU price at most 200,000 uL/CU (exits 400,000); CU limit 1.2 x simulated, at most 300,000. A protective or emergency exit keeps only the absolute caps (exits are always allowed: at the minimum trade 0.6% could be less than one attempt at the caps). An exit's percentage base is the larger of its expected proceeds and the position's cost basis, so a price collapse cannot forbid every priority fee | H 0.3% (exits 0.6%); T [0.05%, 0.3%] | phase0-execution |
+| 19 | Tips | exactly 0 (none), 1,000 (Jito) or 5,000 (Helius SWQOS-only) lamports, never another amount and never a 0.001 SOL service | H | VERIFIED_FACTS s.4 |
 | 20 | Data freshness | plan reserves and approval tokens at most 25 slots old; marks: 30 s stale = entries off, 60 s = protective exit | H | root 30 s quote age |
 | 21 | Price cross-check | entry only if our reserve price is within 3% of Jupiter Price v3 | H 5%; T [1%, 5%]; D 3% (P) | manipulation guard |
 | 22 | Token age | crowdflow 10 min, launch 3 min, momentum 24 h (avoids Jupiter's young-token fee) (P) | H floor 3 min; T [3 min, 30 days] | brief |
@@ -93,18 +93,83 @@ the SOL and EUR cap applies; no price means no live entries.
   A mark counts only if it quotes exactly the tokens held now (one taken before a partial
   sell is stale). A position with no mark yet, or with a mark stamped in the future (a
   clock problem), is unknown for the stops, never 0, so a restart cannot trip a stop.
+  The state machine (src/risk/daystate.ts) evaluates the stops on this separate stop-equity
+  and never lets it move the baseline, the peak or the last equity. The day is the
+  Europe/Athens calendar day (src/core/day.ts: 23- and 25-hour days included).
 - Start-of-day baseline = the higher of the last equity seen and the first observation of
   the day (root rule: an overnight gap down counts against today).
-- A withdrawal lowers the day baseline and the peak by its amount; a confirmed deposit raises
-  both by its amount. Any other unmatched increase is UNEXPECTED_BALANCE (HALT); the owner
-  classifies it at the server. A sanity breach (over 2.0 SOL or 3 x bankroll) halts and never
-  moves baseline or peak (root `observe_equity`).
+- A withdrawal lowers the day baseline, the peak and the last equity by its amount; a
+  confirmed deposit raises all three by its amount. A withdrawal larger than the last known
+  equity cannot be real and would wipe the baseline (and with it the daily stop and the peak
+  halt), so it fails closed: the engine halts and the owner reconciles. A deposit that would
+  pass 2^64 - 1 is refused too. Any other unmatched increase is UNEXPECTED_BALANCE (HALT); the
+  owner classifies it at the server. A sanity breach (over 2.0 SOL or 3 x bankroll) halts and
+  never moves baseline or peak (root `observe_equity`).
 - "+50% in 1 h" (vs equity 1 h earlier): entries pause; the bot re-reads the wallet and
   re-quotes every position from two fresh samples 10 s apart that agree with Jupiter within 3%.
   If fills, confirmed deposits and these verified marks explain the rise, it clears by itself
   and only then may the peak move; otherwise HALT (owner at the server). Until then baseline
-  and peak stay put, so real pumps count only once verified.
-- Clock moving backwards across a day boundary halts (root rule).
+  and peak stay put, so real pumps count only once verified. A confirmation is only possible
+  for a held jump and records the verified equity (a fresh, fully valued read, within the
+  sanity limits): for the next hour a rise is measured from
+  the higher of the hour-ago snapshot and that verified level, so the same rise is not held
+  again and again while the snapshot is still from before it (a livelock); a further rise of
+  more than 50% above the verified level holds again, and a confirmation from the future
+  (the clock stepped back) is ignored, which only makes the test stricter.
+- The owner's /resume has two separate effects, never both at once: after a peak halt the
+  peak restarts at the last accepted equity (fully valued and sanity-checked; no caller can
+  supply a value, so a tiny wrong one cannot weaken the halt), refused while a jump is held
+  or when no equity is known; after a daily stop on two days in a row the streak starts
+  again. Today's daily stop still holds until Athens midnight.
+- Clock moving backwards across a day boundary halts (root rule). A clock before 1970 or
+  after the year 2200 is refused as a clock problem, so a wild clock cannot lock a stored day
+  ahead of real time. A clock that jumps forward by a little less (say to 2199) is accepted
+  by this module and then every real observation reads as backwards: that fails closed, and
+  the guard against it belongs to the clock (contract 8 below).
+
+### Engine contracts for the equity and day state (REVIEWS.md I)
+
+The state machine only reports. Trips are level-triggered (reported on every observation
+while they hold), so the engine sets and keeps the persistent flags itself.
+
+1. After every observation, held or not, the returned state is saved in the same SQLite
+   transaction as the flags. The stored shape is versioned (T2); a state saved before a
+   field existed needs a migration, never a default.
+2. HALT on equity-zero, sanity-max, sanity-bankroll and clock-backwards (the stops are
+   skipped on those paths). Pause entries on equity-jump and start the verification above.
+   daily-stop sets DAILY_STOP and entries stay blocked through dailyStopActive until 00:00
+   Athens. daily-stop-twice blocks entries until the owner's streak restart; peak-halt keeps
+   PEAK_HALT until the owner's peak restart. A RiskError from any of these functions turns
+   entries off and alerts the owner. Exits always continue. If both equity and stop-equity
+   are null, entries are off.
+3. confirmEquityJump is called only by the verification routine (or by the owner at the
+   server), with the fully valued equity of a fresh read taken by that verification, never the
+   held observation itself, and the current clock. No strategy, Telegram or AI path can call
+   it. The engine observes again right after it; if no observation lands within the hour the
+   hold returns and needs another confirmation.
+4. The peak restart runs only on the owner's /resume (live: after the 24 h wait with notice,
+   s.12), right after a tick that observed a fully valued equity. The streak restart is a
+   separate owner action. Neither runs automatically.
+5. applyTransfer is called only for an owner deposit or withdrawal confirmed by its signature,
+   in chain order, before the next observation, never for a balance difference or a loss. A
+   classification of a held jump waits for it. A deposit of more than 50% holds once, because
+   the hour-ago snapshot predates it: resolve it with a confirmation or by adjusting the
+   snapshots. If applyTransfer throws (for example a withdrawal while a jump is held and the
+   last equity is still the pre-jump value), the engine HALTs and reconciles; the owner's
+   withdrawal itself never depends on it and is never blocked or undone because of it.
+6. equityAnHourAgo comes from raw, fully valued snapshots recorded by the engine every tick,
+   never from an outside value. Null is acceptable only in the first hour after a start; if it
+   stays null the +50% check is off, so the engine alerts.
+7. By design (as in the root rule) the day baseline does not rise within a day: after a
+   verified rise the daily stop still measures from the morning's baseline, and the peak halt
+   guards the gains. Across midnight a held jump leaves the day unrolled until it is
+   confirmed; the daily stop is not evaluated for the new day meanwhile, the peak halt is.
+8. The clock guard (core/clock.ts, with the engine) accepts an observation only when the
+   clock agrees with an independent time source, for example the latest block time the RPC
+   reports (within about a minute); a reading that does not agree is a halt, not an
+   observation. A cap on "days since the last observation" would be wrong, because a restart
+   after days of downtime is legitimate. An owner-only day rebase for the case where the
+   stored day really is ahead of real time is still to be written (open, before Phase 7).
 
 ## 5. The 5% cost rule: exactly what it counts
 
@@ -143,10 +208,28 @@ Honest note: pump.fun and PumpSwap trades start at about 2.5% in venue fees alon
    the configured minimum): reject this entry. Only if 10% of equity is below the
    configured minimum: stop all entries and tell the owner once (a pool's cost rule can
    never stop the bot).
-5. Risk re-checks the plan (spend, minOut, slippage, fees, cost rule) and issues the token in
-   transaction T1 (ARCHITECTURE s.4), re-running every cap against open and opening positions;
-   the token binds plan hash, mode, kind and expiry slot <= quote slot + 25. Confidence never
-   raises a size.
+5. Risk re-checks the plan and issues the token in transaction T1 (ARCHITECTURE s.4),
+   re-running every cap against open and opening positions. The re-check (src/risk/recheck.ts)
+   never trusts the planner. It takes from the engine, never from the plan: the pool and venue
+   the safety filter approved (SOL-quoted), the position, wallet and own token account, risk's
+   own quote of the plan's input (from the venue math), the exit intent's urgency and origin,
+   and the cost basis from the ledger. It checks: mode, ownership, route, a fresh quote and fee
+   config (25 slots); minOut against the declared slippage on risk's own quote (a planner that
+   understates its expected output cannot buy a low minOut) and the buy slippage cap; the CU
+   (a live plan needs a simulation), tip and landing-spend caps (limits 18 and 19); the
+   attempts and the worst-case fees against what sizing reserved (buys) or the failed-fee
+   budget left (automatic exits, s.3a: no automatic exits once stopped, a passing sell
+   simulation, never a worthless sell); the input between the minimum trade and the sized
+   amount; a buy only into an opening position; the rent exactly; and the rules for closing the
+   account (only a sell of the whole holding, equal in the ledger and on chain, may close in
+   the same transaction; a standalone close has no swap). Exits also run the reduce-only rules
+   of s.9 on the same plan snapshot. A plan that passes becomes a CheckedPlan, the only thing a
+   token can be issued for. The token (src/risk/approval.ts) binds plan hash, mode, kind,
+   worst-case spend, minOut and an expiry slot <= quote slot + 25 under an HMAC; it works
+   once, in one mode (an authority serves one mode), and the executor builds its transaction
+   from the frozen plan that redeem returns. One re-check gives at most one token: issuing
+   spends the plan's checked status, so a second order for the same plan needs its own
+   re-check against fresh inputs. Confidence never raises a size.
 
 ## 7. Cooldowns (P)
 
@@ -199,7 +282,10 @@ exiting, no sell in flight). A reduce-only token never authorizes a buy. Every e
 fresh quote: after 60 s of stale marks an exit turns protective, which means it sells at the
 next fresh quote within the 10% cap, never on an old price. Slippage cap: normal 1% to 5%,
 protective and emergency from the normal cap to 10%. The fee reserve pays and the governor
-never sheds them.
+never sheds them. An exit is either owner-ordered (an authenticated /panic or /sell: not
+budget-limited, its fees still recorded) or automatic (bound by the failed-fee budget of
+s.3a, the 2-day stop, a passing sell simulation, and never a sell that expects nothing). Its
+urgency is the exit intent's: a plan cannot label itself emergency.
 Exit intents are keyed by (position, exitSeq), so a failed exit is always re-issued. /panic
 sells every position within the emergency cap, then pauses. A position unsellable for 5 min
 is stuck, valued 0, and retries per section 3a; live, the owner gets manual steps.

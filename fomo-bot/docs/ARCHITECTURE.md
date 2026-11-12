@@ -98,20 +98,29 @@ interface SafetyVerdict { mint: Address; verdict: 'pass' | 'reject'; checkedAt: 
   checks: { name: SafetyCheck; result: 'pass' | 'reject' | 'error'; detail: string }[];  // any error = reject
   tokenProgram: 'spl' | 'token-2022'; extensionTypes: number[]; estRoundTripCostBps: number; liquidityLamports: Lamports;
   sellProbe: { method: 'holder-sim' | 'probe-payer-sim' | 'own-wallet-sim' | 'none'; lossBps?: number } } // never the holder
-declare const approved: unique symbol;   // the constructor is not exported from risk/
+declare const approved: unique symbol;   // src/risk/approval.ts: a literal cannot be built outside it
 type ApprovalToken = { readonly [approved]: true; id: string; intentId: string; mode: 'paper' | 'live';
   kind: OrderPlan['kind']; reduceOnly: boolean; positionId: string; planHash: string; maxSpendLamports: Lamports;
-  minOut: bigint; expiresAtSlot: bigint; mac: string };  // expiresAtSlot <= plan.quoteSlot + 25; HMAC, per-boot key; single use
+  minOut: bigint; expiresAtSlot: bigint; mac: string };  // expiresAtSlot <= plan.quoteSlot + 25; HMAC-SHA256 over every other field, per-boot key; single use
 // planHash = sha256(canonical JSON of EVERY OrderPlan field, mode and kind included; keys sorted; bigints as decimal strings)
-// maxSpendLamports = inAmount + rentLamports + allowed attempts x (5,000 x signatures + ceil(cuPrice x cuLimit / 10^6) + tip)
+// maxSpendLamports = inAmount (buys only) + rentLamports + allowed attempts x (5,000 + ceil(cuPrice x cuLimit / 10^6) + tip), the tip on every attempt
+// createApprovalAuthority({ mode, key, newTokenId, planFreshSlots }) returns { issuer, verifier } and serves ONE mode: risk and
+// the composition root get the issuer (issue accepts only a CheckedPlan: recheck.ts checkPlan is the only way to get one, and
+// issuing spends it via consumeCheckedPlan after the newTokenId callback, so one re-check gives at most one token), the
+// executor only the verifier. verify and redeem never throw; redeem = verify, then TokenStore.consume (only an explicit true
+// counts), so a bad token is never burned, and it returns the frozen plan the executor must build its transaction from.
+// Only risk/ and app/ may import anything in risk/ at runtime (architecture test); everyone else imports types.
 type RiskDecision = { approved: false; intentId: string; reasons: string[]; checks: string[] }
   | { approved: true; intentId: string; checks: string[]; token: ApprovalToken };
-interface OrderPlan { orderId: string; intentId: string; mode: 'paper' | 'live';
-  kind: 'buy' | 'sell' | 'close-account' | 'withdraw'; venue: Venue; route: 'direct' | 'jupiter-build' | 'jupiter-order';
-  mint: Address; pool: Address; inAmount: bigint; expectedOut: bigint; minOut: bigint; slippageBps: Bps;
+// src/risk/plan.ts: validatePlan (a frozen snapshot, each field read once), canonicalPlan, planHash, planMaxSpend.
+interface OrderPlan { orderId: string; intentId: string; positionId: string; mode: 'paper' | 'live';
+  kind: 'buy' | 'sell' | 'close-account' | 'withdraw'; urgency: 'normal' | 'protective' | 'emergency';
+  venue: Venue; route: 'direct' | 'jupiter-build' | 'jupiter-order';
+  mint: Address; pool: Address; tokenAccount: Address /* our own */; wallet: Address /* our own */;
+  inAmount: bigint; expectedOut: bigint; minOut: bigint; slippageBps: Bps;
   feeBps: Bps; feeConfigSlot: bigint; cuLimit: number; cuPrice: MicroLamportsPerCu;
   tip: { path: 'none' | 'jito' | 'helius-swqos'; lamports: Lamports };            // never a 0.001 SOL service
-  rentLamports: Lamports; closeAccountAfter: boolean; quoteSlot: bigint; lastValidBlockHeight?: bigint }
+  rentLamports: Lamports; attempts: number; closeAccountAfter: boolean; quoteSlot: bigint; lastValidBlockHeight: bigint | null }
 interface FillBase { orderId: string; mint: Address; side: 'buy' | 'sell'; landed: boolean; attempts: number;
   inAmount: bigint; outAmount: bigint; venueFee: Lamports; networkFee: Lamports; tip: Lamports;
   rentPaid: Lamports; rentRefunded: Lamports; slot: bigint; at: UtcMs }
@@ -364,7 +373,7 @@ signatures live only in typed `signature` columns.
 
 | Tables | Hold |
 |---|---|
-| schema_migrations, config_versions, flags, day_state, counters | migrations; every config version (json, author owner/ai-approved/default, parent, active); kill, halt reasons, pause, breakers, strategy modes (written only by /off, /paper, /golive and auto-demote); pending live loosenings with their 24 h time; day start, peak; entries per day and strategy |
+| schema_migrations, config_versions, flags, day_state, counters | migrations; every config version (json, author owner/ai-approved/default, parent, active); kill, halt reasons, pause, breakers, strategy modes (written only by /off, /paper, /golive and auto-demote); pending live loosenings with their 24 h time; the equity state of risk/daystate.ts (Athens day, day start, last equity, peak, the held-jump flag and the verified level of a confirmed jump with its time, the daily-stop day and streak), saved with the flags after every observation; entries per day and strategy |
 | intents, risk_decisions, approvals, orders, attempts, fills, cost_lines | entry and exit intents with inputs and reasons; decisions with checks; tokens (plan hash, mode, kind, expiry slot, consumed_at); order state machine; one row per cost item (venue fee, priority, tip, rent, failed attempt) |
 | positions, marks, equity_snapshots, shadow_fills, twin_trades, tournament_results | positions; sampled marks (feed the tournament); equity per minute; 2x-cost ledger; random twins; per-policy counterfactuals (shadow, twin and tournament rows have no order or token columns) |
 | tokens, safety_verdicts, creator_blocklist, flow_minutes, health_events, budget_usage | mint facts; verdicts with TTL; creators of rugged tokens (token level, not FOMO users); per-mint per-minute counts (no user tags); health; requests per provider/method/minute |
@@ -388,7 +397,7 @@ a 60 s single-use nonce in `callback_data` (under 64 bytes). No copy-trading com
 | Command | Does | Confirm |
 |---|---|---|
 | /status /pnl /positions /trades /why id /strategies /health /limits /report /help | read-only | no |
-| /pause, /resume | stop or allow entries (resume after a peak halt rebases the peak); live: /resume waits 24 h | resume |
+| /pause, /resume | stop or allow entries (after a peak halt resume rebases the peak to the current, fully valued equity; after two daily stops in a row it clears the streak; never both at once); live: /resume waits 24 h | resume |
 | /panic, /kill | sell all within the emergency cap then pause / set the persistent KILL flag (cleared only at the server) | yes |
 | /off s, /paper s, /golive s | strategy mode in the flags table; off and paper apply at once; golive shows the gate summary and needs the bot and signer armed | golive |
 | /set p v, /proposals, /approve id, /reject id, /rollback, /cancel id | bounded tunable change, never a mode; live loosening waits 24 h; /cancel drops a pending change | set, approve, rollback |
