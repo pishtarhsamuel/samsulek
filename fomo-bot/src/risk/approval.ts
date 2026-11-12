@@ -35,6 +35,7 @@ declare const approvedBrand: unique symbol;
 /** H 25 slots (RISK_POLICY.md limit 20); the caller may choose less. Moves to config/caps.ts in step 5. */
 const HARD_PLAN_FRESH_SLOTS = 25;
 const MIN_KEY_BYTES = 32;
+const MAC_PURPOSE = 'fomo-bot approval token v1';
 /** The newest token ids kept to catch a repeated id; older ones are forgotten so memory stays bounded. */
 const MAX_REMEMBERED_IDS = 10_000;
 
@@ -232,8 +233,9 @@ export function createApprovalAuthority(options: ApprovalOptions): ApprovalAutho
   const fresh = BigInt(planFreshSlots);
   const issued = new Set<string>();
 
+  // A purpose and version tag in front of the canonical text: this key's MAC can only ever mean "approval token".
   const macOf = (fields: TokenFields): Uint8Array =>
-    createHmac('sha256', secret).update(canonicalJson(fields), 'utf8').digest();
+    createHmac('sha256', secret).update(`${MAC_PURPOSE}\n${canonicalJson(fields)}`, 'utf8').digest();
 
   const issuer: ApprovalIssuer = {
     issue(plan: CheckedPlan, currentSlot: bigint): ApprovalToken {

@@ -10,6 +10,7 @@ import { RiskError } from '../../../src/risk/reserve.ts';
 import {
   BASE_FEE_PER_SIGNATURE,
   PLAN_FIELDS,
+  canonicalJson,
   canonicalPlan,
   planHash,
   planMaxSpend,
@@ -224,5 +225,29 @@ describe('fail closed: a malformed plan has no hash', () => {
     };
     assert.equal(planHash(shifty), planHash(PLAN));
     assert.equal(reads, 1);
+  });
+});
+
+describe('canonicalJson: one value, one text (REVIEWS.md K, security finding 8)', () => {
+  it('sorts keys at every depth and writes bigints as decimal text, whatever order the keys came in', () => {
+    assert.equal(canonicalJson({ b: 1n, a: { d: 2, c: 3 } }), '{"a":{"c":3,"d":2},"b":"1"}');
+    assert.equal(canonicalJson({ a: { d: 2, c: 3 }, b: 1n }), canonicalJson({ b: 1n, a: { c: 3, d: 2 } }));
+    assert.equal(canonicalJson({ z: null, y: true, x: 'text', w: 0 }), '{"w":0,"x":"text","y":true,"z":null}');
+  });
+
+  it('a key named __proto__ is a key like any other, never dropped', () => {
+    const tricky = JSON.parse('{"a":1,"__proto__":{"b":2}}') as unknown;
+    assert.equal(canonicalJson(tricky), '{"__proto__":{"b":2},"a":1}');
+    assert.notEqual(canonicalJson(tricky), canonicalJson({ a: 1 }));
+  });
+
+  it('refuses what JSON would silently change or drop: lists, undefined, functions, symbols, NaN, class instances', () => {
+    const refused: readonly unknown[] = [[1, 2], { a: undefined }, { a: () => 1 }, { a: Symbol('x') }, { a: Number.NaN }, { a: Infinity }, new Map(), new Date(0), Object.create({ inherited: 1 }), { [Symbol('k')]: 1 }, undefined, () => 1];
+    for (const value of refused) {
+      assert.throws(() => canonicalJson(value), RiskError, String(typeof value));
+    }
+    // two shapes that used to read the same ([1,2] and {0:1,1:2}) are now different: one is refused
+    assert.equal(canonicalJson({ 0: 1, 1: 2 }), '{"0":1,"1":2}');
+    assert.throws(() => canonicalJson([1, 2]), RiskError);
   });
 });

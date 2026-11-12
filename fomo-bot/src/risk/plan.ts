@@ -211,20 +211,38 @@ export function validatePlan(planInput: OrderPlan): OrderPlan {
 
 // ---------------------------------------------------------------- canonical text and hash
 
-/** Bigints become decimal strings; objects get sorted keys. Everything else is already plain. */
+/**
+ * Bigints become decimal strings; plain objects get sorted keys (built on a null-prototype object,
+ * so a key named __proto__ stays a key). Anything JSON would silently change or drop is refused:
+ * lists (they would read like objects with numeric keys), undefined, functions, symbols,
+ * non-finite numbers, class instances and symbol keys. One value, one text.
+ */
 function encode(value: unknown): unknown {
   if (typeof value === 'bigint') {
     return value.toString(10);
   }
-  if (typeof value === 'object' && value !== null) {
+  if (typeof value === 'string' || typeof value === 'boolean' || value === null) {
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new RiskError('canonical JSON takes no NaN or infinity');
+    }
+    return value;
+  }
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    const proto: unknown = Object.getPrototypeOf(value);
+    if ((proto !== Object.prototype && proto !== null) || Object.getOwnPropertySymbols(value).length > 0) {
+      throw new RiskError('canonical JSON takes plain objects only');
+    }
     const source = value as Record<string, unknown>;
-    const sorted: Record<string, unknown> = {};
+    const sorted: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const key of Object.keys(source).sort()) {
       sorted[key] = encode(source[key]);
     }
     return sorted;
   }
-  return value;
+  throw new RiskError('canonical JSON takes only text, numbers, booleans, null, bigints and plain objects');
 }
 
 /** Canonical JSON of a plain value: keys sorted, bigints as decimal strings. Shared by plans and tokens. */

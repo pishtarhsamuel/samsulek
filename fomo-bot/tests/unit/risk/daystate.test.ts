@@ -37,17 +37,23 @@ const DAY1 = Date.UTC(2026, 10, 9, 12); // 2026-11-09 in Athens
 const DAY2 = DAY1 + 24 * HOUR; // 2026-11-10
 const L = (n: bigint): Lamports => lamports(n);
 
-const state = (patch: Partial<EquityState> = {}): EquityState => ({
-  day: '2026-11-09',
-  dayStart: L(500_000_000n),
-  lastEquity: L(500_000_000n),
-  peak: L(500_000_000n),
-  jumpPending: false,
-  jumpAck: null,
-  dailyStopDay: null,
-  dailyStopStreak: 0,
-  ...patch,
-});
+const state = (patch: Partial<EquityState> = {}): EquityState => {
+  const made: EquityState = {
+    day: '2026-11-09',
+    dayStart: L(500_000_000n),
+    lastEquity: L(500_000_000n),
+    peak: L(500_000_000n),
+    jumpPending: false,
+    jumpHeld: null,
+    jumpAck: null,
+    dailyStopDay: null,
+    dailyStopStreak: 0,
+    streakHalt: false,
+    ...patch,
+  };
+  // A held jump always has its held observation (the state check insists): 1.0 SOL at DAY1 unless a test says otherwise.
+  return made.jumpPending && !('jumpHeld' in patch) ? { ...made, jumpHeld: { equity: L(1_000_000_000n), at: DAY1 } } : made;
+};
 
 const obs = (equity: bigint | null, now = DAY1, extra: Partial<EquityObservation> = {}): EquityObservation => ({
   now,
@@ -235,13 +241,16 @@ describe('+50% within an hour (limit 12): held until verified, baseline and peak
     assert.deepEqual([jump.state.dayStart, jump.state.peak, jump.state.lastEquity], [L(600_000_000n), L(600_000_000n), L(600_000_000n)]);
   });
 
-  it('while pending nothing moves, however the next observations look, until the engine confirms', () => {
+  it('while pending nothing moves but the held observation, however the next observations look, until the engine confirms', () => {
     const held = pumped(900_000_001n, 600_000_000n).state;
+    assert.deepEqual(held.jumpHeld, { equity: 900_000_001n, at: DAY1 });
     const next = run(held, obs(950_000_000n, DAY1 + HOUR));
     assert.deepEqual(next.trips, ['equity-jump']);
-    assert.deepEqual(next.state, held);
-    const confirmed = confirmEquityJump(held, L(950_000_000n), DAY1 + HOUR, POLICY);
+    assert.deepEqual(next.state.jumpHeld, { equity: 950_000_000n, at: DAY1 + HOUR }); // the latest held observation
+    assert.deepEqual({ ...next.state, jumpHeld: held.jumpHeld }, held);
+    const confirmed = confirmEquityJump(next.state, L(950_000_000n), DAY1 + HOUR, POLICY);
     assert.equal(confirmed.jumpPending, false);
+    assert.equal(confirmed.jumpHeld, null);
     const after = run(confirmed, obs(950_000_000n, DAY1 + HOUR));
     assert.deepEqual(after.trips, []);
     assert.equal(after.state.peak, 950_000_000n); // only now may the peak move
@@ -258,7 +267,7 @@ describe('+50% within an hour (limit 12): held until verified, baseline and peak
 });
 
 describe('a confirmed jump is the reference for the next hour (no livelock on a stale snapshot)', () => {
-  const T = DAY1 + HOUR; // when the engine confirmed
+  const T = DAY1 + 60_000; // when the engine confirmed: a minute after the held observation
   const base = state({ dayStart: L(600_000_000n), lastEquity: L(600_000_000n), peak: L(600_000_000n) });
   const held = (): EquityState => run(base, obs(950_000_000n, DAY1, { equityAnHourAgo: L(600_000_000n) })).state;
   const confirmed = (): EquityState => confirmEquityJump(held(), L(950_000_000n), T, POLICY);
@@ -320,7 +329,7 @@ describe('a confirmed jump is the reference for the next hour (no livelock on a 
   });
 
   it('the verified equity must be one the sanity limits accept: a confirmation cannot put the reference above them', () => {
-    const pending = state({ jumpPending: true });
+    const pending = state({ jumpPending: true, jumpHeld: { equity: L(2_000_000_000n), at: DAY1 } });
     // the bankroll cap: 3 x 0.55 SOL
     assert.deepEqual(confirmEquityJump(pending, L(1_650_000_000n), T, POLICY).jumpAck, { equity: 1_650_000_000n, at: T });
     assert.throws(() => confirmEquityJump(pending, L(1_650_000_001n), T, POLICY), /sanity limits/);
@@ -337,10 +346,115 @@ describe('a confirmed jump is the reference for the next hour (no livelock on a 
     assert.throws(() => confirmEquityJump(pending, L(950_000_000n), T, null as unknown as EquityPolicy), RiskError);
   });
 
-  it('confirming changes nothing but the pending flag and the acknowledgement', () => {
+  it('confirming changes nothing but the pending flag, the held observation and the acknowledgement', () => {
     const before = held();
     const after = confirmEquityJump(before, L(950_000_000n), T, POLICY);
-    assert.deepEqual({ ...after, jumpPending: true, jumpAck: null }, { ...before, jumpAck: null });
+    assert.deepEqual({ ...after, jumpPending: true, jumpHeld: before.jumpHeld, jumpAck: null }, { ...before, jumpAck: null });
+  });
+
+  it('the verified level can never vouch for more than the latest held observation saw (REVIEWS.md K, finding 3)', () => {
+    const heldLow = state({ jumpPending: true, jumpHeld: { equity: L(800_000_000n), at: DAY1 } });
+    // held at 0.8 SOL, "verified" at 1.6 SOL: the record is 0.8 SOL, so a jump to 1.6 holds again
+    const c = confirmEquityJump(heldLow, L(1_600_000_000n), T, POLICY);
+    assert.deepEqual(c.jumpAck, { equity: 800_000_000n, at: T });
+    assert.deepEqual(run(c, obs(1_600_000_000n, T + 60_000, { equityAnHourAgo: L(600_000_000n) })).trips, ['equity-jump']);
+    // a pump that collapsed: the verified level is the lower one, and that is the record (the hold can always be cleared)
+    assert.deepEqual(confirmEquityJump(heldLow, L(500_000_000n), T, POLICY).jumpAck, { equity: 500_000_000n, at: T });
+    // verified at exactly what was held: unchanged
+    assert.deepEqual(confirmEquityJump(heldLow, L(800_000_000n), T, POLICY).jumpAck, { equity: 800_000_000n, at: T });
+  });
+
+  it('a confirmation must follow the latest held observation within five minutes and never precede it', () => {
+    const pending = state({ jumpPending: true, jumpHeld: { equity: L(1_000_000_000n), at: DAY1 } });
+    assert.equal(confirmEquityJump(pending, L(900_000_000n), DAY1, POLICY).jumpPending, false); // at once
+    assert.equal(confirmEquityJump(pending, L(900_000_000n), DAY1 + 5 * 60_000, POLICY).jumpPending, false); // the last allowed millisecond
+    assert.throws(() => confirmEquityJump(pending, L(900_000_000n), DAY1 + 5 * 60_000 + 1, POLICY), /observe again/);
+    assert.throws(() => confirmEquityJump(pending, L(900_000_000n), DAY1 - 1, POLICY), /observe again/);
+    assert.throws(() => confirmEquityJump(pending, L(900_000_000n), DAY1 + 24 * HOUR, POLICY), /observe again/); // a record dated far ahead
+  });
+
+  it('a held jump and its held observation come together or not at all', () => {
+    assert.throws(() => run(state({ jumpPending: true, jumpHeld: null }), obs(500_000_000n)), /held observation/);
+    assert.throws(() => run(state({ jumpPending: false, jumpHeld: { equity: L(1n), at: DAY1 } }), obs(500_000_000n)), /held observation/);
+    for (const bad of [{ equity: L(0n), at: DAY1 }, { equity: L(2_000_000_001n), at: DAY1 }, { equity: L(1n), at: -1 }, { equity: 5, at: DAY1 }, 5]) {
+      assert.throws(() => run(state({ jumpPending: true, jumpHeld: bad as unknown as EquityState['jumpHeld'] }), obs(500_000_000n)), RiskError);
+    }
+  });
+});
+
+describe('two daily stops on consecutive days are a halt only the owner lifts (REVIEWS.md K, finding 1)', () => {
+  const day = (n: number): number => DAY1 + n * 24 * HOUR;
+  const stop = (s: EquityState, at: number, open: bigint, low: bigint): ReturnType<typeof run> => run(run(s, obs(open, at)).state, obs(low, at + HOUR));
+
+  it('a quiet day or a gap in between cannot lift it; the streak restarts but the halt stands', () => {
+    // day 0: baseline 500M, down to 350M (-30%): the first stop
+    let r = stop(emptyEquityState(), day(0), 500_000_000n, 350_000_000n);
+    assert.deepEqual(r.trips, ['daily-stop']);
+    assert.equal(r.state.streakHalt, false);
+    // day 1: baseline 450M (an overnight gain), down to 315M (-30%): a stop on two days in a row
+    r = stop(r.state, day(1), 450_000_000n, 315_000_000n);
+    assert.deepEqual(r.trips, ['daily-stop', 'daily-stop-twice']);
+    assert.equal(r.state.streakHalt, true);
+    assert.equal(r.state.dailyStopStreak, 2);
+    // day 2: a quiet day with no stop: the halt still stands and is reported on every observation
+    r = run(r.state, obs(320_000_000n, day(2)));
+    assert.deepEqual(r.trips, ['daily-stop-twice']);
+    r = run(r.state, obs(325_000_000n, day(2) + HOUR));
+    assert.deepEqual(r.trips, ['daily-stop-twice']);
+    // with the equity unknown too (the stops read the stop-equity only)
+    assert.deepEqual(run(r.state, { now: day(2) + 2 * HOUR, equity: null, stopEquity: null, equityAnHourAgo: null }).trips, ['daily-stop-twice']);
+    // day 4 (day 3 not observed): a stop after a gap starts a streak of 1, and the halt still stands
+    r = stop(r.state, day(4), 400_000_000n, 280_000_000n);
+    assert.deepEqual(r.trips, ['daily-stop', 'daily-stop-twice']);
+    assert.equal(r.state.dailyStopStreak, 1);
+    assert.equal(r.state.streakHalt, true);
+    // only the owner lifts it; today's stop still holds until midnight
+    const lifted = resumeStreak(r.state);
+    assert.equal(lifted.streakHalt, false);
+    assert.equal(lifted.dailyStopStreak, 0);
+    assert.deepEqual(run(lifted, obs(270_000_000n, day(4) + 2 * HOUR)).trips, ['daily-stop']);
+    assert.deepEqual(run(lifted, obs(275_000_000n, day(5))).trips, []);
+  });
+
+  it('nothing but the owner clears it: not midnight, a transfer, a peak restart or a confirmed jump', () => {
+    const halted = state({ streakHalt: true, dailyStopStreak: 2, dailyStopDay: '2026-11-09' });
+    assert.equal(run(halted, obs(500_000_000n, DAY2)).state.streakHalt, true);
+    assert.equal(applyTransfer(halted, signedLamports(100_000_000n)).streakHalt, true);
+    assert.equal(resumePeak(halted).streakHalt, true);
+    const pending = state({ streakHalt: true, jumpPending: true });
+    assert.equal(confirmEquityJump(pending, L(900_000_000n), DAY1, POLICY).streakHalt, true);
+    assert.equal(resumeStreak(halted).streakHalt, false);
+  });
+
+  it('two stops that are not on consecutive days are no halt', () => {
+    let r = stop(emptyEquityState(), day(0), 500_000_000n, 350_000_000n);
+    r = stop(r.state, day(2), 400_000_000n, 280_000_000n); // day 1 had none
+    assert.deepEqual(r.trips, ['daily-stop']);
+    assert.equal(r.state.streakHalt, false);
+    assert.equal(r.state.dailyStopStreak, 1);
+  });
+});
+
+describe('the daily stop holds through a clock that steps back (REVIEWS.md K, finding 2)', () => {
+  it('a stop tripped earlier today still blocks entries if the clock then reads an earlier time or day', () => {
+    const tripped = run(state(), obs(350_000_000n, DAY1 + HOUR)).state;
+    assert.equal(tripped.dailyStopDay, '2026-11-09');
+    assert.equal(dailyStopActive(tripped, DAY1 + HOUR), true);
+    assert.equal(dailyStopActive(tripped, DAY1 - 5 * HOUR), true); // an earlier time on the same day
+    assert.equal(dailyStopActive(tripped, DAY1 - 2 * 24 * HOUR), true); // two days earlier: still blocked
+    assert.equal(dailyStopActive(tripped, DAY2), false); // the next Athens day: off
+  });
+
+  it('a clock earlier than the last observation blocks entries until the next observation reports it', () => {
+    assert.equal(dailyStopActive(state(), DAY1), false);
+    assert.equal(dailyStopActive(state(), DAY1 - 24 * HOUR), true); // the state has seen 2026-11-09
+    assert.equal(dailyStopActive(state(), DAY2), false);
+    assert.equal(dailyStopActive(emptyEquityState(), 0), false); // nothing observed yet: nothing to block
+  });
+
+  it('a stored stop dated after the clock blocks even if the state\'s own day lags (belt and braces)', () => {
+    assert.equal(dailyStopActive(state({ day: '2026-11-08', dailyStopDay: '2026-11-09' }), DAY1 - 24 * HOUR), true);
+    assert.equal(dailyStopActive(state({ day: '2026-11-08', dailyStopDay: '2026-11-07' }), DAY1 - 24 * HOUR), false);
   });
 });
 
@@ -393,12 +507,30 @@ describe('deposits, withdrawals and the owner\'s /resume (invariant 22)', () => 
     assert.equal(resumePeak(confirmed).peak, 500_000_000n);
   });
 
-  it('/resume after two daily stops in a row clears only the streak', () => {
-    const before = state({ peak: L(900_000_000n), dailyStopStreak: 2, dailyStopDay: '2026-11-09' });
+  it('/resume after two daily stops in a row lifts the halt and restarts the streak, nothing else', () => {
+    const before = state({ peak: L(900_000_000n), dailyStopStreak: 2, streakHalt: true, dailyStopDay: '2026-11-09' });
     const r = resumeStreak(before);
     assert.equal(r.dailyStopStreak, 0);
-    assert.deepEqual({ ...r, dailyStopStreak: 2 }, before); // today's stop still holds until midnight, the peak is untouched
+    assert.equal(r.streakHalt, false);
+    assert.deepEqual({ ...r, dailyStopStreak: 2, streakHalt: true }, before); // today's stop still holds until midnight, the peak is untouched
     assert.equal(dailyStopActive(r, DAY1), true);
+  });
+});
+
+describe('every stored field and input is read exactly once (a getter cannot show the check one value and the code another)', () => {
+  it('the acknowledgement, the held observation and the observation time', () => {
+    let ackReads = 0;
+    const ack = { equity: L(600_000_000n), get at(): number { ackReads += 1; return DAY1; } };
+    run(state({ jumpAck: ack as unknown as EquityState['jumpAck'] }), obs(500_000_000n));
+    assert.equal(ackReads, 1);
+    let heldReads = 0;
+    const held = { equity: L(600_000_000n), get at(): number { heldReads += 1; return DAY1; } };
+    run(state({ jumpPending: true, jumpHeld: held as unknown as EquityState['jumpHeld'] }), obs(500_000_000n));
+    assert.equal(heldReads, 1);
+    let nowReads = 0;
+    const observation = { get now(): number { nowReads += 1; return DAY1; }, equity: L(500_000_000n), stopEquity: L(500_000_000n), equityAnHourAgo: null };
+    run(state(), observation as unknown as EquityObservation);
+    assert.equal(nowReads, 1);
   });
 });
 
@@ -415,6 +547,9 @@ describe('fail closed on bad input', () => {
     assert.throws(() => run(state({ day: '2026-02-30' }), obs(1n)), RiskError);
     assert.throws(() => run(state({ dailyStopStreak: -1 }), obs(1n)), RiskError);
     assert.throws(() => run(state({ jumpPending: 'no' as unknown as boolean }), obs(1n)), RiskError);
+    assert.throws(() => run(state({ streakHalt: 'yes' as unknown as boolean }), obs(1n)), RiskError);
+    assert.throws(() => run({ ...state(), streakHalt: undefined } as unknown as EquityState, obs(1n)), RiskError); // a state saved before the field existed
+    assert.throws(() => run({ ...state(), jumpHeld: undefined } as unknown as EquityState, obs(1n)), RiskError);
     assert.throws(() => run(state({ peak: -1n as Lamports }), obs(1n)), RiskError);
     // a stored jump acknowledgement is checked as well: a verified level of 0 or above 2.0 SOL, a bad time, or not an object
     for (const bad of [{ equity: L(0n), at: DAY1 }, { equity: L(2_000_000_001n), at: DAY1 }, { equity: L(1n), at: -1 }, { equity: L(1n), at: MAX_TIMESTAMP_MS + 1 }, { equity: 5, at: DAY1 }, 5, 'ack']) {

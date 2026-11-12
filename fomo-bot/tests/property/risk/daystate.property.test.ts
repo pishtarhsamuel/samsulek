@@ -8,7 +8,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fc from 'fast-check';
-import { athensDay } from '../../../src/core/day.ts';
+import { athensDay, previousDay } from '../../../src/core/day.ts';
 import { U64_MAX, bps, lamports, signedLamports, type Lamports } from '../../../src/core/units.ts';
 import { RiskError } from '../../../src/risk/reserve.ts';
 import {
@@ -44,6 +44,8 @@ const stepArb = fc.record({
     { weight: 1, arbitrary: fc.integer({ min: -30 * HOUR, max: -1 }) },
   ),
   confirm: fc.boolean(),
+  verifyUp: fc.boolean(), // the "verified" level comes out higher than what was held
+  resume: fc.oneof({ weight: 9, arbitrary: fc.constant(false) }, { weight: 1, arbitrary: fc.constant(true) }), // the owner lifts the two-day halt
   move: fc.oneof(
     { weight: 10, arbitrary: fc.constant('small' as const) },
     { weight: 3, arbitrary: fc.constant('drop' as const) },
@@ -86,13 +88,20 @@ describe('equity and day state properties', () => {
   it('over random sequences every rule holds at every step, and every trip occurs', () => {
     const seen = new Map<EquityTrip, number>();
     let confirmations = 0;
+    let lateConfirmations = 0; // refused: not within five minutes of the latest held observation
+    let cappedByHeld = 0; // the verified level was above what was held, so the record is the held level
     let savedByAck = 0; // accepted only because the verified level was the reference: the old livelock
     let transfers = 0;
+    let haltedQuietObservations = 0; // the two-day halt reported on an observation with no stop of its own
+    let resumes = 0;
     fc.assert(
       fc.property(fc.array(stepArb, { minLength: 1, maxLength: 40 }), (steps) => {
         let state: EquityState = emptyEquityState();
         let now = START;
         let level = 500_000_000n;
+        const stopDays = new Set<string>(); // the days a daily stop tripped, as the plain rule sees them
+        let floorDay = ''; // the owner's resume forgives the stops up to this day ('' = none yet)
+        let streakExpected = false; // two stops on consecutive days, until the owner resumes
         for (const step of steps) {
           now = Math.max(0, now + step.dt);
           let equity: bigint | null;
@@ -159,10 +168,12 @@ describe('equity and day state properties', () => {
           if (equity === null) {
             assert.deepEqual([next.dayStart, next.lastEquity, next.peak, next.jumpPending], [prev.dayStart, prev.lastEquity, prev.peak, prev.jumpPending], 'unknown equity moves nothing');
           }
-          if (trips.includes('equity-jump')) {
+          if (trips.includes('equity-jump') && equity !== null) {
             assert.equal(next.jumpPending, true);
             assert.deepEqual([next.dayStart, next.lastEquity, next.peak, next.day], [prev.dayStart, prev.lastEquity, prev.peak, prev.day], 'a held jump moves nothing');
+            assert.deepEqual(next.jumpHeld, { equity: L(equity), at: now }, 'but the latest held observation is remembered');
           }
+          assert.equal(next.jumpPending, next.jumpHeld !== null, 'a held jump and its held observation come together');
           if (accepted && equity !== null) {
             assert.equal(next.day, today);
             assert.equal(next.lastEquity, equity);
@@ -187,12 +198,25 @@ describe('equity and day state properties', () => {
             assert.equal(trips.includes('daily-stop'), daily);
             assert.equal(trips.includes('peak-halt'), peakHalt);
             if (daily) {
-              assert.equal(next.dailyStopDay, today);
-              assert.ok(next.dailyStopStreak >= 1);
-              assert.equal(trips.includes('daily-stop-twice'), next.dailyStopStreak >= 2);
+              assert.equal(next.dailyStopDay, today); // (the streak may be 0 if the owner resumed after today's first stop)
             }
           } else if (!anomalous) {
             assert.equal(trips.includes('daily-stop') || trips.includes('peak-halt'), false);
+          }
+          if (!anomalous) {
+            // two stops on consecutive days: a halt that stays on every observation until the owner resumes
+            if (trips.includes('daily-stop') && !stopDays.has(today)) {
+              const yesterday = previousDay(today);
+              if (stopDays.has(yesterday) && yesterday > floorDay) {
+                streakExpected = true; // a stop the day after another stop that the owner has not forgiven
+              }
+              stopDays.add(today);
+            }
+            assert.equal(trips.includes('daily-stop-twice'), streakExpected, 'the two-day halt is sticky and reported on every observation');
+            assert.equal(next.streakHalt, streakExpected);
+            if (streakExpected && !trips.includes('daily-stop')) {
+              haltedQuietObservations += 1;
+            }
           }
           // a stop never moves the baseline, the peak or the last equity
           if (!accepted && !anomalous && equity === null) {
@@ -201,14 +225,32 @@ describe('equity and day state properties', () => {
           // the acknowledgement is only ever written by a confirmation
           assert.deepEqual(next.jumpAck, prev.jumpAck, 'an observation never touches the jump acknowledgement');
           state = next;
-          if (next.jumpPending && step.confirm) {
-            const verified = L(level); // 0.1 to 1.6 SOL, always a level the sanity limits accept
-            const confirmed = confirmEquityJump(next, verified, now, POLICY);
-            assert.equal(confirmed.jumpPending, false);
-            assert.deepEqual(confirmed.jumpAck, { equity: verified, at: now });
-            assert.deepEqual({ ...confirmed, jumpPending: true, jumpAck: next.jumpAck }, next, 'confirming changes nothing else');
-            state = confirmed;
-            confirmations += 1;
+          if (next.jumpPending && step.confirm && next.jumpHeld !== null) {
+            const held = next.jumpHeld;
+            // 0.1 to 1.6 SOL, or 30% above that capped at the bankroll limit: always a level the sanity limits accept
+            const asked = step.verifyUp ? (level * 130n) / 100n : level;
+            const verified = L(asked > 1_650_000_000n ? 1_650_000_000n : asked);
+            if (now >= held.at && now - held.at <= 300_000) {
+              const confirmed = confirmEquityJump(next, verified, now, POLICY);
+              const recorded = verified < held.equity ? verified : held.equity; // never more than the held observation saw
+              assert.equal(confirmed.jumpPending, false);
+              assert.equal(confirmed.jumpHeld, null);
+              assert.deepEqual(confirmed.jumpAck, { equity: recorded, at: now });
+              assert.deepEqual({ ...confirmed, jumpPending: true, jumpHeld: held, jumpAck: next.jumpAck }, next, 'confirming changes nothing else');
+              state = confirmed;
+              confirmations += 1;
+              cappedByHeld += verified > held.equity ? 1 : 0;
+            } else {
+              assert.throws(() => confirmEquityJump(next, verified, now, POLICY), /observe again/);
+              lateConfirmations += 1;
+            }
+          }
+          if (step.resume) {
+            state = resumeStreak(state);
+            streakExpected = false;
+            floorDay = [...stopDays].sort().at(-1) ?? floorDay; // every stop so far is forgiven
+            resumes += 1;
+            assert.equal(state.streakHalt, false);
           }
         }
       }),
@@ -217,8 +259,13 @@ describe('equity and day state properties', () => {
       assert.ok((seen.get(trip) ?? 0) >= 5, `the trip ${trip} occurred only ${seen.get(trip) ?? 0} times`);
     }
     assert.ok(confirmations >= 20, `only ${confirmations} confirmations`);
+    assert.ok(lateConfirmations >= 5, `only ${lateConfirmations} refused late confirmations`);
+    assert.ok(cappedByHeld >= 5, `the held observation capped only ${cappedByHeld} confirmations`);
     assert.ok(savedByAck >= 5, `the acknowledgement decided only ${savedByAck} observations`);
     assert.ok(transfers >= 20, `only ${transfers} transfers`);
+    assert.ok((seen.get('daily-stop-twice') ?? 0) >= 5, `the two-day halt occurred only ${seen.get('daily-stop-twice') ?? 0} times`);
+    assert.ok(haltedQuietObservations >= 5, `the halt stood through only ${haltedQuietObservations} observations without a stop of their own`);
+    assert.ok(resumes >= 5, `only ${resumes} resumes`);
   });
 
   it('a deposit or withdrawal and its reverse give back the state, as long as nothing was clamped', () => {
@@ -292,7 +339,7 @@ describe('equity and day state properties', () => {
     assert.ok(inside >= 100 && outsideHeld >= 20, `inside ${inside}, held after the hour ${outsideHeld}`);
   });
 
-  it('a confirmation is accepted if and only if a jump is held and the level is within the sanity limits', () => {
+  it('a confirmation is accepted if and only if a jump is held, the level is within the sanity limits and it follows the held observation within five minutes; it records the lower of the verified and the held level', () => {
     const T = Date.UTC(2026, 10, 9, 6);
     let accepted = 0;
     let refused = 0;
@@ -300,16 +347,28 @@ describe('equity and day state properties', () => {
       fc.property(
         fc.boolean(),
         fc.oneof({ weight: 6, arbitrary: fc.bigInt({ min: 1n, max: 1_650_000_000n }) }, { weight: 3, arbitrary: fc.bigInt({ min: 1_650_000_001n, max: 3_000_000_000n }) }, { weight: 1, arbitrary: fc.constant(0n) }),
-        (pending, level) => {
-          const state = { ...emptyEquityState(), day: athensDay(T), dayStart: L(500_000_000n), lastEquity: L(500_000_000n), peak: L(500_000_000n), jumpPending: pending } as EquityState;
-          const fine = pending && level >= 1n && level <= 1_650_000_000n; // 3 x the bankroll is the lower of the two limits
+        fc.bigInt({ min: 1n, max: 2_000_000_000n }), // what the latest held observation saw
+        fc.oneof({ weight: 6, arbitrary: fc.integer({ min: 0, max: 300_000 }) }, { weight: 4, arbitrary: fc.integer({ min: -600_000, max: 900_000 }) }), // how long after it the confirmation comes
+        (pending, level, heldEquity, after) => {
+          const state = {
+            ...emptyEquityState(),
+            day: athensDay(T),
+            dayStart: L(500_000_000n),
+            lastEquity: L(500_000_000n),
+            peak: L(500_000_000n),
+            jumpPending: pending,
+            jumpHeld: pending ? { equity: L(heldEquity), at: T - after } : null,
+          } as EquityState;
+          const now = T;
+          const fine = pending && level >= 1n && level <= 1_650_000_000n && after >= 0 && after <= 300_000; // 3 x the bankroll is the lower of the two limits
           if (fine) {
-            const c = confirmEquityJump(state, L(level), T, POLICY);
-            assert.deepEqual(c.jumpAck, { equity: level, at: T });
+            const c = confirmEquityJump(state, L(level), now, POLICY);
+            assert.deepEqual(c.jumpAck, { equity: level < heldEquity ? level : heldEquity, at: now });
             assert.equal(c.jumpPending, false);
+            assert.equal(c.jumpHeld, null);
             accepted += 1;
           } else {
-            assert.throws(() => confirmEquityJump(state, L(level), T, POLICY), RiskError);
+            assert.throws(() => confirmEquityJump(state, L(level), now, POLICY), RiskError);
             refused += 1;
           }
         },
@@ -327,9 +386,11 @@ describe('equity and day state properties', () => {
       lastEquity: fc.bigInt({ min: 0n, max: 900_000_000n }),
       peak: fc.option(fc.bigInt({ min: 1n, max: 900_000_000n }), { nil: null }),
       jumpPending: fc.boolean(),
+      held: fc.record({ equity: fc.bigInt({ min: 1n, max: 2_000_000_000n }), at: fc.integer({ min: 0, max: Date.UTC(2030, 0, 1) }) }),
       ack: fc.option(fc.record({ equity: fc.bigInt({ min: 1n, max: 2_000_000_000n }), at: fc.integer({ min: 0, max: Date.UTC(2030, 0, 1) }) }), { nil: null }),
       dailyStopDay: fc.constantFrom<string | null>(null, '2026-11-08', '2026-11-09'),
       dailyStopStreak: fc.integer({ min: 0, max: 3 }),
+      streakHalt: fc.boolean(),
     });
     fc.assert(
       fc.property(states, (r) => {
@@ -339,9 +400,11 @@ describe('equity and day state properties', () => {
           lastEquity: L(r.lastEquity),
           peak: r.peak === null ? null : L(r.peak),
           jumpPending: r.jumpPending,
+          jumpHeld: r.jumpPending ? { equity: L(r.held.equity), at: r.held.at } : null,
           jumpAck: r.ack === null ? null : { equity: L(r.ack.equity), at: r.ack.at },
           dailyStopDay: r.dailyStopDay,
           dailyStopStreak: r.dailyStopStreak,
+          streakHalt: r.streakHalt,
         };
         if (!s.jumpPending && s.lastEquity > 0n) {
           const p = resumePeak(s);
@@ -354,7 +417,8 @@ describe('equity and day state properties', () => {
         }
         const k = resumeStreak(s);
         assert.equal(k.dailyStopStreak, 0);
-        assert.deepEqual({ ...k, dailyStopStreak: s.dailyStopStreak }, s);
+        assert.equal(k.streakHalt, false);
+        assert.deepEqual({ ...k, dailyStopStreak: s.dailyStopStreak, streakHalt: s.streakHalt }, s);
       }),
     );
     assert.ok(restarted >= 100 && refused >= 100, `restarted ${restarted}, refused ${refused}`);

@@ -125,13 +125,35 @@ const FAULTS: Readonly<Record<string, (c: Case) => Case>> = {
   smallSale: ([p, c]) => smallSale([p, c], 1n),
   // The same sale after a price collapse: the cost basis (5,166,667) keeps the cap alive.
   collapsedPrice: ([p, c]) => smallSale([p, c], 5_166_667n),
+  // REVIEWS.md K: the plan must belong to the engine's intent, be built from risk's own quote and fee
+  // config, never be a second buy for the position, and stay inside the hard limits whatever sizing says.
+  intent: onPlan((p) => ({ intentId: `${p.intentId}x` })),
+  quoteSlotOff: onCtx((_p, c) => ({ quote: { ...c.quote, slot: c.quote.slot + 1n } })),
+  feeCheaper: onPlan((p) => ({ feeBps: bps(p.feeBps > 0 ? p.feeBps - 1 : 1) })),
+  feeSlotOff: onPlan((p) => ({ feeConfigSlot: p.feeConfigSlot + 1n })),
+  buyOrdered: onBuy(() => ({ buyOrdersForPosition: 1 })),
+  hugeBuy: ([p, c]) => (p.kind === 'buy' && c.buy !== null ? [{ ...p, inAmount: 60_000_001n }, { ...c, buy: { ...c.buy, sizedInAmount: lamports(60_000_001n) } }] : [p, c]),
+  tinyBuy: ([p, c]) => (p.kind === 'buy' && c.buy !== null ? [{ ...p, inAmount: 9_999_999n, cuLimit: 100_000 }, { ...c, buy: { ...c.buy, minInAmount: lamports(0n) } }] : [p, c]),
+  richRent: ([p, c]) =>
+    p.kind === 'buy' && c.buy !== null ? [{ ...p, rentLamports: lamports(15_000_000n) }, { ...c, buy: { ...c.buy, rentRequired: lamports(15_000_000n) } }] : [p, c],
+  // minOut one lamport under an exact fractional bound (980,000,000.98 or 14,550,000.97): a floor that rounds down accepted it
+  fractionalQuote: ([p, c]) => {
+    if (p.kind === 'close-account') {
+      return [p, c];
+    }
+    const quoted = p.expectedOut + 1n;
+    const minOut = (quoted * (10_000n - BigInt(p.slippageBps))) / 10_000n;
+    return onExit(() => ({ quotedOut: lamports(quoted) }))(onBuy(() => ({ quotedOut: quoted }))([{ ...p, expectedOut: quoted, minOut }, c]));
+  },
+  // 1.2 x 100,001 simulated units = 120,001.2: a limit of 120,002 is above the cap, though it rounds to it
+  cuFractional: ([p, c]) => [{ ...p, cuLimit: 120_002 }, { ...c, simulatedCu: 100_001 }],
 };
 function smallSale([p, c]: Case, costBasis: bigint): Case {
   if (p.kind !== 'sell' || c.exit === null) {
     return [p, c];
   }
   const quoted = 5_166_666n;
-  const minOut = (quoted * (10_000n - BigInt(p.slippageBps))) / 10_000n;
+  const minOut = (quoted * (10_000n - BigInt(p.slippageBps)) + 9_999n) / 10_000n; // the floor rounds UP: a lower bound
   return [{ ...p, expectedOut: quoted, minOut }, { ...c, exit: { ...c.exit, quotedOut: lamports(quoted), costBasis: lamports(costBasis) } }];
 }
 const FAULT_NAMES = Object.keys(FAULTS);
@@ -167,25 +189,30 @@ function acceptable(plan: OrderPlan, c: PlanContext): boolean {
   const b = c.buy;
   const e = c.exit;
   const quoted = buy ? b!.quotedOut : e!.quotedOut;
-  const floor = (quoted * (10_000n - BigInt(plan.slippageBps))) / 10_000n;
+  // Exact (cross-multiplied): a lower bound never rounds in the plan's favour, so no rounding is shared with the code.
+  const minOutOk = plan.minOut * 10_000n >= quoted * (10_000n - BigInt(plan.slippageBps));
   const urgency = buy ? 'normal' : e!.urgency;
   const base = buy ? plan.inAmount : e!.quotedOut > e!.costBasis ? e!.quotedOut : e!.costBasis;
   const landingBps = buy ? 20n : 60n;
 
   const common =
     plan.mode === c.position.mode &&
+    plan.intentId === c.intentId &&
     plan.pool === c.pool.id &&
     plan.venue === c.pool.venue &&
     c.pool.quoteMint === WSOL &&
     plan.route === 'direct' &&
     fresh(plan.feeConfigSlot) &&
+    plan.quoteSlot === c.quote.slot &&
+    plan.feeBps === c.quote.feeBps &&
+    plan.feeConfigSlot === c.quote.feeConfigSlot &&
     (plan.mode !== 'live' || c.simulatedCu !== null) &&
     plan.cuLimit <= 300_000 &&
-    (c.simulatedCu === null || BigInt(plan.cuLimit) <= (BigInt(c.simulatedCu) * 12n + 9n) / 10n) &&
+    (c.simulatedCu === null || BigInt(plan.cuLimit) * 10n <= BigInt(c.simulatedCu) * 12n) && // 1.2 x, exact: a cap never rounds up
     plan.cuPrice <= (buy ? 200_000n : 400_000n) &&
     tipOk &&
     (!(buy || urgency === 'normal') || landing <= (base * landingBps) / 10_000n) &&
-    (close || (plan.expectedOut <= quoted && plan.minOut >= floor && plan.minOut <= plan.expectedOut));
+    (close || (plan.expectedOut <= quoted && minOutOk && plan.minOut <= plan.expectedOut));
 
   if (buy) {
     return (
@@ -203,6 +230,10 @@ function acceptable(plan: OrderPlan, c: PlanContext): boolean {
       worst <= b!.sizedAttemptFees &&
       plan.inAmount >= b!.minInAmount &&
       plan.inAmount <= b!.sizedInAmount &&
+      b!.buyOrdersForPosition === 0 &&
+      plan.inAmount <= 60_000_000n && // limit 2, whatever sizing says
+      plan.inAmount >= 10_000_000n && // the floor of limit 15, whatever sizing says
+      plan.inAmount + plan.rentLamports + worst <= 70_000_000n && // the worst-case spend backstop
       plan.rentLamports === b!.rentRequired &&
       !plan.closeAccountAfter
     );

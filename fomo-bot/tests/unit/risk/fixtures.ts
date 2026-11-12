@@ -55,6 +55,8 @@ export function passingContext(plan: OrderPlan): PlanContext {
   const held = tokenUnits(plan.kind === 'sell' ? plan.inAmount * 2n : 0n);
   return {
     currentSlot: plan.quoteSlot + 5n,
+    intentId: plan.intentId,
+    quote: { slot: plan.quoteSlot, feeBps: plan.feeBps, feeConfigSlot: plan.feeConfigSlot },
     position: { id: plan.positionId, mint: plan.mint, mode: plan.mode, status: buy ? 'opening' : close ? 'exiting' : 'open' },
     wallet: plan.wallet,
     ownTokenAccount: plan.tokenAccount,
@@ -72,6 +74,7 @@ export function passingContext(plan: OrderPlan): PlanContext {
           rentRequired: plan.rentLamports,
           attemptsAllowed: plan.attempts,
           quotedOut: plan.expectedOut,
+          buyOrdersForPosition: 0,
         }
       : null,
     exit: buy

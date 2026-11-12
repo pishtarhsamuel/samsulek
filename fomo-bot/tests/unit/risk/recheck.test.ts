@@ -75,8 +75,13 @@ const CLOSE: OrderPlan = {
   attempts: 1,
 };
 
+/** Risk's own read of the quote: the same reserves and fee config the plans below were built from. */
+const QUOTE = { slot: 990n, feeBps: bps(125), feeConfigSlot: 995n } as const;
+
 const BUY_CTX: PlanContext = {
   currentSlot: 1_000n,
+  intentId: 'intent-1',
+  quote: QUOTE,
   position: { id: 'p1', mint: 'MintA', mode: 'paper', status: 'opening' },
   wallet: 'OurWallet',
   ownTokenAccount: 'AtaOfMintA',
@@ -93,6 +98,7 @@ const BUY_CTX: PlanContext = {
     rentRequired: lamports(1_488_440n),
     attemptsAllowed: 3,
     quotedOut: 1_000_000_000n,
+    buyOrdersForPosition: 0,
   },
   exit: null,
 };
@@ -118,6 +124,7 @@ const SELL_CTX: PlanContext = {
 
 const CLOSE_CTX: PlanContext = {
   ...SELL_CTX,
+  quote: { ...QUOTE, feeBps: bps(0) }, // the close plan has no swap and so no fee
   position: { id: 'p1', mint: 'MintA', mode: 'paper', status: 'exiting' },
   ledgerTokens: tokenUnits(0n),
   chainTokens: tokenUnits(0n),
@@ -266,8 +273,9 @@ describe('fee caps (limit 18) and tips (limit 19)', () => {
     assert.deepEqual(buy({ inAmount: 15_499_999n }, buyCtx({ sizedInAmount: lamports(15_499_999n), minInAmount: lamports(10_000_000n) })), ['landing-spend-above-cap']);
   });
 
-  // A small sale: the plan expects 5,166,666 and keeps its 3% floor (5,011,666) against that quote.
-  const small = { expectedOut: 5_166_666n, minOut: 5_011_666n };
+  // A small sale: the plan expects 5,166,666 and keeps its 3% floor against that quote: exactly 5,011,666.02,
+  // so 5,011,667 (the old constant, 5,011,666, only passed because the floor used to round down).
+  const small = { expectedOut: 5_166_666n, minOut: 5_011_667n };
 
   it('an exit: 0.6% of the larger of risk\'s quote and the cost basis, for normal urgency', () => {
     // 5,166,667 x 0.6% = 31,000 (passes); 5,166,666 gives 30,999 (refused)
@@ -406,19 +414,112 @@ describe('ownership, position state, mode, route and fresh inputs', () => {
     assert.deepEqual(buy({ route: 'jupiter-build' }, { caps: { ...CAPS, allowedRoutes: ['direct', 'jupiter-build'] } }), []);
   });
 
-  it('quote and fee config at most 25 slots old, and never from the future', () => {
-    assert.deepEqual(buy({ quoteSlot: 975n }), []);
-    assert.deepEqual(buy({ quoteSlot: 974n }), ['stale-plan']);
-    assert.deepEqual(buy({ quoteSlot: 1_001n }), ['stale-plan']);
-    assert.deepEqual(buy({ feeConfigSlot: 975n }), []);
-    assert.deepEqual(buy({ feeConfigSlot: 974n }), ['stale-fee-config']);
-    assert.deepEqual(buy({ feeConfigSlot: 1_001n }), ['stale-fee-config']);
-    assert.deepEqual(sell({ quoteSlot: 974n }), ['stale-quote']); // the exit check's name for the same fault
+  it('quote and fee config at most 25 slots old, and never from the future (risk\'s own read moves with the plan here)', () => {
+    const quoted = (slot: bigint) => ({ quote: { ...QUOTE, slot } });
+    const feeRead = (feeConfigSlot: bigint) => ({ quote: { ...QUOTE, feeConfigSlot } });
+    assert.deepEqual(buy({ quoteSlot: 975n }, quoted(975n)), []);
+    assert.deepEqual(buy({ quoteSlot: 974n }, quoted(974n)), ['stale-plan']);
+    assert.deepEqual(buy({ quoteSlot: 1_001n }, quoted(1_001n)), ['stale-plan']);
+    assert.deepEqual(buy({ feeConfigSlot: 975n }, feeRead(975n)), []);
+    assert.deepEqual(buy({ feeConfigSlot: 974n }, feeRead(974n)), ['stale-fee-config']);
+    assert.deepEqual(buy({ feeConfigSlot: 1_001n }, feeRead(1_001n)), ['stale-fee-config']);
+    assert.deepEqual(sell({ quoteSlot: 974n }, quoted(974n)), ['stale-quote']); // the exit check's name for the same fault
   });
 
   it('every problem is reported, in a fixed order', () => {
-    const all = buy({ mode: 'live', positionId: 'p2', wallet: 'X', quoteSlot: 1n, minOut: 0n, rentLamports: lamports(0n) });
+    const all = buy({ mode: 'live', positionId: 'p2', wallet: 'X', quoteSlot: 1n, minOut: 0n, rentLamports: lamports(0n) }, { quote: { ...QUOTE, slot: 1n } });
     assert.deepEqual(all, ['wrong-mode', 'wrong-position', 'foreign-wallet', 'stale-plan', 'min-out-below-slippage', 'rent-mismatch']);
+    const more = buy({ intentId: 'other', feeBps: bps(0), quoteSlot: 991n }, buyCtx({ buyOrdersForPosition: 2 }));
+    assert.deepEqual(more, ['wrong-intent', 'quote-slot-mismatch', 'fee-config-mismatch', 'buy-already-ordered']);
+  });
+});
+
+describe('the plan belongs to the engine\'s intent, and a position gets one buy (REVIEWS.md K, finding 4)', () => {
+  it('the intent id comes from the engine: a plan carrying another is refused, for buys and exits', () => {
+    assert.deepEqual(buy({ intentId: 'intent-2' }), ['wrong-intent']);
+    assert.deepEqual(buy({}, { intentId: 'intent-2' }), ['wrong-intent']);
+    assert.deepEqual(sell({ intentId: 'intent-2' }), ['wrong-intent']);
+    assert.deepEqual(close({ intentId: 'intent-2' }), ['wrong-intent']);
+  });
+
+  it('a second buy order for the same position is refused, whatever ids it carries', () => {
+    assert.deepEqual(buy({}, buyCtx({ buyOrdersForPosition: 0 })), []);
+    assert.deepEqual(buy({}, buyCtx({ buyOrdersForPosition: 1 })), ['buy-already-ordered']);
+    assert.deepEqual(buy({ orderId: 'order-2', intentId: 'intent-2' }, { intentId: 'intent-2', ...buyCtx({ buyOrdersForPosition: 3 }) }), ['buy-already-ordered']);
+  });
+});
+
+describe('hard backstops hold whatever sizing says (REVIEWS.md K, finding 5; limits 2 and 15)', () => {
+  const sizedAs = (inAmount: bigint) => buyCtx({ sizedInAmount: lamports(inAmount), minInAmount: lamports(0n) });
+
+  it('a buy of more than 0.06 SOL is refused even if the context says it was sized that big', () => {
+    assert.deepEqual(buy({ inAmount: 60_000_000n }, sizedAs(60_000_000n)), []);
+    assert.deepEqual(buy({ inAmount: 60_000_001n }, sizedAs(60_000_001n)), ['in-amount-above-hard-max']);
+    assert.deepEqual(buy({ inAmount: 1_500_000_000n }, sizedAs(1_500_000_000n)), ['in-amount-above-hard-max', 'spend-above-hard-max']);
+  });
+
+  it('a buy of less than 0.01 SOL is refused even if the minimum in the context is 0: no buy of nothing that pays rent and fees', () => {
+    const cheap = { cuLimit: 100_000 }; // keeps the landing spend inside its cap at this size
+    assert.deepEqual(buy({ inAmount: 10_000_000n, ...cheap }, sizedAs(10_000_000n)), []);
+    assert.deepEqual(buy({ inAmount: 9_999_999n, ...cheap }, sizedAs(9_999_999n)), ['in-amount-below-hard-min']);
+    assert.ok(buy({ inAmount: 0n, ...cheap }, sizedAs(0n)).includes('in-amount-below-hard-min'));
+  });
+
+  it('the worst-case spend (input + rent + every attempt) is at most 0.07 SOL, exact to the lamport', () => {
+    // 55,000,000 + rent + 3 x 36,000 = 70,000,000 at a rent of 14,892,000
+    const rich = (rent: bigint) => buy({ rentLamports: lamports(rent) }, buyCtx({ rentRequired: lamports(rent) }));
+    assert.deepEqual(rich(14_892_000n), []);
+    assert.deepEqual(rich(14_892_001n), ['spend-above-hard-max']);
+  });
+});
+
+describe('risk\'s own quote and fee config: the plan must be built from the same (REVIEWS.md K, finding 6)', () => {
+  it('a plan declaring another fee (paper results would look better), fee config slot or quote slot is refused', () => {
+    assert.deepEqual(buy({ feeBps: bps(0) }), ['fee-config-mismatch']);
+    assert.deepEqual(buy({ feeBps: bps(124) }), ['fee-config-mismatch']);
+    assert.deepEqual(buy({ feeBps: bps(126) }), ['fee-config-mismatch']);
+    assert.deepEqual(buy({ feeConfigSlot: 996n }), ['fee-config-mismatch']);
+    assert.deepEqual(buy({ quoteSlot: 989n }), ['quote-slot-mismatch']);
+    assert.deepEqual(buy({ quoteSlot: 991n }), ['quote-slot-mismatch']);
+    assert.deepEqual(sell({ feeBps: bps(0) }), ['fee-config-mismatch']);
+    assert.deepEqual(sell({ quoteSlot: 991n }), ['quote-slot-mismatch']);
+    assert.deepEqual(close({ quoteSlot: 991n }), ['quote-slot-mismatch']);
+  });
+});
+
+describe('exact comparisons: a floor never rounds down and a cap never rounds up (REVIEWS.md K, finding 7)', () => {
+  it('minOut must reach the exact floor of the quote (980,000,000.98 means 980,000,001)', () => {
+    const odd = buyCtx({ quotedOut: 1_000_000_001n });
+    assert.deepEqual(buy({ expectedOut: 1_000_000_001n, minOut: 980_000_000n }, odd), ['min-out-below-slippage']);
+    assert.deepEqual(buy({ expectedOut: 1_000_000_001n, minOut: 980_000_001n }, odd), []);
+    const oddSale = sellExit({ quotedOut: lamports(15_000_001n) });
+    assert.deepEqual(sell({ expectedOut: 15_000_001n, minOut: 14_550_000n }, oddSale), ['min-out-below-slippage']); // 14,550,000.97
+    assert.deepEqual(sell({ expectedOut: 15_000_001n, minOut: 14_550_001n }, oddSale), []);
+  });
+
+  it('the CU limit is at most 1.2 x the simulated units exactly (120,001.2 means 120,001)', () => {
+    const sim = { ...ROOMY, simulatedCu: 100_001 };
+    assert.deepEqual(buy({ cuLimit: 120_001 }, sim), []);
+    assert.deepEqual(buy({ cuLimit: 120_002 }, sim), ['cu-limit-above-simulated']);
+  });
+});
+
+describe('exactly one kind of figures, and the new context parts are checked (REVIEWS.md K, finding 8)', () => {
+  it('a buy has no exit context and an exit has no buy context', () => {
+    assert.throws(() => planProblems(BUY, { ...BUY_CTX, exit: SELL_CTX.exit }), /no exit context/);
+    assert.throws(() => planProblems(SELL, { ...SELL_CTX, buy: BUY_CTX.buy }), /the reverse/);
+    assert.throws(() => planProblems(CLOSE, { ...CLOSE_CTX, buy: BUY_CTX.buy }), /the reverse/);
+  });
+
+  it('the intent id and the quote must be there and well formed', () => {
+    assert.throws(() => buy({}, { intentId: '' }), RiskError);
+    assert.throws(() => buy({}, { intentId: undefined as unknown as string }), RiskError);
+    assert.throws(() => buy({}, { quote: null as unknown as PlanContext['quote'] }), RiskError);
+    assert.throws(() => buy({}, { quote: { ...QUOTE, slot: -1n } }), RiskError);
+    assert.throws(() => buy({}, { quote: { ...QUOTE, feeConfigSlot: 5 as unknown as bigint } }), RiskError);
+    assert.throws(() => buy({}, { quote: { ...QUOTE, feeBps: 20_000 as unknown as typeof QUOTE.feeBps } }), Error);
+    assert.throws(() => buy({}, buyCtx({ buyOrdersForPosition: -1 })), RiskError);
+    assert.throws(() => buy({}, buyCtx({ buyOrdersForPosition: 0.5 })), RiskError);
   });
 });
 

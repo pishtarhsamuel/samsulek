@@ -9,6 +9,8 @@
 //   for the next hour a rise is measured from the higher of the hour-ago snapshot and that
 //   verified level, so the same rise cannot trip the hold again and again while the snapshot is
 //   still from before it.
+// - Two daily stops on consecutive days set a STICKY streak halt, reported on every observation
+//   until the owner's resumeStreak: a quiet day or a gap in between cannot lift it.
 // - The stops read a separate stop-equity (positions stale for over 5 min valued 0) and never move
 //   anything (REVIEWS.md D, M3), so a dead price feed can trip a stop but cannot set a baseline.
 // - The day is the Europe/Athens calendar day (core/day.ts), so the daily stop resets at local
@@ -50,12 +52,22 @@ export interface EquityState {
   readonly peak: Lamports | null;
   /** A +50% jump is waiting for the engine's verification; baseline and peak stay put. */
   readonly jumpPending: boolean;
+  /**
+   * The latest observation that was held as a jump (its equity and time); set exactly while
+   * jumpPending. A confirmation must follow it closely and can never verify more than it saw.
+   */
+  readonly jumpHeld: { readonly equity: Lamports; readonly at: number } | null;
   /** The verified equity of a confirmed jump and when it was confirmed; a reference for the next hour. */
   readonly jumpAck: { readonly equity: Lamports; readonly at: number } | null;
   /** The Athens day a daily stop last tripped; entries are blocked for that day. */
   readonly dailyStopDay: string | null;
-  /** Consecutive days with a daily stop: two need the owner's /resume. */
+  /** Consecutive days with a daily stop. */
   readonly dailyStopStreak: number;
+  /**
+   * Two daily stops on consecutive days: entries wait for the owner. Sticky: set the moment the
+   * streak reaches two and cleared only by resumeStreak, so a quiet day or a gap cannot lift it.
+   */
+  readonly streakHalt: boolean;
 }
 
 export interface EquityObservation {
@@ -134,11 +146,26 @@ function checkAck(value: EquityState['jumpAck']): EquityState['jumpAck'] {
   }
   const ack = object('jumpAck', value);
   const equity = amount('jumpAck equity', ack.equity);
+  const at = ack.at; // each field is read once
   // Above the hard sanity limit no equity is ever accepted, so no verified level can be higher.
-  if (equity < 1n || equity > HARD_SANITY_MAX || !isTimestamp(ack.at)) {
+  if (equity < 1n || equity > HARD_SANITY_MAX || !isTimestamp(at)) {
     throw new RiskError('jumpAck needs a verified equity from 1 lamport to 2.0 SOL and a timestamp');
   }
-  return Object.freeze({ equity: equity as Lamports, at: ack.at });
+  return Object.freeze({ equity: equity as Lamports, at });
+}
+
+function checkHeld(value: EquityState['jumpHeld']): EquityState['jumpHeld'] {
+  if (value === null) {
+    return null;
+  }
+  const held = object('jumpHeld', value);
+  const equity = amount('jumpHeld equity', held.equity);
+  const at = held.at; // each field is read once
+  // An observed equity that passed the sanity checks: never above the hard sanity limit.
+  if (equity < 1n || equity > HARD_SANITY_MAX || !isTimestamp(at)) {
+    throw new RiskError('jumpHeld needs an observed equity from 1 lamport to 2.0 SOL and a timestamp');
+  }
+  return Object.freeze({ equity: equity as Lamports, at });
 }
 
 function checkState(input: EquityState): EquityState {
@@ -147,15 +174,22 @@ function checkState(input: EquityState): EquityState {
   if (typeof streak !== 'number' || !Number.isSafeInteger(streak) || streak < 0) {
     throw new RiskError('dailyStopStreak must be a whole number of at least 0');
   }
+  const jumpPending = flag('jumpPending', s.jumpPending);
+  const jumpHeld = checkHeld(s.jumpHeld);
+  if (jumpPending !== (jumpHeld !== null)) {
+    throw new RiskError('a held jump needs its held observation, and an observation is held only while a jump is');
+  }
   return Object.freeze({
     day: optionalDay('state day', s.day),
     dayStart: amount('dayStart', s.dayStart) as Lamports,
     lastEquity: amount('lastEquity', s.lastEquity) as Lamports,
     peak: optionalAmount('peak', s.peak) as Lamports | null,
-    jumpPending: flag('jumpPending', s.jumpPending),
+    jumpPending,
+    jumpHeld,
     jumpAck: checkAck(s.jumpAck),
     dailyStopDay: optionalDay('dailyStopDay', s.dailyStopDay),
     dailyStopStreak: streak,
+    streakHalt: flag('streakHalt', s.streakHalt),
   });
 }
 
@@ -195,7 +229,8 @@ interface CheckedObservation {
 
 function checkObservation(input: EquityObservation): CheckedObservation {
   const o = object('observation', input);
-  if (!isTimestamp(o.now)) {
+  const now = o.now; // each field is read once
+  if (!isTimestamp(now)) {
     throw new RiskError('now must be a UTC millisecond timestamp up to the year 2200');
   }
   const equity = optionalAmount('equity', o.equity);
@@ -204,7 +239,7 @@ function checkObservation(input: EquityObservation): CheckedObservation {
   if (equity !== null && stopEquity !== null && stopEquity > equity) {
     throw new RiskError('the stop equity cannot be above the equity');
   }
-  return { now: o.now, equity, stopEquity, anHourAgo };
+  return { now, equity, stopEquity, anHourAgo };
 }
 
 // ---------------------------------------------------------------- the state machine
@@ -219,9 +254,11 @@ export function emptyEquityState(): EquityState {
     lastEquity: 0n as Lamports,
     peak: null,
     jumpPending: false,
+    jumpHeld: null,
     jumpAck: null,
     dailyStopDay: null,
     dailyStopStreak: 0,
+    streakHalt: false,
   });
 }
 
@@ -293,51 +330,63 @@ export function observeEquity(stateInput: EquityState, observation: EquityObserv
     const jumped = state.jumpPending || (reference !== null && equity * 10_000n > reference * (10_000n + policy.jumpBps));
     if (jumped) {
       trips.push('equity-jump'); // held: nothing moves until the engine verifies the rise
-      next = Object.freeze({ ...state, jumpPending: true });
+      // the latest held observation is remembered: a confirmation is tied to it
+      next = Object.freeze({ ...state, jumpPending: true, jumpHeld: Object.freeze({ equity: equity as Lamports, at: now }) });
     } else {
       next = accept(state, equity, today);
     }
   }
 
   const stop = stopEquity ?? equity;
-  if (stop !== null) {
-    if (next.day === today && next.dayStart > 0n && fellBy(next.dayStart, stop, policy.dailyStopBps)) {
-      trips.push('daily-stop');
-      if (next.dailyStopDay !== today) {
-        const consecutive = next.dailyStopDay !== null && next.dailyStopDay === previousDay(today);
-        next = Object.freeze({ ...next, dailyStopDay: today, dailyStopStreak: consecutive ? next.dailyStopStreak + 1 : 1 });
-      }
-      if (next.dailyStopStreak >= 2) {
-        trips.push('daily-stop-twice');
-      }
+  if (stop !== null && next.day === today && next.dayStart > 0n && fellBy(next.dayStart, stop, policy.dailyStopBps)) {
+    trips.push('daily-stop');
+    if (next.dailyStopDay !== today) {
+      const consecutive = next.dailyStopDay !== null && next.dailyStopDay === previousDay(today);
+      const streak = consecutive ? next.dailyStopStreak + 1 : 1;
+      // Two days in a row is a halt for the owner. It is sticky: the streak itself restarts on a
+      // gap, but only the owner lifts the halt.
+      next = Object.freeze({ ...next, dailyStopDay: today, dailyStopStreak: streak, streakHalt: next.streakHalt || streak >= 2 });
     }
-    if (next.peak !== null && next.peak > 0n && fellBy(next.peak, stop, policy.peakHaltBps)) {
-      trips.push('peak-halt');
-    }
+  }
+  if (next.streakHalt) {
+    trips.push('daily-stop-twice'); // level-triggered: on every observation until the owner resumes
+  }
+  if (stop !== null && next.peak !== null && next.peak > 0n && fellBy(next.peak, stop, policy.peakHaltBps)) {
+    trips.push('peak-halt');
   }
   return Object.freeze({ state: next, trips: Object.freeze(trips) });
 }
 
+/** A confirmation must come this soon after the latest held observation (else observe again first). */
+const CONFIRM_WINDOW_MS = 5 * 60_000;
+
 /**
  * The engine verified a held +50% jump against the chain, from a fresh, fully valued read (never
- * the held observation itself). The verified equity is the reference for the next hour (so the same
- * rise cannot hold again while the hour-ago snapshot is still from before it), and from the next
- * observation the baseline and the peak may move. It must be a level the sanity limits accept, so
- * a confirmation can never put the reference above them. A confirmation with no held jump is an
- * engine bug and fails closed.
+ * the held observation itself). The recorded reference is the LOWER of the verified level and what
+ * the latest held observation saw, so a confirmation can never vouch for more than was observed
+ * (it still clears after a pump that collapses: the verified level is then the lower one). It is the
+ * reference for the next hour, so the same rise cannot hold again while the hour-ago snapshot is
+ * still from before it; from the next observation the baseline and the peak may move. The verified
+ * level must be one the sanity limits accept, and the confirmation must follow the latest held
+ * observation by at most 5 minutes (never precede it): otherwise observe again first. A
+ * confirmation with no held jump is an engine bug. All of these fail closed.
  */
 export function confirmEquityJump(stateInput: EquityState, verifiedEquity: Lamports, now: number, policyInput: EquityPolicy): EquityState {
   const state = checkState(stateInput);
   const policy = checkPolicy(policyInput);
-  if (!state.jumpPending) {
+  const held = state.jumpHeld;
+  if (!state.jumpPending || held === null) {
     throw new RiskError('there is no held equity jump to confirm');
   }
   const level = amount('verifiedEquity', verifiedEquity);
   if (level > policy.sanityMax || level > policy.bankrollCap) {
     throw new RiskError('the verified equity is above the sanity limits');
   }
-  const ack = checkAck({ equity: level as Lamports, at: now });
-  return Object.freeze({ ...state, jumpPending: false, jumpAck: ack });
+  if (!isTimestamp(now) || now < held.at || now - held.at > CONFIRM_WINDOW_MS) {
+    throw new RiskError('a confirmation must follow the latest held observation by at most 5 minutes: observe again first');
+  }
+  const ack = checkAck({ equity: (level < held.equity ? level : held.equity) as Lamports, at: now });
+  return Object.freeze({ ...state, jumpPending: false, jumpHeld: null, jumpAck: ack });
 }
 
 /**
@@ -387,16 +436,25 @@ export function resumePeak(stateInput: EquityState): EquityState {
   return Object.freeze({ ...state, peak: state.lastEquity });
 }
 
-/** The owner's /resume after two daily stops in a row: the streak starts again. Nothing else changes. */
+/**
+ * The owner's /resume after two daily stops in a row: the halt is lifted and the streak starts
+ * again. Nothing else changes (today's daily stop still holds until midnight).
+ */
 export function resumeStreak(stateInput: EquityState): EquityState {
-  return Object.freeze({ ...checkState(stateInput), dailyStopStreak: 0 });
+  return Object.freeze({ ...checkState(stateInput), dailyStopStreak: 0, streakHalt: false });
 }
 
-/** Entries are blocked for the rest of the Athens day on which a daily stop tripped. */
+/**
+ * Entries are blocked for the rest of the Athens day on which a daily stop tripped. If the clock
+ * reads earlier than that (it stepped back), the stop still holds; and while the clock reads
+ * earlier than the last observation's day entries stay blocked too, until the next observation
+ * reports the clock problem.
+ */
 export function dailyStopActive(stateInput: EquityState, now: number): boolean {
   const state = checkState(stateInput);
   if (!isTimestamp(now)) {
     throw new RiskError('now must be a UTC millisecond timestamp up to the year 2200');
   }
-  return state.dailyStopDay === athensDay(now);
+  const today = athensDay(now);
+  return (state.dailyStopDay !== null && state.dailyStopDay >= today) || (state.day !== null && state.day > today);
 }

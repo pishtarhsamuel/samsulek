@@ -17,7 +17,8 @@
 //   REVIEWS.md entries D, E and F).
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import ts from 'typescript';
 
@@ -34,10 +35,13 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   safety: ['core', 'chain', 'venues'],
   strategies: ['core'],
   exits: ['core'],
-  risk: ['core', 'config', 'storage', 'portfolio'],
+  // risk/ and portfolio/ are pure: at runtime they may import only pure folders (a meta-test below
+  // enforces it), so purity holds across imports and not only file by file. They reach storage and
+  // config through types and values the composition root (app/) hands in.
+  risk: ['core', 'portfolio'],
   execution: ['core', 'venues', 'chain', 'storage', 'risk'],
   signer: [],
-  portfolio: ['core', 'storage'],
+  portfolio: ['core'],
   research: ['core', 'storage', 'portfolio', 'exits'],
   telegram: ['core'],
   'ai-review': ['core', 'research', 'config'],
@@ -60,7 +64,10 @@ const PACKAGES: Readonly<Record<string, readonly string[]>> = {};
  */
 const RUNTIME_ONLY_FROM: Readonly<Record<string, readonly string[]>> = {
   risk: ['risk', 'app'],
+  // the composition root is reached only from the process entry (cli/) and from itself, so nothing else can pick up what it holds
+  app: ['app', 'cli'],
 };
+/** Lower case: the check compares import targets in lower case, because Windows and macOS ignore case in file names. */
 const CLOCK_FILES = new Set(['core/clock.ts', 'core/rng.ts']);
 const RNG_FILE = 'core/rng.ts';
 
@@ -248,7 +255,7 @@ export function checkSource(rel: string, text: string): string[] {
   const pure = CLOCK_FILES.has(rel) ? undefined : PURE[folder];
   const declared = pure === undefined ? new Set<string>() : declaredNames(source);
 
-  const checkSpecifier = (spec: string, typeOnly: boolean): void => {
+  const checkSpecifier = (spec: string, typeOnly: boolean, reexport = false): void => {
     if (spec.startsWith('node:')) {
       if (pure !== undefined && !typeOnly && !pure.includes(spec)) {
         problems.push(`${rel}: ${spec} is not allowed in ${folder}/ (pure code)`);
@@ -267,13 +274,17 @@ export function checkSource(rel: string, text: string): string[] {
         problems.push(`${rel}: import "${spec}" leaves src/`);
         return;
       }
-      if (pure !== undefined && !typeOnly && CLOCK_FILES.has(target)) {
+      if (pure !== undefined && !typeOnly && CLOCK_FILES.has(target.toLowerCase())) {
         problems.push(`${rel}: pure code may import ${target} only as types (time and randomness are passed in)`);
       }
       const targetFolder = target.split('/')[0] ?? '';
       const onlyFrom = RUNTIME_ONLY_FROM[targetFolder.toLowerCase()];
       if (onlyFrom !== undefined && !typeOnly && !onlyFrom.includes(folder.toLowerCase())) {
         problems.push(`${rel}: ${target} may be imported at runtime only from ${onlyFrom.join(' and ')} (types are fine)`);
+      }
+      // A re-export hands the values on to whoever imports this file: only the folder itself may do that.
+      if (onlyFrom !== undefined && !typeOnly && reexport && folder.toLowerCase() !== targetFolder.toLowerCase()) {
+        problems.push(`${rel}: ${target} may not be re-exported outside ${targetFolder}/ (types are fine)`);
       }
       if (typeOnly || targetFolder === folder || allowed.includes('*') || allowed.includes(targetFolder)) {
         return;
@@ -309,7 +320,7 @@ export function checkSource(rel: string, text: string): string[] {
         }
       }
     } else if (ts.isExportDeclaration(node) && node.moduleSpecifier !== undefined && ts.isStringLiteral(node.moduleSpecifier)) {
-      checkSpecifier(node.moduleSpecifier.text, node.isTypeOnly);
+      checkSpecifier(node.moduleSpecifier.text, node.isTypeOnly, true);
       if (isCrypto(node.moduleSpecifier) && rel !== RNG_FILE && !node.isTypeOnly) {
         problems.push(`${rel}: node:crypto may not be re-exported`);
       }
@@ -428,13 +439,14 @@ export function checkSource(rel: string, text: string): string[] {
         problems.push(`${rel}: ${owner}.${member} outside core/clock.ts and core/rng.ts`);
       }
     }
-    if (pure !== undefined) {
-      const named =
-        (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
-        node.text === 'constructor';
-      if (named) {
-        problems.push(`${rel}: "constructor" is not allowed in ${folder}/ (pure code: it reaches Function)`);
-      }
+    // In every folder, not only the pure ones: `x.constructor` reaches Function and the members of
+    // Date (`new Date(0).constructor.now()` reads the clock). A class's own `constructor(...)` is a
+    // keyword in the syntax tree, not a name, so classes are untouched.
+    const named =
+      (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+      node.text === 'constructor';
+    if (named) {
+      problems.push(`${rel}: "constructor" is not allowed (it reaches Function and the clock)`);
     }
     ts.forEachChild(node, visit);
   };
@@ -653,6 +665,88 @@ describe('architecture: imports and determinism', () => {
     ];
     for (const [rel, text] of cases) {
       assert.deepEqual(checkSource(rel, text), [], `should allow ${rel}: ${text}`);
+    }
+  });
+});
+
+describe('architecture: purity across imports, re-exports and links (REVIEWS.md K, security findings 1, 4, 5 and the clock-file case)', () => {
+  it('purity holds across imports: a pure folder may import only pure folders at runtime', () => {
+    for (const folder of Object.keys(PURE)) {
+      const bad = (ALLOWED[folder] ?? []).filter((target) => target !== folder && !(target in PURE));
+      assert.deepEqual(bad, [], `${folder}/ may import only pure folders (${Object.keys(PURE).join(', ')})`);
+    }
+  });
+
+  it('CANARY: a pure folder importing storage/ or config/ at runtime is flagged, types are fine', () => {
+    flagged([
+      ['risk/x.ts', "import { open } from '../storage/db.ts';"],
+      ['risk/x.ts', "import { load } from '../config/load.ts';"],
+      ['portfolio/x.ts', "import { open } from '../storage/db.ts';"],
+      ['risk/x.ts', "export { readFileSync } from '../storage/fsx.ts';"],
+    ]);
+    assert.deepEqual(checkSource('risk/x.ts', "import type { Db } from '../storage/db.ts'; export const x = (d: Db): Db => d;"), []);
+  });
+
+  it('CANARY: app/ cannot hand risk/ values on, and only cli/ reaches app/ at runtime', () => {
+    flagged([
+      ['app/x.ts', "export { createApprovalAuthority } from '../risk/approval.ts';"],
+      ['app/x.ts', "export * from '../risk/approval.ts';"],
+      ['execution/y.ts', "import { build } from '../app/x.ts';"],
+      ['signer/y.ts', "import { build } from '../app/x.ts';"],
+    ]);
+    assert.deepEqual(checkSource('app/x.ts', "export type { ApprovalToken } from '../risk/approval.ts';"), []); // types are fine
+    assert.deepEqual(checkSource('app/x.ts', "import { createApprovalAuthority } from '../risk/approval.ts'; export const build = () => createApprovalAuthority;"), []); // using it is the point of app/
+    assert.deepEqual(checkSource('cli/y.ts', "import { build } from '../app/x.ts';"), []);
+    assert.deepEqual(checkSource('risk/z.ts', "export { createApprovalAuthority } from './approval.ts';"), []); // risk/ itself may
+  });
+
+  it('CANARY: "constructor" is flagged in every folder (it reaches the clock through Date), a class\'s own constructor is not', () => {
+    flagged([
+      ['execution/x.ts', 'const t = new Date(0).constructor.now();'],
+      ['execution/x.ts', "const F = (() => 0)['constructor'];"],
+      ['cli/x.ts', 'const { constructor: C } = new Date(0);'],
+    ]);
+    assert.deepEqual(checkSource('execution/x.ts', 'export class E extends Error { constructor(m: string) { super(m); } }'), []);
+  });
+
+  it('LIMIT, written down: re-exporting through a local binding is not seen (import then export), and the determinism rules are a tripwire for mistakes, not a sandbox', () => {
+    // Only cli/ can reach app/, and app/ is the composition root we write; the guarantee against a hostile
+    // file is review plus the verifier/issuer split, not this lint. If this ever starts to be flagged, update ARCHITECTURE s.11.
+    assert.deepEqual(
+      checkSource('app/x.ts', "import { createApprovalAuthority as c } from '../risk/approval.ts'; export { c };"),
+      [],
+    );
+  });
+
+  it('CANARY: the clock files are recognised whatever the case of the import (Windows and macOS ignore case)', () => {
+    flagged([
+      ['risk/x.ts', "import { systemClock } from '../core/Clock.ts';"],
+      ['portfolio/x.ts', "import { systemRng } from '../core/RNG.ts';"],
+    ]);
+  });
+
+  const symlinksUnder = (root: string): string[] =>
+    readdirSync(root, { recursive: true, withFileTypes: true })
+      .filter((entry) => entry.isSymbolicLink())
+      .map((entry) => path.join(entry.parentPath, entry.name));
+
+  it('there are no symbolic links under src/: a link could point a file in one folder at code in another', () => {
+    assert.deepEqual(symlinksUnder(SRC), []);
+  });
+
+  it('CANARY: the link scan finds a link (skipped where the system does not let the test make one)', (t) => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'fomo-links-'));
+    try {
+      writeFileSync(path.join(dir, 'real.ts'), 'export const x = 1;\n');
+      try {
+        symlinkSync(path.join(dir, 'real.ts'), path.join(dir, 'link.ts'));
+      } catch {
+        t.skip('symbolic links are not permitted here');
+        return;
+      }
+      assert.deepEqual(symlinksUnder(dir), [path.join(dir, 'link.ts')]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

@@ -28,7 +28,6 @@ import {
   ceilDiv,
   lamports,
   microLamportsPerCu,
-  mulDivFloor,
   tokenUnits,
   type Bps,
   type Lamports,
@@ -66,8 +65,17 @@ const ALLOWED_TIPS = [
   ['jito', 1_000n],
   ['helius-swqos', 5_000n],
 ] as const;
-/** The CU limit is at most this many tenths of the simulated units (1.2 x). */
+/** The CU limit is at most this many tenths of the simulated units (1.2 x), compared exactly. */
 const CU_SIMULATED_TENTHS = 12n;
+/**
+ * Backstops that hold whatever sizing says (RISK_POLICY.md limit 2 "holds even if equity is
+ * misread"): a buy's swap input is at most 0.06 SOL (limit 2) and at least 0.01 SOL (the floor of
+ * limit 15), and its worst-case spend (input + rent + every attempt) at most 0.07 SOL, a margin
+ * above limit 2's 0.0617. They never loosen anything and move to config/caps.ts with the others.
+ */
+const HARD_MAX_BUY_IN = 60_000_000n;
+const HARD_MIN_BUY_IN = 10_000_000n;
+const HARD_MAX_BUY_SPEND = 70_000_000n;
 const STATUSES: readonly ExitPositionStatus[] = ['opening', 'open', 'exiting', 'stuck', 'closed'];
 
 export interface PlanCaps {
@@ -107,6 +115,17 @@ export interface BuyPlanContext {
   readonly attemptsAllowed: number;
   /** Risk's own quote for the plan's input: tokens out, from venues/math on the reserves at the quote slot. */
   readonly quotedOut: bigint;
+  /** Buy orders already made for this position (must be 0): one buy per position, ever. */
+  readonly buyOrdersForPosition: number;
+}
+
+/** Risk's own read of the quote: the plan must be built from the same reserves and fee config. */
+export interface QuoteContext {
+  /** The slot of the reserves risk quoted against. */
+  readonly slot: bigint;
+  /** The pool's fee in bps and the slot of the fee config risk read. */
+  readonly feeBps: Bps;
+  readonly feeConfigSlot: bigint;
 }
 
 export type ExitOrigin =
@@ -138,6 +157,10 @@ export interface ExitPlanContext {
 export interface PlanContext {
   /** The highest slot seen. */
   readonly currentSlot: bigint;
+  /** The engine's id of the intent this order serves (buy or exit); the plan must carry the same, never its own. */
+  readonly intentId: string;
+  /** Risk's own read of the quote and the fee config. */
+  readonly quote: QuoteContext;
   readonly position: { readonly id: string; readonly mint: string; readonly mode: PlanMode; readonly status: ExitPositionStatus };
   /** From config; never from the plan. */
   readonly wallet: string;
@@ -158,11 +181,18 @@ export interface PlanContext {
 export type RecheckProblem =
   | 'kind-not-allowed'
   | 'wrong-mode'
+  | 'wrong-intent'
   | 'wrong-pool'
   | 'wrong-venue'
   | 'pool-not-sol'
   | 'route-not-allowed'
   | 'stale-fee-config'
+  | 'quote-slot-mismatch'
+  | 'fee-config-mismatch'
+  | 'buy-already-ordered'
+  | 'in-amount-above-hard-max'
+  | 'in-amount-below-hard-min'
+  | 'spend-above-hard-max'
   | 'urgency-on-buy'
   | 'wrong-urgency'
   | 'wrong-position'
@@ -342,6 +372,7 @@ type KindContext =
       readonly sized: bigint;
       readonly sizedFees: bigint;
       readonly rent: bigint;
+      readonly orders: number;
     }
   | {
       readonly type: 'exit';
@@ -364,6 +395,7 @@ function checkBuy(input: BuyPlanContext | null): KindContext {
     sized: lamports(buy.sizedInAmount),
     sizedFees: lamports(buy.sizedAttemptFees),
     rent: lamports(buy.rentRequired),
+    orders: count('buyOrdersForPosition', buy.buyOrdersForPosition),
   };
 }
 
@@ -405,6 +437,11 @@ function findProblems(plan: OrderPlan, contextInput: PlanContext): PlanProblem[]
     return ['kind-not-allowed'];
   }
   const current = slot('currentSlot', context.currentSlot);
+  const intentId = id('intentId', context.intentId);
+  const quote = object('quote', context.quote);
+  const quoteSlot = slot('quote slot', quote.slot);
+  const quoteFeeBps = bps(quote.feeBps);
+  const quoteFeeSlot = slot('quote feeConfigSlot', quote.feeConfigSlot);
   const position = object('position', context.position);
   const positionId = id('position id', position.id);
   const positionMint = id('position mint', position.mint);
@@ -421,6 +458,11 @@ function findProblems(plan: OrderPlan, contextInput: PlanContext): PlanProblem[]
   const chain = tokenUnits(context.chainTokens);
   const simulated = context.simulatedCu === null ? null : wholeNumber('simulatedCu', context.simulatedCu, Number.MAX_SAFE_INTEGER);
   const caps = checkCaps(context.caps);
+  // Exactly one kind of figures, matching the plan: a buy has no exit context and an exit no buy context.
+  const other = plan.kind === 'buy' ? context.exit : context.buy;
+  if (other !== null && other !== undefined) {
+    throw new RiskError('a buy has a buy context and no exit context, and an exit the reverse');
+  }
   const k = plan.kind === 'buy' ? checkBuy(context.buy) : checkExit(context.exit);
 
   // One attempt pays the base fee, the priority fee and (conservatively) the tip; the landing
@@ -440,11 +482,16 @@ function findProblems(plan: OrderPlan, contextInput: PlanContext): PlanProblem[]
   };
 
   add('wrong-mode', plan.mode !== positionMode);
+  add('wrong-intent', plan.intentId !== intentId); // the id comes from the engine's intent, never from the plan
   add('wrong-pool', plan.pool !== poolId);
   add('wrong-venue', plan.venue !== poolVenue);
   add('pool-not-sol', poolQuote !== wsolMint);
   add('route-not-allowed', !caps.routes.includes(plan.route));
   add('stale-fee-config', plan.feeConfigSlot > current || current - plan.feeConfigSlot > caps.fresh);
+  // The plan must be built from the reserves and the fee config risk itself read: a planner that
+  // declares a cheaper fee (so paper results look better) or another slot is refused.
+  add('quote-slot-mismatch', plan.quoteSlot !== quoteSlot);
+  add('fee-config-mismatch', plan.feeBps !== quoteFeeBps || plan.feeConfigSlot !== quoteFeeSlot);
   if (k.type === 'buy') {
     add('urgency-on-buy', plan.urgency !== 'normal');
     add('wrong-position', plan.positionId !== positionId);
@@ -459,18 +506,19 @@ function findProblems(plan: OrderPlan, contextInput: PlanContext): PlanProblem[]
 
   if (plan.kind !== 'close-account') {
     // The floor the declared slippage implies on risk's own quote: a plan cannot declare 2% and
-    // accept anything, and cannot hide a bad price by understating its expected output.
-    const floor = mulDivFloor(k.quotedOut, 10_000n - BigInt(plan.slippageBps), 10_000n);
+    // accept anything, and cannot hide a bad price by understating its expected output. Compared
+    // exactly (cross-multiplied): a floor is a lower bound, so it must never round in the plan's favour.
     add('no-expected-output', k.type === 'buy' && plan.expectedOut === 0n);
     add('expected-out-above-quote', plan.expectedOut > k.quotedOut);
     add('slippage-above-cap', k.type === 'buy' && plan.slippageBps > caps.buySlippage);
-    add('min-out-below-slippage', plan.minOut < floor);
+    add('min-out-below-slippage', plan.minOut * 10_000n < k.quotedOut * (10_000n - BigInt(plan.slippageBps)));
     add('min-out-above-expected', plan.minOut > plan.expectedOut);
   }
 
   add('cu-not-simulated', plan.mode === 'live' && simulated === null);
   add('cu-limit-above-cap', plan.cuLimit > caps.cuLimit);
-  add('cu-limit-above-simulated', simulated !== null && BigInt(plan.cuLimit) > ceilDiv(BigInt(simulated) * CU_SIMULATED_TENTHS, 10n));
+  // 1.2 x the simulated units is a cap, so it is compared exactly and never rounds up.
+  add('cu-limit-above-simulated', simulated !== null && BigInt(plan.cuLimit) * 10n > BigInt(simulated) * CU_SIMULATED_TENTHS);
   add('cu-price-above-cap', plan.cuPrice > (k.type === 'buy' ? caps.cuPriceBuy : caps.cuPriceExit));
   add('tip-not-allowed', !ALLOWED_TIPS.some(([path, amount]) => path === plan.tip.path && amount === plan.tip.lamports));
   // The percentage cap: buys and normal exits (the intent's urgency decides). A buy's base is its
@@ -481,9 +529,15 @@ function findProblems(plan: OrderPlan, contextInput: PlanContext): PlanProblem[]
   add('attempts-above-allowed', plan.attempts > k.attempts);
 
   if (k.type === 'buy') {
+    add('buy-already-ordered', k.orders > 0); // one buy order per position, ever
     add('fees-above-sized', worstFees > k.sizedFees);
     add('in-amount-below-minimum', plan.inAmount < k.min);
     add('in-amount-above-sized', plan.inAmount > k.sized);
+    // Backstops that do not depend on what sizing says (limits 2 and 15): a wrong sizing context
+    // cannot make a 1.5 SOL buy, or a buy of nothing that pays rent and fees, pass.
+    add('in-amount-above-hard-max', plan.inAmount > HARD_MAX_BUY_IN);
+    add('in-amount-below-hard-min', plan.inAmount < HARD_MIN_BUY_IN);
+    add('spend-above-hard-max', plan.inAmount + plan.rentLamports + worstFees > HARD_MAX_BUY_SPEND);
     add('rent-mismatch', plan.rentLamports !== k.rent);
     add('close-after-buy', plan.closeAccountAfter);
   } else {
