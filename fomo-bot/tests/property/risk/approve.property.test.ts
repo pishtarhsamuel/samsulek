@@ -253,9 +253,16 @@ const caseArb = fc
     return { ...c, input: c.faults.reduce((i, name) => FAULTS[name]!(i, c.dials), start) };
   });
 
-function authority(): ApprovalAuthority {
+/** A single-use store that remembers token ids. */
+const memoryStore = (): { consume(tokenId: string): boolean } => {
+  const seen = new Set<string>();
+  return { consume: (tokenId: string): boolean => (seen.has(tokenId) ? false : (seen.add(tokenId), true)) };
+};
+
+/** An authority with its slot source at SLOT (every plan here quotes at 1,000) and its own store bound. */
+function authority(mode: 'paper' | 'live' = 'paper'): ApprovalAuthority {
   let n = 0;
-  return createApprovalAuthority({ mode: 'paper', key: KEY, newTokenId: () => `tok-${(n += 1)}`, planFreshSlots: 25 });
+  return createApprovalAuthority({ mode, key: KEY, newTokenId: () => `tok-${(n += 1)}`, planFreshSlots: 25, slots: { currentSlot: () => SLOT }, store: memoryStore() });
 }
 
 // ---------------------------------------------------------------- the independent model
@@ -435,7 +442,7 @@ describe('approval step properties', () => {
         const mode = input.intent.mode;
         const { a, minted } = (() => {
           let n = 0;
-          const auth = createApprovalAuthority({ mode, key: KEY, newTokenId: () => `tok-${(n += 1)}`, planFreshSlots: 25 });
+          const auth = createApprovalAuthority({ mode, key: KEY, newTokenId: () => `tok-${(n += 1)}`, planFreshSlots: 25, slots: { currentSlot: () => SLOT }, store: memoryStore() });
           return { a: auth, minted: () => n };
         })();
         const decision = approveBuy(input, a.issuer);
@@ -446,7 +453,9 @@ describe('approval step properties', () => {
           looseApproved += config === 'loose' ? 1 : 0;
           assert.equal(minted(), 1);
           assertLimits(input, decision);
-          assert.deepEqual(a.verifier.verify(decision.token, decision.plan, { currentSlot: SLOT, mode }), []);
+          assert.deepEqual(a.verifier.verify(decision.token, decision.plan), []);
+          assert.equal(a.verifier.redeem(decision.token, decision.plan).ok, true); // once, in the bound store
+          assert.deepEqual(a.verifier.redeem(decision.token, decision.plan), { ok: false, problems: ['already-consumed'] });
         } else {
           assert.equal(minted(), 0, 'a refusal never mints a token');
           assert.equal(decision.stage, expected.stage, faults.join('+'));
@@ -571,9 +580,10 @@ describe('approval step properties', () => {
           assert.equal(e.faulty, false);
           assert.equal(decision.token.reduceOnly, true);
           assert.equal(decision.token.kind, e.kind);
-          assert.deepEqual(a.verifier.verify(decision.token, plan, { currentSlot: context.currentSlot, mode: 'paper' }), []);
+          assert.equal(context.currentSlot, SLOT); // the slot the authority's source reports
+          assert.deepEqual(a.verifier.verify(decision.token, plan), []);
           // the token is for exactly this plan: any other plan is refused
-          assert.notDeepEqual(a.verifier.verify(decision.token, { ...plan, inAmount: plan.inAmount + 1n }, { currentSlot: context.currentSlot, mode: 'paper' }), []);
+          assert.notDeepEqual(a.verifier.verify(decision.token, { ...plan, inAmount: plan.inAmount + 1n }), []);
           assert.equal(planMaxSpend(plan), decision.token.maxSpendLamports);
         } else {
           refused += 1;

@@ -13,6 +13,12 @@
 // the order); redeem verifies first and consumes last, so a bad token is never burned, and it
 // accepts only an explicit `true` from the store. Issuing spends the plan's re-check
 // (recheck.ts consumeCheckedPlan): one checked plan, at most one token.
+// The store and the slot source are bound when the authority is created (in app/, the composition
+// root) and never come from a caller (REVIEWS.md K, security findings 2 and 3): an executor cannot
+// hand redeem a store that always says "first use", nor a slot that makes an expired token look
+// fresh. The store receives the validated snapshot, so T2 records the order from it, never from the
+// executor's objects. The slot only moves forward (a ratchet over what the source reports), and an
+// unknown slot refuses every issue, verify and redeem.
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { HARD_CAPS } from '../config/caps.ts';
 import { isIdText } from '../core/ids.ts';
@@ -39,6 +45,13 @@ const MIN_KEY_BYTES = 32;
 const MAC_PURPOSE = 'fomo-bot approval token v1';
 /** The newest token ids kept to catch a repeated id; older ones are forgotten so memory stays bounded. */
 const MAX_REMEMBERED_IDS = 10_000;
+/**
+ * No real slot is above what the database's INTEGER columns can hold (2^63 - 1; the chain is near
+ * 4 x 10^8): a reading above it is a parse bug or a lying RPC (u64::MAX, say), is unknown and is never
+ * adopted, so it cannot stick in the ratchet (REVIEWS.md N). Plausibility against time and a second
+ * provider is app/slots.ts's job: this pure code has no clock.
+ */
+const MAX_PLAUSIBLE_SLOT = (1n << 63n) - 1n;
 
 export interface ApprovalToken {
   /** Only risk's issuer makes one: a literal cannot be built outside this module, and a forged one fails its MAC. */
@@ -57,23 +70,38 @@ export interface ApprovalToken {
   readonly mac: string;
 }
 
-export interface VerifyContext {
-  /** The highest slot seen. */
-  readonly currentSlot: bigint;
-  /** The mode the executor runs in; it must be the authority's mode. */
+/** The highest slot seen, from the chain stream and HTTP; null when unknown or stale. */
+export interface SlotSource {
+  currentSlot(): bigint | null;
+}
+
+/** What redeem validated: the store records the order from this, never from the executor's objects. */
+export interface RedeemSnapshot {
+  readonly intentId: string;
+  readonly positionId: string;
   readonly mode: PlanMode;
+  readonly kind: PlanKind;
+  readonly reduceOnly: boolean;
+  readonly planHash: string;
+  readonly maxSpendLamports: Lamports;
+  readonly minOut: bigint;
+  readonly expiresAtSlot: bigint;
+  /** The slot redeem judged the expiry at (from the bound slot source). */
+  readonly slot: bigint;
+  /** The frozen, validated plan. */
+  readonly plan: OrderPlan;
 }
 
 /** Records that a token was used. true: first use. false: already used. Anything else, or a throw: refused. */
 export interface TokenStore {
-  consume(tokenId: string): boolean;
+  consume(tokenId: string, snapshot: RedeemSnapshot): boolean;
 }
 
 export type TokenProblem =
   | 'malformed-token'
   | 'bad-mac'
   | 'malformed-plan'
-  | 'malformed-context'
+  | 'slot-unknown'
   | 'kind-not-allowed'
   | 'plan-hash-mismatch'
   | 'wrong-mode'
@@ -94,18 +122,34 @@ export type RedeemResult =
   | { readonly ok: false; readonly problems: readonly TokenProblem[] };
 
 export interface ApprovalIssuer {
-  issue(plan: CheckedPlan, currentSlot: bigint): ApprovalToken;
+  /** The current slot comes from the bound slot source, never from the caller. */
+  issue(plan: CheckedPlan): ApprovalToken;
 }
 
 export interface ApprovalVerifier {
-  verify(token: ApprovalToken, plan: OrderPlan, context: VerifyContext): readonly TokenProblem[];
-  /** verify, then consume: ok means the order may run, once, from the returned plan. */
-  redeem(token: ApprovalToken, plan: OrderPlan, context: VerifyContext, store: TokenStore): RedeemResult;
+  /** The mode this verifier (and its authority) serves, so the composition root can assert its wiring. */
+  readonly mode: PlanMode;
+  verify(token: ApprovalToken, plan: OrderPlan): readonly TokenProblem[];
+  /** verify, then consume in the bound store: ok means the order may run, once, from the returned plan. */
+  redeem(token: ApprovalToken, plan: OrderPlan): RedeemResult;
+}
+
+/**
+ * What the executor receives: redeem only. verify says "valid" without consuming, so an executor that
+ * traded after verify would skip single use; it stays with the composition root for diagnostics
+ * (REVIEWS.md N, security finding 2).
+ */
+export interface ApprovalRedeemer {
+  readonly mode: PlanMode;
+  redeem(token: ApprovalToken, plan: OrderPlan): RedeemResult;
 }
 
 export interface ApprovalAuthority {
   readonly issuer: ApprovalIssuer;
+  /** verify and redeem, for the composition root. */
   readonly verifier: ApprovalVerifier;
+  /** redeem only, for the executor. */
+  readonly redeemer: ApprovalRedeemer;
 }
 
 export interface ApprovalOptions {
@@ -117,6 +161,10 @@ export interface ApprovalOptions {
   readonly newTokenId: () => string;
   /** A token expires this many slots after its plan's quote (1 to 25). */
   readonly planFreshSlots: number;
+  /** Where the current slot comes from (app/slots.ts); read on every issue, verify and redeem. */
+  readonly slots: SlotSource;
+  /** The single-use store (app/token-store.ts: T2 in SQLite). */
+  readonly store: TokenStore;
 }
 
 // ---------------------------------------------------------------- token fields and MAC
@@ -190,29 +238,36 @@ function parseToken(input: unknown): ParsedToken | null {
   return { id, intentId, mode: mode as PlanMode, kind: kind as PlanKind, reduceOnly, positionId, planHash: hash, maxSpendLamports, minOut, expiresAtSlot, mac };
 }
 
-function parseContext(input: unknown): VerifyContext | null {
-  if (typeof input !== 'object' || input === null) {
-    return null;
+/** A capability's method, read once at creation and bound, so a later change to the object changes nothing. */
+function boundMethod(what: string, owner: unknown, name: string): (...args: unknown[]) => unknown {
+  if (typeof owner !== 'object' || owner === null) {
+    throw new RiskError(`${what} must be an object`);
   }
-  const { currentSlot, mode } = input as Record<string, unknown>;
-  if (!isU64(currentSlot) || !(PLAN_MODES as readonly unknown[]).includes(mode)) {
-    return null;
+  let method: unknown;
+  try {
+    method = (owner as Record<string, unknown>)[name];
+  } catch {
+    method = undefined;
   }
-  return { currentSlot, mode: mode as PlanMode };
+  if (typeof method !== 'function') {
+    throw new RiskError(`${what}.${name} must be a function`);
+  }
+  return (method as (...args: unknown[]) => unknown).bind(owner);
 }
 
 interface Checked {
   readonly problems: readonly TokenProblem[];
-  readonly id: string | null;
+  readonly token: ParsedToken | null;
   readonly plan: OrderPlan | null;
+  readonly slot: bigint | null;
 }
 
-const refuse = (problem: TokenProblem): Checked => ({ problems: Object.freeze([problem]), id: null, plan: null });
+const refuse = (problem: TokenProblem): Checked => ({ problems: Object.freeze([problem]), token: null, plan: null, slot: null });
 
 // ---------------------------------------------------------------- the authority
 
 export function createApprovalAuthority(options: ApprovalOptions): ApprovalAuthority {
-  const { mode, key, newTokenId, planFreshSlots } = options as Partial<ApprovalOptions>;
+  const { mode, key, newTokenId, planFreshSlots, slots, store } = options as Partial<ApprovalOptions>;
   if (!(PLAN_MODES as readonly unknown[]).includes(mode)) {
     throw new RiskError('the authority needs a mode: paper or live');
   }
@@ -230,24 +285,46 @@ export function createApprovalAuthority(options: ApprovalOptions): ApprovalAutho
   if (typeof planFreshSlots !== 'number' || !Number.isSafeInteger(planFreshSlots) || planFreshSlots < 1 || planFreshSlots > HARD_PLAN_FRESH_SLOTS) {
     throw new RiskError(`planFreshSlots must be a whole number from 1 to ${HARD_PLAN_FRESH_SLOTS}`);
   }
+  const readSlot = boundMethod('slots', slots, 'currentSlot');
+  const consume = boundMethod('store', store, 'consume');
   const authorityMode = mode as PlanMode;
   const fresh = BigInt(planFreshSlots);
   const issued = new Set<string>();
+
+  // The highest slot the source has reported: a source that goes backwards never lengthens a token's
+  // life. A throw, null or anything but a u64 slot means unknown (null), and an unknown slot refuses.
+  let highest: bigint | null = null;
+  const slotNow = (): bigint | null => {
+    let reported: unknown;
+    try {
+      reported = readSlot();
+    } catch {
+      return null;
+    }
+    if (!isU64(reported) || reported > MAX_PLAUSIBLE_SLOT) {
+      return null;
+    }
+    if (highest === null || reported > highest) {
+      highest = reported;
+    }
+    return highest;
+  };
 
   // A purpose and version tag in front of the canonical text: this key's MAC can only ever mean "approval token".
   const macOf = (fields: TokenFields): Uint8Array =>
     createHmac('sha256', secret).update(`${MAC_PURPOSE}\n${canonicalJson(fields)}`, 'utf8').digest();
 
   const issuer: ApprovalIssuer = {
-    issue(plan: CheckedPlan, currentSlot: bigint): ApprovalToken {
+    issue(plan: CheckedPlan): ApprovalToken {
       if (!isCheckedPlan(plan)) {
         throw new RiskError('the plan has not passed the re-check, or its token was already issued');
       }
       if (plan.mode !== authorityMode) {
         throw new RiskError('this authority issues tokens for its own mode only');
       }
-      if (!isU64(currentSlot)) {
-        throw new RiskError('currentSlot must be a non-negative bigint slot');
+      const currentSlot = slotNow();
+      if (currentSlot === null) {
+        throw new RiskError('the current slot is unknown: no token is issued');
       }
       const expiresAtSlot = plan.quoteSlot + fresh;
       if (plan.quoteSlot > currentSlot) {
@@ -293,7 +370,7 @@ export function createApprovalAuthority(options: ApprovalOptions): ApprovalAutho
   };
 
   /** Everything but the single-use consumption. Never throws: any surprise is a refusal. */
-  const check = (tokenInput: unknown, planInput: unknown, contextInput: unknown): Checked => {
+  const check = (tokenInput: unknown, planInput: unknown): Checked => {
     let token: ParsedToken | null;
     try {
       token = parseToken(tokenInput);
@@ -313,14 +390,9 @@ export function createApprovalAuthority(options: ApprovalOptions): ApprovalAutho
     } catch {
       return refuse('malformed-plan');
     }
-    let context: VerifyContext | null;
-    try {
-      context = parseContext(contextInput);
-    } catch {
-      context = null;
-    }
-    if (context === null) {
-      return refuse('malformed-context');
+    const slot = slotNow();
+    if (slot === null) {
+      return refuse('slot-unknown');
     }
     let spend: bigint | null;
     try {
@@ -336,38 +408,54 @@ export function createApprovalAuthority(options: ApprovalOptions): ApprovalAutho
     };
     add('kind-not-allowed', token.kind === 'withdraw' || plan.kind === 'withdraw'); // withdraws have their own path
     add('plan-hash-mismatch', token.planHash !== planHash(plan));
-    add('wrong-mode', token.mode !== plan.mode || token.mode !== context.mode || token.mode !== authorityMode);
+    add('wrong-mode', token.mode !== plan.mode || token.mode !== authorityMode);
     add('wrong-kind', token.kind !== plan.kind);
     add('wrong-intent', token.intentId !== plan.intentId);
     add('wrong-position', token.positionId !== plan.positionId);
     add('wrong-reduce-only', token.reduceOnly !== reduceOnlyKind(plan.kind));
     add('max-spend-mismatch', token.maxSpendLamports !== spend);
     add('min-out-mismatch', token.minOut !== plan.minOut);
-    add('expired', context.currentSlot > token.expiresAtSlot);
+    add('expired', slot > token.expiresAtSlot);
     add('expiry-too-late', token.expiresAtSlot > plan.quoteSlot + fresh);
-    return { problems: Object.freeze(problems), id: token.id, plan };
+    return { problems: Object.freeze(problems), token, plan, slot };
   };
 
   const verifier: ApprovalVerifier = {
-    verify: (token, plan, context) => check(token, plan, context).problems,
-    redeem(token, plan, context, store): RedeemResult {
-      const { problems, id, plan: snapshot } = check(token, plan, context);
-      if (problems.length > 0 || id === null || snapshot === null) {
+    mode: authorityMode,
+    verify: (token, plan) => check(token, plan).problems,
+    redeem(tokenInput, planInput): RedeemResult {
+      const { problems, token, plan, slot } = check(tokenInput, planInput);
+      if (problems.length > 0 || token === null || plan === null || slot === null) {
         return Object.freeze({ ok: false, problems });
       }
+      // What the store records: the token as verified and the frozen plan, never the caller's objects.
+      const snapshot: RedeemSnapshot = Object.freeze({
+        intentId: token.intentId,
+        positionId: token.positionId,
+        mode: token.mode,
+        kind: token.kind,
+        reduceOnly: token.reduceOnly,
+        planHash: token.planHash,
+        maxSpendLamports: token.maxSpendLamports as Lamports,
+        minOut: token.minOut,
+        expiresAtSlot: token.expiresAtSlot,
+        slot,
+        plan,
+      });
       let consumed: unknown;
       try {
-        consumed = store.consume(id);
+        consumed = consume(token.id, snapshot);
       } catch {
         consumed = undefined; // no proof of single use: never approve
       }
       if (consumed === true) {
-        return Object.freeze({ ok: true, plan: snapshot });
+        return Object.freeze({ ok: true, plan });
       }
       const problem: TokenProblem = consumed === false ? 'already-consumed' : 'store-error';
       return Object.freeze({ ok: false, problems: Object.freeze([problem]) });
     },
   };
 
-  return Object.freeze({ issuer: Object.freeze(issuer), verifier: Object.freeze(verifier) });
+  const redeemer: ApprovalRedeemer = { mode: authorityMode, redeem: verifier.redeem };
+  return Object.freeze({ issuer: Object.freeze(issuer), verifier: Object.freeze(verifier), redeemer: Object.freeze(redeemer) });
 }

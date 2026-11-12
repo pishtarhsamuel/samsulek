@@ -3,11 +3,13 @@
 // tampering, plan changes, modes, slots and store states, redeem accepts IF AND ONLY IF an
 // independent oracle says nothing is wrong; and a token never authorizes a different plan, a buy
 // included when it was made for a sell (invariant 19). Every plan is issued through the re-check.
+// The slot source and the store are bound at creation (REVIEWS.md K): the slot the authority judges
+// by is the highest the source has reported, so the oracle uses the running maximum too.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fc from 'fast-check';
 import { bps, lamports, microLamportsPerCu } from '../../../src/core/units.ts';
-import { createApprovalAuthority, type ApprovalToken, type TokenStore } from '../../../src/risk/approval.ts';
+import { createApprovalAuthority, type ApprovalToken, type RedeemSnapshot, type TokenStore } from '../../../src/risk/approval.ts';
 import { type OrderPlan, type PlanMode } from '../../../src/risk/plan.ts';
 import { isCheckedPlan } from '../../../src/risk/recheck.ts';
 import { RiskError } from '../../../src/risk/reserve.ts';
@@ -101,19 +103,27 @@ const caseArb = fc
 const text = (p: OrderPlan): string => JSON.stringify(p, (_k, v: unknown) => (typeof v === 'bigint' ? `${v}n` : v));
 
 class Store implements TokenStore {
-  readonly seen = new Set<string>();
-  consume(tokenId: string): boolean {
+  readonly seen = new Map<string, RedeemSnapshot | null>();
+  consume(tokenId: string, snapshot: RedeemSnapshot): boolean {
     if (this.seen.has(tokenId)) {
       return false;
     }
-    this.seen.add(tokenId);
+    this.seen.set(tokenId, snapshot);
     return true;
+  }
+  /** Marks a token as used before the test presents it. */
+  burn(tokenId: string): void {
+    this.seen.set(tokenId, null);
   }
 }
 
-function newAuthority(mode: PlanMode) {
+/** An authority with its own hand-moved slot (starting at the quote) and its own store. */
+function newAuthority(mode: PlanMode, key: Uint8Array = KEY) {
   let n = 0;
-  return createApprovalAuthority({ mode, key: KEY, newTokenId: () => `tok-${(n += 1)}`, planFreshSlots: 25 });
+  const clock = { slot: QUOTE };
+  const store = new Store();
+  const authority = createApprovalAuthority({ mode, key, newTokenId: () => `tok-${(n += 1)}`, planFreshSlots: 25, slots: { currentSlot: () => clock.slot }, store });
+  return { ...authority, clock, store };
 }
 
 describe('approval token properties', () => {
@@ -122,27 +132,37 @@ describe('approval token properties', () => {
     let refused = 0;
     fc.assert(
       fc.property(caseArb, (c) => {
-        const authority = newAuthority(c.planMode);
+        const issuing = newAuthority(c.planMode);
+        // the executor's verifier: the issuing authority's, or (another mode) one of the other mode with the same key
+        const executing = c.execMode === c.planMode ? issuing : newAuthority(c.execMode);
         const plan = planOf(c.kind, c.planMode, c.salt);
-        const token = authority.issuer.issue(checked(plan), QUOTE + BigInt(c.issueAt));
-        const store = new Store();
+        issuing.clock.slot = QUOTE + BigInt(c.issueAt);
+        const token = issuing.issuer.issue(checked(plan));
+        const store = executing.store;
         if (c.consumedBefore) {
-          store.consume(token.id);
+          store.burn(token.id);
         }
         const presentedToken = c.tamper === null ? token : (TOKEN_TAMPERS[c.tamper]!(token) as ApprovalToken);
         const presentedPlan = c.change === null ? plan : PLAN_CHANGES[c.change]!(plan);
-        const result = authority.verifier.redeem(presentedToken, presentedPlan, { currentSlot: QUOTE + BigInt(c.verifyAt), mode: c.execMode }, store);
+        executing.clock.slot = QUOTE + BigInt(c.verifyAt);
+        const result = executing.verifier.redeem(presentedToken, presentedPlan);
 
         // A "change" that leaves the plan as it was (a tip change on a plan that has no tip) is no change.
         const planChanged = text(presentedPlan) !== text(plan);
-        const expected = c.tamper === null && !planChanged && c.execMode === c.planMode && c.verifyAt <= 25 && !c.consumedBefore;
+        // the slot judged by is the highest the executing authority's source has reported
+        const judgedAt = executing === issuing ? Math.max(c.issueAt, c.verifyAt) : c.verifyAt;
+        const expected = c.tamper === null && !planChanged && c.execMode === c.planMode && judgedAt <= 25 && !c.consumedBefore;
         assert.equal(result.ok, expected, JSON.stringify([c, result.ok ? [] : result.problems]));
         if (expected) {
           accepted += 1;
           assert.equal(store.seen.has(token.id), true, 'an accepted token is consumed');
           assert.ok(result.ok && Object.isFrozen(result.plan), 'the executor gets the frozen snapshot');
+          const snapshot = store.seen.get(token.id)!;
+          assert.equal(snapshot.planHash, token.planHash, 'the store records the token as verified');
+          assert.equal(snapshot.slot, QUOTE + BigInt(judgedAt), 'and the slot it was judged at');
+          assert.deepEqual({ ...snapshot.plan }, { ...plan }, 'and the validated plan');
           // ...and a second use of the same token is always refused
-          assert.deepEqual(authority.verifier.redeem(token, plan, { currentSlot: QUOTE, mode: c.execMode }, store), { ok: false, problems: ['already-consumed'] });
+          assert.deepEqual(executing.verifier.redeem(token, plan), { ok: false, problems: ['already-consumed'] });
         } else {
           refused += 1;
           if (!c.consumedBefore) {
@@ -160,8 +180,8 @@ describe('approval token properties', () => {
         const authority = newAuthority(a.planMode);
         const plan = planOf(a.kind, a.planMode, a.salt);
         const other = planOf(b.kind, b.planMode, b.salt);
-        const token = authority.issuer.issue(checked(plan), QUOTE);
-        const problems = authority.verifier.verify(token, other, { currentSlot: QUOTE, mode: other.mode });
+        const token = authority.issuer.issue(checked(plan));
+        const problems = authority.verifier.verify(token, other);
         assert.equal(problems.length === 0, text(plan) === text(other));
         if (token.reduceOnly && other.kind === 'buy') {
           assert.ok(problems.length > 0, 'a reduce-only token never runs a buy');
@@ -174,9 +194,9 @@ describe('approval token properties', () => {
     fc.assert(
       fc.property(caseArb, fc.integer({ min: 1, max: 255 }), (c, shift) => {
         const mine = newAuthority(c.planMode);
-        const theirs = createApprovalAuthority({ mode: c.planMode, key: Uint8Array.from(KEY, (b) => (b + shift) % 256 || 1), newTokenId: () => 'tok-1', planFreshSlots: 25 });
+        const theirs = newAuthority(c.planMode, Uint8Array.from(KEY, (b) => (b + shift) % 256 || 1));
         const plan = planOf(c.kind, c.planMode, c.salt);
-        assert.deepEqual(mine.verifier.verify(theirs.issuer.issue(checked(plan), QUOTE), plan, { currentSlot: QUOTE, mode: c.planMode }), ['bad-mac']);
+        assert.deepEqual(mine.verifier.verify(theirs.issuer.issue(checked(plan)), plan), ['bad-mac']);
       }),
     );
   });
@@ -188,7 +208,7 @@ describe('approval token properties', () => {
         const plan = planOf(c.kind, c.planMode, c.salt);
         const snapshot = checked(plan);
         const attempt = copy ? { ...snapshot } : plan;
-        assert.throws(() => authority.issuer.issue(attempt as typeof snapshot, QUOTE), /re-check/);
+        assert.throws(() => authority.issuer.issue(attempt as typeof snapshot), /re-check/);
       }),
       { numRuns: 200 },
     );
@@ -201,13 +221,16 @@ describe('approval token properties', () => {
         const authority = newAuthority(c.planMode);
         const snapshot = checked(planOf(c.kind, c.planMode, c.salt));
         let tokens = 0;
+        let highest: number | null = null;
         for (const offset of offsets) {
-          const slot = QUOTE + BigInt(offset); // before the quote, 0..25 slots after it (valid), or expired
-          if (offset >= 0 && offset <= 25 && tokens === 0) {
-            assert.equal(authority.issuer.issue(snapshot, slot).intentId, snapshot.intentId);
+          // the source reports before the quote, 0..25 slots after it (valid), or expired; the authority judges by the highest so far
+          authority.clock.slot = QUOTE + BigInt(offset);
+          highest = highest === null || offset > highest ? offset : highest;
+          if (highest >= 0 && highest <= 25 && tokens === 0) {
+            assert.equal(authority.issuer.issue(snapshot).intentId, snapshot.intentId);
             tokens += 1;
           } else {
-            assert.throws(() => authority.issuer.issue(snapshot, slot), RiskError);
+            assert.throws(() => authority.issuer.issue(snapshot), RiskError);
             spentThenRefused += tokens;
           }
           assert.equal(isCheckedPlan(snapshot), tokens === 0, 'checked until the first token, never again');

@@ -67,6 +67,14 @@ const RUNTIME_ONLY_FROM: Readonly<Record<string, readonly string[]>> = {
   // the composition root is reached only from the process entry (cli/) and from itself, so nothing else can pick up what it holds
   app: ['app', 'cli'],
 };
+/**
+ * The approval authority holds the token key and binds the single-use store and the slot source
+ * (REVIEWS.md K, security findings 2 and 3): it is created in exactly one place, the composition
+ * root's authority file, which hands the executor only the verifier. Its own module defines it.
+ */
+const AUTHORITY_FILES = new Set(['risk/approval.ts', 'app/authority.ts']);
+/** A relative import: a plain path of letters, digits, dots, slashes, underscores and dashes, ending in .ts. */
+const RELATIVE_SPEC = /^\.{1,2}\/[./A-Za-z0-9_-]*\.ts$/;
 /** Lower case: the check compares import targets in lower case, because Windows and macOS ignore case in file names. */
 const CLOCK_FILES = new Set(['core/clock.ts', 'core/rng.ts']);
 const RNG_FILE = 'core/rng.ts';
@@ -284,8 +292,12 @@ export function checkSource(rel: string, text: string): string[] {
       return;
     }
     if (spec.startsWith('.')) {
-      if (!spec.endsWith('.ts')) {
-        problems.push(`${rel}: relative import "${spec}" must name the .ts file`);
+      // A plain path to a .ts file and nothing else: a query or a fragment ('./approval.ts?x=.ts') loads
+      // the same file as a second module and would slip past every rule that compares the target
+      // (REVIEWS.md N, security), and so would a space, an escape or a backslash.
+      if (!RELATIVE_SPEC.test(spec)) {
+        problems.push(`${rel}: relative import "${spec}" must name the .ts file as a plain path (no query, fragment or escape)`);
+        return;
       }
       const target = path.relative(SRC, path.resolve(SRC, path.dirname(rel), spec)).split(path.sep).join('/');
       if (target.startsWith('..')) {
@@ -294,6 +306,11 @@ export function checkSource(rel: string, text: string): string[] {
       }
       if (pure !== undefined && !typeOnly && CLOCK_FILES.has(target.toLowerCase())) {
         problems.push(`${rel}: pure code may import ${target} only as types (time and randomness are passed in)`);
+      }
+      // The token module's only runtime value is the factory: it reaches the authority files and nothing
+      // else, whatever the form (named, namespace, re-export, dynamic). Types are fine everywhere.
+      if (!typeOnly && target.toLowerCase() === 'risk/approval.ts' && !AUTHORITY_FILES.has(rel)) {
+        problems.push(`${rel}: only app/authority.ts may import risk/approval.ts at runtime (types are fine)`);
       }
       const targetFolder = target.split('/')[0] ?? '';
       const onlyFrom = RUNTIME_ONLY_FROM[targetFolder.toLowerCase()];
@@ -466,6 +483,18 @@ export function checkSource(rel: string, text: string): string[] {
       node.text === 'constructor';
     if (named) {
       problems.push(`${rel}: "constructor" is not allowed (it reaches Function and the clock)`);
+    }
+    // the authority is made in one place only (names compared exactly: this is our own code), and that
+    // place calls the factory under its own name and hands out built authorities, never the factory
+    if (ts.isIdentifier(node) && node.text === 'createApprovalAuthority') {
+      const parent = node.parent;
+      const plainImport = ts.isImportSpecifier(parent) && parent.propertyName === undefined;
+      const call = ts.isCallExpression(parent) && parent.expression === node;
+      if (!AUTHORITY_FILES.has(rel)) {
+        problems.push(`${rel}: only app/authority.ts creates the approval authority (it binds the token store and the slot source)`);
+      } else if (rel === 'app/authority.ts' && !plainImport && !call) {
+        problems.push(`${rel}: app/authority.ts calls the factory and hands out built authorities, never the factory itself`);
+      }
     }
     ts.forEachChild(node, visit);
   };
@@ -743,6 +772,40 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
     assert.deepEqual(caseCollisions(['config/caps.ts', 'config/Caps.ts', 'risk/a.ts']), ['config/caps.ts and config/Caps.ts']);
   });
 
+  it('CANARY: only app/authority.ts creates the approval authority (REVIEWS.md K, security findings 2 and 3; N, finding 3)', () => {
+    flagged([
+      ['app/engine.ts', "import { createApprovalAuthority } from '../risk/approval.ts';"],
+      ['app/x.ts', "import { createApprovalAuthority as make } from '../risk/approval.ts'; export const a = make;"],
+      ['cli/x.ts', "import { createApprovalAuthority } from '../risk/approval.ts';"],
+      ['risk/approve.ts', 'export const again = createApprovalAuthority;'],
+      // every other way to reach the factory: a namespace, a computed key, a dynamic import, a re-export, a non-type import of a type
+      ['app/engine.ts', "import * as approval from '../risk/approval.ts'; export const f = approval['create' + 'ApprovalAuthority'];"],
+      ['app/engine.ts', "export const load = async () => (await import('../risk/approval.ts'))['create' + 'ApprovalAuthority'];"],
+      ['risk/x.ts', "export * from './approval.ts';"],
+      ['app/engine.ts', "import { type ApprovalToken } from '../risk/approval.ts'; export const t = (x: ApprovalToken): ApprovalToken => x;"],
+      // the authority file hands out built authorities, never the factory, under its own name or another
+      ['app/authority.ts', "import { createApprovalAuthority } from '../risk/approval.ts'; export const make = createApprovalAuthority;"],
+      ['app/authority.ts', "import { createApprovalAuthority as make } from '../risk/approval.ts'; export const a = make({} as never);"],
+      ['app/authority.ts', "export { createApprovalAuthority } from '../risk/approval.ts';"],
+    ]);
+    assert.deepEqual(checkSource('app/authority.ts', "import { createApprovalAuthority } from '../risk/approval.ts'; export const paper = createApprovalAuthority({} as never);"), []);
+  });
+
+  it('CANARY: a relative import is a plain path: a query, fragment, escape, space or backslash would load a second module past the rules (REVIEWS.md N)', () => {
+    flagged([
+      ['risk/sneak.ts', "import * as a from './approval.ts?x=.ts'; export const f = a['create' + 'ApprovalAuthority'];"],
+      ['risk/sneak.ts', "import * as a from './approval.ts#.ts'; export const f = a;"],
+      ['risk/x.ts', "import { systemClock } from '../core/clock.ts?fresh=.ts';"],
+      ['risk/x.ts', "import { x } from './a%2Eb.ts';"],
+      ['risk/x.ts', "import { x } from './a b.ts';"],
+      ['risk/x.ts', "import { x } from '.\\\\approve.ts';"],
+      ['risk/x.ts', "import { x } from './approve';"],
+      ['risk/x.ts', "import { x } from './approve.ts.json';"],
+    ]);
+    assert.deepEqual(checkSource('risk/x.ts', "import { approveBuy } from './approve.ts'; import { HARD_CAPS } from '../config/caps.ts'; export const a = [approveBuy, HARD_CAPS];"), []);
+    assert.deepEqual(checkSource('app/engine.ts', "import type { ApprovalVerifier } from '../risk/approval.ts'; export const v = (x: ApprovalVerifier): ApprovalVerifier => x;"), []);
+  });
+
   it('no two source files differ only in case (one file on Windows and macOS, two on Linux)', () => {
     assert.deepEqual(caseCollisions(sourceFiles()), []);
   });
@@ -765,9 +828,9 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['signer/y.ts', "import { build } from '../app/x.ts';"],
     ]);
     assert.deepEqual(checkSource('app/x.ts', "export type { ApprovalToken } from '../risk/approval.ts';"), []); // types are fine
-    assert.deepEqual(checkSource('app/x.ts', "import { createApprovalAuthority } from '../risk/approval.ts'; export const build = () => createApprovalAuthority;"), []); // using it is the point of app/
+    assert.deepEqual(checkSource('app/x.ts', "import { approveBuy } from '../risk/approve.ts'; export const build = () => approveBuy;"), []); // using it is the point of app/
     assert.deepEqual(checkSource('cli/y.ts', "import { build } from '../app/x.ts';"), []);
-    assert.deepEqual(checkSource('risk/z.ts', "export { createApprovalAuthority } from './approval.ts';"), []); // risk/ itself may
+    assert.deepEqual(checkSource('risk/z.ts', "export { approveBuy } from './approve.ts';"), []); // risk/ itself may
   });
 
   it('CANARY: "constructor" is flagged in every folder (it reaches the clock through Date), a class\'s own constructor is not', () => {
@@ -783,7 +846,7 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
     // Only cli/ can reach app/, and app/ is the composition root we write; the guarantee against a hostile
     // file is review plus the verifier/issuer split, not this lint. If this ever starts to be flagged, update ARCHITECTURE s.11.
     assert.deepEqual(
-      checkSource('app/x.ts', "import { createApprovalAuthority as c } from '../risk/approval.ts'; export { c };"),
+      checkSource('app/x.ts', "import { approveBuy as c } from '../risk/approve.ts'; export { c };"),
       [],
     );
   });

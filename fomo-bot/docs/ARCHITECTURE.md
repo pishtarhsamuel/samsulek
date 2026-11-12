@@ -104,11 +104,19 @@ type ApprovalToken = { readonly [approved]: true; id: string; intentId: string; 
   minOut: bigint; expiresAtSlot: bigint; mac: string };  // expiresAtSlot <= plan.quoteSlot + 25; HMAC-SHA256 over every other field, per-boot key; single use
 // planHash = sha256(canonical JSON of EVERY OrderPlan field, mode and kind included; keys sorted; bigints as decimal strings)
 // maxSpendLamports = inAmount (buys only) + rentLamports + allowed attempts x (5,000 + ceil(cuPrice x cuLimit / 10^6) + tip), the tip on every attempt
-// createApprovalAuthority({ mode, key, newTokenId, planFreshSlots }) returns { issuer, verifier } and serves ONE mode: risk and
-// the composition root get the issuer (issue accepts only a CheckedPlan: recheck.ts checkPlan is the only way to get one, and
-// issuing spends it via consumeCheckedPlan after the newTokenId callback, so one re-check gives at most one token), the
-// executor only the verifier. verify and redeem never throw; redeem = verify, then TokenStore.consume (only an explicit true
-// counts), so a bad token is never burned, and it returns the frozen plan the executor must build its transaction from.
+// createApprovalAuthority({ mode, key, newTokenId, planFreshSlots, slots, store }) returns { issuer, verifier } and serves ONE
+// mode; it is called only in app/authority.ts (architecture test). Risk and the composition root get the issuer (issue(plan)
+// accepts only a CheckedPlan: recheck.ts checkPlan is the only way to get one, and issuing spends it via consumeCheckedPlan
+// after the newTokenId callback, so one re-check gives at most one token), the executor only the redeemer (redeem(token, plan),
+// mode); the verifier (verify and redeem) stays with the composition root for diagnostics, because verify says "valid" without
+// consuming. Only app/authority.ts imports risk/approval.ts at runtime, calls the factory under its own name and hands out built
+// authorities (architecture test). The slot source and the single-use store are bound at creation and never come from a caller
+// (REVIEWS.md K, security findings 2 and 3, closed in step 6a): the slot is the highest the source has reported (a ratchet; a
+// throw, null, a non-u64 or a reading above 2^63 - 1 is unknown and never adopted, and an unknown slot refuses issue, verify and
+// redeem; app/slots.ts judges every reading against the time elapsed and a second provider first). verify and redeem never throw;
+// redeem = verify, then store.consume(tokenId, snapshot) (only an explicit true counts), so a bad token is never burned; the
+// snapshot is the token as verified, the slot it was judged at and the frozen plan, which T2 records the order from, and
+// redeem returns that frozen plan for the executor to build its transaction from.
 // Only risk/ and app/ may import anything in risk/ at runtime (architecture test); everyone else imports types. app/ may not
 // re-export risk/ values and is reached at runtime only from cli/; pure folders (core, venues, portfolio, risk, strategies,
 // exits) import only pure folders at runtime, so purity holds across imports, with one exception: config/caps.ts, held to

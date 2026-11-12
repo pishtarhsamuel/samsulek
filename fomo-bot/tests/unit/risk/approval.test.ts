@@ -4,14 +4,19 @@
 // slot, all under an HMAC with a per-boot key that only the authority holds; it works once, in one
 // mode, for one intent. The executor gets a verifier that cannot issue. verify and redeem never
 // throw, whatever they are given; redeem returns the frozen validated plan. A paper authority
-// never mints a live token. TEST_PLAN.md s.3 step 4 and s.4 invariant 1.
+// never mints a live token. The single-use store and the slot source are bound when the authority is
+// created, never passed by a caller (REVIEWS.md K, security findings 2 and 3), the slot only moves
+// forward, and the store receives the validated snapshot. TEST_PLAN.md s.3 step 4 and s.4 invariant 1.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { bps, lamports, microLamportsPerCu } from '../../../src/core/units.ts';
 import {
   createApprovalAuthority,
   type ApprovalAuthority,
+  type ApprovalOptions,
   type ApprovalToken,
+  type RedeemSnapshot,
+  type SlotSource,
   type TokenProblem,
   type TokenStore,
 } from '../../../src/risk/approval.ts';
@@ -53,37 +58,56 @@ const CLOSE: OrderPlan = { ...SELL, kind: 'close-account', inAmount: 0n, expecte
 const LIVE: OrderPlan = { ...PLAN, mode: 'live' };
 
 const KEY = Uint8Array.from({ length: 32 }, (_v, i) => i + 1);
-const NOW = { currentSlot: 1_005n, mode: 'paper' as const };
 
-function authority(options: { mode?: PlanMode; key?: Uint8Array; planFreshSlots?: number } = {}): ApprovalAuthority {
-  let n = 0;
-  return createApprovalAuthority({
-    mode: options.mode ?? 'paper',
-    key: options.key ?? KEY,
-    newTokenId: () => `tok-${(n += 1)}`,
-    planFreshSlots: options.planFreshSlots ?? 25,
-  });
+/** A slot source the test moves by hand (the chain stream in the bot). */
+class Slots implements SlotSource {
+  value: unknown = 1_005n;
+  reads = 0;
+  currentSlot(): bigint | null {
+    this.reads += 1;
+    return this.value as bigint | null;
+  }
 }
 
+/** The single-use store, as T2 will be: it keeps the snapshot it was given. */
 class MemoryStore implements TokenStore {
-  readonly seen = new Set<string>();
-  consume(tokenId: string): boolean {
+  readonly seen = new Map<string, RedeemSnapshot>();
+  consume(tokenId: string, snapshot: RedeemSnapshot): boolean {
     if (this.seen.has(tokenId)) {
       return false;
     }
-    this.seen.add(tokenId);
+    this.seen.set(tokenId, snapshot);
     return true;
   }
 }
 
-const storeReturning = (value: unknown): TokenStore => ({ consume: () => value as boolean });
-const verify = (a: ApprovalAuthority, token: unknown, plan: unknown = PLAN, context: unknown = NOW): readonly TokenProblem[] =>
-  a.verifier.verify(token as ApprovalToken, plan as OrderPlan, context as typeof NOW);
-const issue = (a: ApprovalAuthority, plan: OrderPlan = PLAN, slot = 1_005n): ApprovalToken => a.issuer.issue(checked(plan), slot);
+interface Harness {
+  readonly a: ApprovalAuthority;
+  readonly slots: Slots;
+  readonly store: MemoryStore;
+}
+
+function authority(options: { mode?: PlanMode; key?: Uint8Array; planFreshSlots?: number; newTokenId?: () => string; store?: TokenStore } = {}): Harness {
+  let n = 0;
+  const slots = new Slots();
+  const store = new MemoryStore();
+  const a = createApprovalAuthority({
+    mode: options.mode ?? 'paper',
+    key: options.key ?? KEY,
+    newTokenId: options.newTokenId ?? (() => `tok-${(n += 1)}`),
+    planFreshSlots: options.planFreshSlots ?? 25,
+    slots,
+    store: options.store ?? store,
+  });
+  return { a, slots, store };
+}
+
+const verify = (a: ApprovalAuthority, token: unknown, plan: unknown = PLAN): readonly TokenProblem[] => a.verifier.verify(token as ApprovalToken, plan as OrderPlan);
+const issue = (a: ApprovalAuthority, plan: OrderPlan = PLAN): ApprovalToken => a.issuer.issue(checked(plan));
 
 describe('issuing a token', () => {
   it('binds the plan hash, mode, kind, worst-case spend, minOut and an expiry 25 slots after the quote', () => {
-    const t = issue(authority());
+    const t = issue(authority().a);
     assert.equal(t.id, 'tok-1');
     assert.equal(t.intentId, 'intent-1');
     assert.equal(t.mode, 'paper');
@@ -100,121 +124,232 @@ describe('issuing a token', () => {
   });
 
   it('a sell or a close is reduce-only; a buy never is', () => {
-    const a = authority();
+    const { a } = authority();
     assert.equal(issue(a, SELL).reduceOnly, true);
     assert.equal(issue(a, CLOSE).reduceOnly, true);
     assert.equal(issue(a, PLAN).reduceOnly, false);
   });
 
   it('every token is different: a fresh id and so a fresh MAC, even for the same plan checked twice', () => {
-    const a = authority();
-    const [one, two] = [a.issuer.issue(checked(PLAN), 1_005n), a.issuer.issue(checked(PLAN), 1_005n)];
+    const { a } = authority();
+    const [one, two] = [a.issuer.issue(checked(PLAN)), a.issuer.issue(checked(PLAN))];
     assert.notEqual(one.id, two.id);
     assert.notEqual(one.mac, two.mac);
   });
 
   it('one re-check, at most one token: issuing spends it, a refused issue does not', () => {
     const ids = ['bad id', 'tok-a', 'tok-b'];
-    const a = createApprovalAuthority({ mode: 'paper', key: KEY, newTokenId: () => ids.shift() ?? 'x', planFreshSlots: 25 }).issuer;
+    const { a, slots } = authority({ newTokenId: () => ids.shift() ?? 'x' });
     const plan = checked(PLAN);
-    assert.throws(() => a.issue(plan, 999n), /future/); // refused before anything was spent
-    assert.throws(() => a.issue(plan, 1_005n), /plain id/); // 'bad id' is refused too
+    slots.value = 999n;
+    assert.throws(() => a.issuer.issue(plan), /future/); // refused before anything was spent
+    slots.value = 1_005n;
+    assert.throws(() => a.issuer.issue(plan), /plain id/); // 'bad id' is refused too
     assert.equal(isCheckedPlan(plan), true);
-    assert.equal(a.issue(plan, 1_005n).id, 'tok-a');
+    assert.equal(a.issuer.issue(plan).id, 'tok-a');
     assert.equal(isCheckedPlan(plan), false);
-    assert.throws(() => a.issue(plan, 1_005n), /re-check/); // the same snapshot cannot get a second token
-    assert.equal(a.issue(checked(PLAN), 1_005n).id, 'tok-b'); // a new re-check against fresh inputs can
+    assert.throws(() => a.issuer.issue(plan), /re-check/); // the same snapshot cannot get a second token
+    assert.equal(a.issuer.issue(checked(PLAN)).id, 'tok-b'); // a new re-check against fresh inputs can
   });
 
   it('even if newTokenId comes back into issue with the same plan, only one token comes out', () => {
     let calls = 0;
     let inner = undefined as ApprovalToken | undefined;
     const plan = checked(PLAN);
+    const slots = new Slots();
     const a: ApprovalAuthority = createApprovalAuthority({
       mode: 'paper',
       key: KEY,
       planFreshSlots: 25,
+      slots,
+      store: new MemoryStore(),
       newTokenId: () => {
         calls += 1;
         if (calls === 1) {
-          inner = a.issuer.issue(plan, 1_005n); // the callback tries to issue the same plan
+          inner = a.issuer.issue(plan); // the callback tries to issue the same plan
           return 'outer';
         }
         return 'inner';
       },
     });
-    assert.throws(() => a.issuer.issue(plan, 1_005n), /already has a token/); // the outer call loses
+    assert.throws(() => a.issuer.issue(plan), /already has a token/); // the outer call loses
     assert.equal(calls, 2);
     assert.equal(inner?.id, 'inner'); // the one token there is
     assert.deepEqual(verify(a, inner), []);
   });
 
   it('only a plan that passed the re-check can be issued a token (REVIEWS.md G)', () => {
-    const a = authority().issuer;
-    assert.throws(() => a.issue(PLAN as CheckedPlan, 1_005n), /re-check/); // never checked
-    assert.throws(() => a.issue({ ...checked(PLAN) } as CheckedPlan, 1_005n), /re-check/); // a copy is not the snapshot
-    assert.throws(() => a.issue({ ...PLAN, kind: 'withdraw' } as CheckedPlan, 1_005n), /re-check/); // a withdraw never passes
-    assert.throws(() => a.issue(null as unknown as CheckedPlan, 1_005n), /re-check/);
+    const { a } = authority();
+    assert.throws(() => a.issuer.issue(PLAN as CheckedPlan), /re-check/); // never checked
+    assert.throws(() => a.issuer.issue({ ...checked(PLAN) } as CheckedPlan), /re-check/); // a copy is not the snapshot
+    assert.throws(() => a.issuer.issue({ ...PLAN, kind: 'withdraw' } as CheckedPlan), /re-check/); // a withdraw never passes
+    assert.throws(() => a.issuer.issue(null as unknown as CheckedPlan), /re-check/);
   });
 
   it('a paper authority never mints a live token, and the reverse', () => {
-    assert.throws(() => authority({ mode: 'paper' }).issuer.issue(checked(LIVE), 1_005n), /own mode/);
-    assert.throws(() => authority({ mode: 'live' }).issuer.issue(checked(PLAN), 1_005n), /own mode/);
-    assert.equal(authority({ mode: 'live' }).issuer.issue(checked(LIVE), 1_005n).mode, 'live');
+    assert.throws(() => authority({ mode: 'paper' }).a.issuer.issue(checked(LIVE)), /own mode/);
+    assert.throws(() => authority({ mode: 'live' }).a.issuer.issue(checked(PLAN)), /own mode/);
+    assert.equal(authority({ mode: 'live' }).a.issuer.issue(checked(LIVE)).mode, 'live');
   });
 
-  it('refuses a plan from the future, an expired plan and a bad slot', () => {
-    const a = authority().issuer;
+  it('refuses a plan from the future and an expired plan, by the bound slot', () => {
+    const { a, slots } = authority();
     const plan = checked(PLAN);
-    assert.throws(() => a.issue(plan, 999n), /future/);
-    assert.throws(() => a.issue(plan, 1_026n), /expired/);
-    assert.throws(() => a.issue(plan, -1n), /slot/);
-    assert.throws(() => a.issue(plan, 5 as unknown as bigint), /slot/);
-    assert.equal(a.issue(plan, 1_025n).expiresAtSlot, 1_025n); // the last slot it is still valid
+    slots.value = 999n;
+    assert.throws(() => a.issuer.issue(plan), /future/);
+    slots.value = 1_025n;
+    assert.equal(a.issuer.issue(plan).expiresAtSlot, 1_025n); // the last slot it is still valid
+    slots.value = 1_026n;
+    assert.throws(() => a.issuer.issue(checked(PLAN)), /expired/);
   });
 
   it('refuses a token id that is not a plain id or was already used', () => {
     const ids = ['ok-1', 'ok-1', 'has space', ''];
-    const a = createApprovalAuthority({ mode: 'paper', key: KEY, newTokenId: () => ids.shift() ?? 'x', planFreshSlots: 25 });
-    assert.equal(a.issuer.issue(checked(PLAN), 1_005n).id, 'ok-1');
-    assert.throws(() => a.issuer.issue(checked(PLAN), 1_005n), /already/);
-    assert.throws(() => a.issuer.issue(checked(PLAN), 1_005n), /plain id/);
-    assert.throws(() => a.issuer.issue(checked(PLAN), 1_005n), /plain id/);
+    const { a } = authority({ newTokenId: () => ids.shift() ?? 'x' });
+    assert.equal(a.issuer.issue(checked(PLAN)).id, 'ok-1');
+    assert.throws(() => a.issuer.issue(checked(PLAN)), /already/);
+    assert.throws(() => a.issuer.issue(checked(PLAN)), /plain id/);
+    assert.throws(() => a.issuer.issue(checked(PLAN)), /plain id/);
   });
 
   it('remembers only the newest ids, so memory stays bounded', () => {
     const ids = ['dup'];
     let n = 0;
-    const a = createApprovalAuthority({ mode: 'paper', key: KEY, newTokenId: () => ids.shift() ?? `t-${(n += 1)}`, planFreshSlots: 25 });
-    a.issuer.issue(checked(PLAN), 1_005n); // 'dup'
-    assert.throws(() => (ids.push('dup'), a.issuer.issue(checked(PLAN), 1_005n)), /already/);
+    const { a } = authority({ newTokenId: () => ids.shift() ?? `t-${(n += 1)}` });
+    a.issuer.issue(checked(PLAN)); // 'dup'
+    assert.throws(() => (ids.push('dup'), a.issuer.issue(checked(PLAN))), /already/);
     for (let i = 0; i < 10_000; i += 1) {
-      a.issuer.issue(checked(PLAN), 1_005n);
+      a.issuer.issue(checked(PLAN));
     }
     ids.push('dup');
-    assert.equal(a.issuer.issue(checked(PLAN), 1_005n).id, 'dup'); // forgotten after 10,000 newer ids
+    assert.equal(a.issuer.issue(checked(PLAN)).id, 'dup'); // forgotten after 10,000 newer ids
+  });
+});
+
+describe('the slot comes from the bound source, never from a caller (REVIEWS.md K, security finding 3)', () => {
+  it('issue, verify and redeem take no slot at all; a slot passed anyway changes nothing', () => {
+    const { a, slots } = authority();
+    assert.equal(a.issuer.issue.length, 1);
+    assert.equal(a.verifier.verify.length, 2);
+    assert.equal(a.verifier.redeem.length, 2);
+    const t = issue(a);
+    slots.value = 1_026n; // expired by the source
+    // the K reproduction: an executor passing `currentSlot: 0n` makes an expired token look fresh
+    const verifyWithSlot = a.verifier.verify as unknown as (...args: unknown[]) => readonly TokenProblem[];
+    assert.deepEqual(verifyWithSlot(t, PLAN, { currentSlot: 0n, mode: 'paper' }), ['expired']);
+    assert.deepEqual(verify(a, t), ['expired']);
+  });
+
+  it('an unknown slot refuses everything: null, a throw, not a bigint, negative, past u64', () => {
+    for (const value of [null, undefined, 5, -1n, 2n ** 64n, '1005', { slot: 1_005n }]) {
+      const { a, slots } = authority();
+      const t = issue(a);
+      slots.value = value;
+      assert.throws(() => a.issuer.issue(checked(PLAN)), /slot is unknown/, String(value));
+      assert.deepEqual(verify(a, t), ['slot-unknown'], String(value));
+      assert.deepEqual(a.verifier.redeem(t, PLAN), { ok: false, problems: ['slot-unknown'] });
+    }
+    const throwing = new Slots();
+    throwing.currentSlot = (): bigint | null => {
+      throw new Error('RPC down');
+    };
+    const a = createApprovalAuthority({ mode: 'paper', key: KEY, newTokenId: () => 'x', planFreshSlots: 25, slots: throwing, store: new MemoryStore() });
+    assert.throws(() => a.issuer.issue(checked(PLAN)), /slot is unknown/);
+  });
+
+  it('a source that worked and then breaks is unknown, never its last good slot', () => {
+    let broken = false;
+    const flaky: SlotSource = {
+      currentSlot: (): bigint | null => {
+        if (broken) {
+          throw new Error('stream lost');
+        }
+        return 1_005n;
+      },
+    };
+    let n = 0;
+    const a = createApprovalAuthority({ mode: 'paper', key: KEY, newTokenId: () => `t-${(n += 1)}`, planFreshSlots: 25, slots: flaky, store: new MemoryStore() });
+    const t = issue(a);
+    broken = true;
+    assert.deepEqual(verify(a, t), ['slot-unknown']);
+    assert.deepEqual(a.verifier.redeem(t, PLAN), { ok: false, problems: ['slot-unknown'] });
+    assert.throws(() => a.issuer.issue(checked(PLAN)), /slot is unknown/);
+    broken = false;
+    assert.deepEqual(verify(a, t), []); // back once the source answers again
+  });
+
+  it('a source that goes backwards never revives an expired token: the slot only moves forward', () => {
+    const { a, slots } = authority();
+    const t = issue(a);
+    slots.value = 1_026n;
+    assert.deepEqual(verify(a, t), ['expired']);
+    slots.value = 1_000n; // the stream lagged, or someone set it back
+    assert.deepEqual(verify(a, t), ['expired']);
+    assert.deepEqual(a.verifier.redeem(t, PLAN), { ok: false, problems: ['expired'] });
+    assert.throws(() => a.issuer.issue(checked(PLAN)), /expired/); // nor can a new token be issued against the old slot
+  });
+
+  it('one reading above any storable slot (a parse bug, a lying RPC) is unknown and never sticks in the ratchet (REVIEWS.md N)', () => {
+    const { a, slots } = authority();
+    const t = issue(a);
+    for (const wild of [2n ** 64n - 1n, 2n ** 63n]) {
+      slots.value = wild;
+      assert.deepEqual(verify(a, t), ['slot-unknown'], String(wild));
+    }
+    slots.value = 1_006n; // the next sane reading: tokens work again, exits included
+    assert.deepEqual(verify(a, t), []);
+    assert.ok(a.verifier.redeem(t, PLAN).ok);
+    assert.equal(issue(a, SELL).expiresAtSlot, 1_025n);
+    // the bound itself is adopted: anything up to it is app/slots.ts's to judge against time and a second provider
+    slots.value = 2n ** 63n - 1n;
+    assert.deepEqual(verify(a, t), ['expired']);
+  });
+
+  it('the source is read once at creation: replacing its method later changes nothing', () => {
+    const { a, slots } = authority();
+    const t = issue(a);
+    slots.currentSlot = (): bigint => 0n; // the method swapped on the object the authority was given
+    slots.value = 1_026n;
+    const before = slots.reads;
+    assert.deepEqual(verify(a, t), ['expired']); // still the original method, reading 1,026
+    assert.equal(slots.reads, before + 1);
   });
 });
 
 describe('verifying: a valid token', () => {
-  it('passes for the plan it was issued for, in its mode, before it expires', () => {
-    const a = authority();
+  it('passes for the plan it was issued for, in its mode, until its expiry slot', () => {
+    const { a, slots } = authority();
     const t = issue(a);
     assert.deepEqual(verify(a, t), []);
-    assert.deepEqual(verify(a, t, PLAN, { currentSlot: 1_025n, mode: 'paper' }), []);
     assert.deepEqual(verify(a, issue(a, SELL), SELL), []);
     assert.deepEqual(verify(a, issue(a, CLOSE), CLOSE), []);
+    slots.value = 1_025n;
+    assert.deepEqual(verify(a, t), []);
   });
 
-  it('the executor\'s verifier cannot issue (the key and the constructor stay with risk)', () => {
-    const a = authority();
+  it('the verifier cannot issue, holds no key, and says which mode it serves', () => {
+    const { a } = authority({ mode: 'live' });
     assert.equal('issue' in a.verifier, false);
     assert.equal(Object.keys(a.verifier).includes('key'), false);
+    assert.equal(a.verifier.mode, 'live');
+    assert.ok(Object.isFrozen(a.verifier) && Object.isFrozen(a.issuer));
+  });
+
+  it("the executor's redeemer can only redeem: no verify that skips single use, no issue (REVIEWS.md N, security finding 2)", () => {
+    const { a } = authority();
+    assert.deepEqual(Object.keys(a.redeemer).sort(), ['mode', 'redeem']);
+    assert.equal(a.redeemer.mode, 'paper');
+    assert.ok(Object.isFrozen(a.redeemer));
+    const t = issue(a);
+    assert.ok(a.redeemer.redeem(t, PLAN).ok);
+    // the same bound store: a second use is refused whichever capability tries it
+    assert.deepEqual(a.redeemer.redeem(t, PLAN), { ok: false, problems: ['already-consumed'] });
+    assert.deepEqual(a.verifier.redeem(t, PLAN), { ok: false, problems: ['already-consumed'] });
   });
 });
 
 describe('verifying: a forged or tampered token', () => {
-  const a = authority();
+  const { a } = authority();
   const token = issue(a);
 
   it('any changed token field breaks the MAC', () => {
@@ -237,7 +372,7 @@ describe('verifying: a forged or tampered token', () => {
   });
 
   it('a token made with another key is refused, even a perfect copy of the fields', () => {
-    const other = authority({ key: Uint8Array.from({ length: 32 }, (_v, i) => 200 - i) });
+    const other = authority({ key: Uint8Array.from({ length: 32 }, (_v, i) => 200 - i) }).a;
     assert.deepEqual(verify(a, issue(other)), ['bad-mac']);
   });
 
@@ -257,86 +392,126 @@ describe('verifying: a forged or tampered token', () => {
     assert.ok(verify(a, token, { ...PLAN, kind: 'withdraw' }).includes('kind-not-allowed'));
   });
 
-  it('a token never works in the other mode', () => {
-    assert.deepEqual(verify(a, token, PLAN, { currentSlot: 1_005n, mode: 'live' }), ['wrong-mode']);
-    // a live token (same key) at a paper authority, with a paper executor context or a live one
-    const live = issue(authority({ mode: 'live' }), LIVE);
-    assert.deepEqual(verify(a, live, LIVE, NOW), ['wrong-mode']);
-    assert.deepEqual(verify(a, live, LIVE, { currentSlot: 1_005n, mode: 'live' }), ['wrong-mode']);
-    assert.deepEqual(verify(authority({ mode: 'live' }), live, LIVE, { currentSlot: 1_005n, mode: 'live' }), []);
+  it('a token never works at an authority of the other mode, even with the same key', () => {
+    const live = authority({ mode: 'live' }).a;
+    const liveToken = issue(live, LIVE);
+    assert.deepEqual(verify(a, liveToken, LIVE), ['wrong-mode']); // a live token at a paper authority
+    assert.deepEqual(verify(live, token, PLAN), ['wrong-mode']); // a paper token at a live one
+    assert.deepEqual(verify(live, liveToken, LIVE), []);
   });
 });
 
 describe('verifying: expiry', () => {
   it('valid through its expiry slot, refused after', () => {
-    const a = authority();
+    const { a, slots } = authority();
     const t = issue(a);
-    assert.deepEqual(verify(a, t, PLAN, { currentSlot: 1_025n, mode: 'paper' }), []);
-    assert.deepEqual(verify(a, t, PLAN, { currentSlot: 1_026n, mode: 'paper' }), ['expired']);
+    slots.value = 1_025n;
+    assert.deepEqual(verify(a, t), []);
+    slots.value = 1_026n;
+    assert.deepEqual(verify(a, t), ['expired']);
   });
 
   it('an expiry later than the quote allows is refused (a verifier with a tighter window)', () => {
-    const issued = issue(authority()); // expires 1,025
-    assert.deepEqual(verify(authority({ planFreshSlots: 10 }), issued), ['expiry-too-late']);
+    const issued = issue(authority().a); // expires 1,025
+    assert.deepEqual(verify(authority({ planFreshSlots: 10 }).a, issued), ['expiry-too-late']);
   });
 });
 
-describe('single use', () => {
+describe('single use, in the bound store (REVIEWS.md K, security finding 2)', () => {
   it('redeem verifies, consumes, and hands back the frozen validated plan; a second use is refused', () => {
-    const a = authority();
-    const store = new MemoryStore();
+    const { a, store } = authority();
     const t = issue(a);
-    const first = a.verifier.redeem(t, PLAN, NOW, store);
+    const first = a.verifier.redeem(t, PLAN);
     assert.ok(first.ok);
     assert.deepEqual({ ...first.plan }, { ...PLAN });
     assert.ok(Object.isFrozen(first.plan));
-    const second = a.verifier.redeem(t, PLAN, NOW, store);
-    assert.deepEqual(second, { ok: false, problems: ['already-consumed'] });
-    assert.deepEqual([...store.seen], ['tok-1']);
+    assert.deepEqual(a.verifier.redeem(t, PLAN), { ok: false, problems: ['already-consumed'] });
+    assert.deepEqual([...store.seen.keys()], ['tok-1']);
+  });
+
+  it('the store gets the validated snapshot: the token as verified, the slot it was judged at, the frozen plan', () => {
+    const { a, store, slots } = authority();
+    const t = issue(a);
+    slots.value = 1_010n;
+    const mine = { ...PLAN };
+    assert.ok(a.verifier.redeem(t, mine).ok);
+    const snapshot = store.seen.get('tok-1')!;
+    assert.deepEqual({ ...snapshot, plan: { ...snapshot.plan } }, {
+      intentId: 'intent-1',
+      positionId: 'p1',
+      mode: 'paper',
+      kind: 'buy',
+      reduceOnly: false,
+      planHash: planHash(PLAN),
+      maxSpendLamports: 56_686_440n,
+      minOut: 980_000_000n,
+      expiresAtSlot: 1_025n,
+      slot: 1_010n,
+      plan: { ...PLAN },
+    });
+    assert.ok(Object.isFrozen(snapshot) && Object.isFrozen(snapshot.plan));
+    assert.notEqual(snapshot.plan, mine); // never the executor's own object
+    (mine as { wallet: string }).wallet = 'Attacker';
+    assert.equal(snapshot.plan.wallet, 'OurWallet');
+  });
+
+  it('an executor cannot bring its own store: redeem has no place for one, and one passed anyway is ignored', () => {
+    const { a } = authority();
+    const t = issue(a);
+    assert.ok(a.verifier.redeem(t, PLAN).ok);
+    // the K reproduction: `{ consume: () => true }` would have given unlimited reuse
+    const redeemWithStore = a.verifier.redeem as unknown as (...args: unknown[]) => unknown;
+    assert.deepEqual(redeemWithStore(t, PLAN, { currentSlot: 1_005n, mode: 'paper' }, { consume: () => true }), { ok: false, problems: ['already-consumed'] });
+  });
+
+  it('the store is read once at creation: replacing its method later changes nothing', () => {
+    const { a, store } = authority();
+    const t = issue(a);
+    assert.ok(a.verifier.redeem(t, PLAN).ok);
+    store.consume = (): boolean => true;
+    assert.deepEqual(a.verifier.redeem(t, PLAN), { ok: false, problems: ['already-consumed'] });
   });
 
   it('the plan the executor builds from cannot change after redeem (REVIEWS.md H, M2)', () => {
-    const a = authority();
+    const { a } = authority();
     const mine = { ...PLAN };
-    const result = a.verifier.redeem(issue(a), mine, NOW, new MemoryStore());
+    const result = a.verifier.redeem(issue(a), mine);
     (mine as { wallet: string }).wallet = 'Attacker';
     assert.ok(result.ok && result.plan.wallet === 'OurWallet');
   });
 
   it('a token that fails verification is not consumed', () => {
-    const a = authority();
-    const store = new MemoryStore();
+    const { a, store } = authority();
     const t = issue(a);
-    assert.deepEqual(a.verifier.redeem(t, { ...PLAN, wallet: 'Attacker' }, NOW, store), { ok: false, problems: ['plan-hash-mismatch'] });
+    assert.deepEqual(a.verifier.redeem(t, { ...PLAN, wallet: 'Attacker' }), { ok: false, problems: ['plan-hash-mismatch'] });
     assert.equal(store.seen.size, 0);
-    assert.ok(a.verifier.redeem(t, PLAN, NOW, store).ok); // still good for the right plan
+    assert.ok(a.verifier.redeem(t, PLAN).ok); // still good for the right plan
   });
 
   it('only an explicit true from the store approves: an async or truthy result is refused (REVIEWS.md H, H1)', () => {
-    const a = authority();
-    const t = issue(a);
     for (const answer of [Promise.resolve(false), Promise.resolve(true), 1, 'yes', {}, undefined, null, 0]) {
-      assert.deepEqual(a.verifier.redeem(t, PLAN, NOW, storeReturning(answer)), { ok: false, problems: ['store-error'] }, String(answer));
+      const { a } = authority({ store: { consume: () => answer as boolean } });
+      assert.deepEqual(a.verifier.redeem(issue(a), PLAN), { ok: false, problems: ['store-error'] }, String(answer));
     }
-    assert.deepEqual(a.verifier.redeem(t, PLAN, NOW, storeReturning(false)), { ok: false, problems: ['already-consumed'] });
-    assert.ok(a.verifier.redeem(t, PLAN, NOW, storeReturning(true)).ok);
+    const no = authority({ store: { consume: () => false } }).a;
+    assert.deepEqual(no.verifier.redeem(issue(no), PLAN), { ok: false, problems: ['already-consumed'] });
+    const yes = authority({ store: { consume: () => true } }).a;
+    assert.ok(yes.verifier.redeem(issue(yes), PLAN).ok);
   });
 
-  it('a store that fails, or is not a store, means no guarantee of single use: refused, never approved', () => {
-    const a = authority();
-    const t = issue(a);
+  it('a store that fails means no guarantee of single use: refused, never approved', () => {
     const broken: TokenStore = {
       consume(): boolean {
         throw new Error('disk full');
       },
     };
-    assert.deepEqual(a.verifier.redeem(t, PLAN, NOW, broken), { ok: false, problems: ['store-error'] });
-    assert.deepEqual(a.verifier.redeem(t, PLAN, NOW, null as unknown as TokenStore), { ok: false, problems: ['store-error'] });
+    const { a } = authority({ store: broken });
+    assert.deepEqual(a.verifier.redeem(issue(a), PLAN), { ok: false, problems: ['store-error'] });
   });
 });
 
 describe('verify never throws', () => {
-  const a = authority();
+  const { a } = authority();
   const token = issue(a);
   const boom = (): never => {
     throw new Error('boom');
@@ -357,19 +532,13 @@ describe('verify never throws', () => {
     const proxy = new Proxy({}, { ownKeys: boom, getOwnPropertyDescriptor: boom, get: boom, has: boom });
     assert.deepEqual(verify(a, getter), ['malformed-token']);
     assert.deepEqual(verify(a, proxy), ['malformed-token']);
-    assert.deepEqual(a.verifier.redeem(getter as unknown as ApprovalToken, PLAN, NOW, new MemoryStore()), { ok: false, problems: ['malformed-token'] });
+    assert.deepEqual(a.verifier.redeem(getter as unknown as ApprovalToken, PLAN), { ok: false, problems: ['malformed-token'] });
   });
 
-  it('a malformed or hostile plan or context is refused as such', () => {
+  it('a malformed or hostile plan is refused as such', () => {
     assert.deepEqual(verify(a, token, null), ['malformed-plan']);
     assert.deepEqual(verify(a, token, { ...PLAN, attempts: 0 }), ['malformed-plan']);
     assert.deepEqual(verify(a, token, Object.defineProperty({ ...PLAN }, 'wallet', { get: boom, enumerable: true })), ['malformed-plan']);
-    assert.deepEqual(verify(a, token, PLAN, null), ['malformed-context']);
-    assert.deepEqual(verify(a, token, PLAN, { currentSlot: 1_005n, mode: 'off' }), ['malformed-context']);
-    assert.deepEqual(verify(a, token, PLAN, { currentSlot: 5, mode: 'paper' }), ['malformed-context']);
-    assert.deepEqual(verify(a, token, PLAN, { currentSlot: -1n, mode: 'paper' }), ['malformed-context']);
-    assert.deepEqual(verify(a, token, PLAN, { get currentSlot() { return boom(); }, mode: 'paper' }), ['malformed-context']);
-    assert.deepEqual(verify(a, token, PLAN, new Proxy({}, { get: boom })), ['malformed-context']);
   });
 
   it('a plan whose worst-case spend overflows is refused, not thrown', () => {
@@ -379,15 +548,15 @@ describe('verify never throws', () => {
   });
 
   it('redeem never throws either', () => {
-    const store = new MemoryStore();
-    assert.deepEqual(a.verifier.redeem(null as unknown as ApprovalToken, PLAN, NOW, store), { ok: false, problems: ['malformed-token'] });
+    const { a: fresh, store } = authority();
+    assert.deepEqual(fresh.verifier.redeem(null as unknown as ApprovalToken, PLAN), { ok: false, problems: ['malformed-token'] });
     assert.equal(store.seen.size, 0);
   });
 });
 
 describe('creating the authority', () => {
   const make = (patch: Record<string, unknown>) =>
-    createApprovalAuthority({ mode: 'paper', key: KEY, newTokenId: () => 'x', planFreshSlots: 25, ...patch } as Parameters<typeof createApprovalAuthority>[0]);
+    createApprovalAuthority({ mode: 'paper', key: KEY, newTokenId: () => 'x', planFreshSlots: 25, slots: new Slots(), store: new MemoryStore(), ...patch } as ApprovalOptions);
 
   it('needs a mode and a real key: at least 32 bytes, not all zero, a Uint8Array', () => {
     assert.throws(() => make({ mode: 'demo' }), RiskError);
@@ -403,6 +572,17 @@ describe('creating the authority', () => {
     assert.doesNotThrow(() => make({ key: new Uint8Array(64).fill(9), mode: 'live' }));
   });
 
+  it('needs a slot source and a store, each with its method (a getter that throws counts as none)', () => {
+    const throwingGetter = Object.defineProperty({}, 'consume', {
+      get: () => {
+        throw new Error('boom');
+      },
+    });
+    for (const patch of [{ slots: undefined }, { slots: null }, { slots: {} }, { slots: { currentSlot: 1_005n } }, { store: undefined }, { store: {} }, { store: { consume: true } }, { store: throwingGetter }]) {
+      assert.throws(() => make(patch), RiskError, JSON.stringify(patch, (_k, v: unknown) => (typeof v === 'bigint' ? `${v}n` : v)));
+    }
+  });
+
   it('validates the COPY of the key: a subclass cannot show the check one thing and the MAC another (REVIEWS.md H)', () => {
     class ShortKey extends Uint8Array {
       override [Symbol.iterator](): ArrayIterator<number> {
@@ -413,9 +593,10 @@ describe('creating the authority', () => {
     assert.throws(() => make({ key: evil }), RiskError);
   });
 
-  it('keeps its own copy of the key: wiping the caller\'s array does not break or weaken it', () => {
+  it("keeps its own copy of the key: wiping the caller's array does not break or weaken it", () => {
     const mine = Uint8Array.from(KEY);
-    const a = createApprovalAuthority({ mode: 'paper', key: mine, newTokenId: (() => { let n = 0; return () => `t-${(n += 1)}`; })(), planFreshSlots: 25 });
+    let n = 0;
+    const a = make({ key: mine, newTokenId: () => `t-${(n += 1)}` });
     const before = issue(a);
     mine.fill(0);
     assert.deepEqual(verify(a, before), []);

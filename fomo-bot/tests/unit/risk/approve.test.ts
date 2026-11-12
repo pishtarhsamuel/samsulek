@@ -172,13 +172,6 @@ function pos(id: string, mint: string, status: ActivePosition['status'], value: 
   return status === 'opening' ? { ...base, status, maxSpend: L(value) } : { ...base, status, value: L(value) };
 }
 
-/** An authority that counts the tokens it mints. */
-function authority(mode: 'paper' | 'live' = 'paper'): { a: ApprovalAuthority; minted: () => number } {
-  let n = 0;
-  const a = createApprovalAuthority({ mode, key: KEY, newTokenId: () => `tok-${(n += 1)}`, planFreshSlots: 25 });
-  return { a, minted: () => n };
-}
-
 class MemoryStore implements TokenStore {
   readonly seen = new Set<string>();
   consume(tokenId: string): boolean {
@@ -188,6 +181,13 @@ class MemoryStore implements TokenStore {
     this.seen.add(tokenId);
     return true;
   }
+}
+
+/** An authority that counts the tokens it mints, with its slot source at SLOT and its own store bound. */
+function authority(mode: 'paper' | 'live' = 'paper'): { a: ApprovalAuthority; minted: () => number } {
+  let n = 0;
+  const a = createApprovalAuthority({ mode, key: KEY, newTokenId: () => `tok-${(n += 1)}`, planFreshSlots: 25, slots: { currentSlot: () => SLOT }, store: new MemoryStore() });
+  return { a, minted: () => n };
 }
 
 function decide(patch: Patch = {}): { decision: BuyDecision; minted: number; a: ApprovalAuthority } {
@@ -229,12 +229,11 @@ describe('approveBuy: a buy that passes everything', () => {
     assert.equal(decision.token.intentId, 'intent-1'); // the engine's intent, which the plan had to carry
     assert.equal(decision.token.reduceOnly, false);
     assert.equal(decision.token.maxSpendLamports, decision.opening.maxSpend);
-    assert.deepEqual(a.verifier.verify(decision.token, PLAN, { currentSlot: SLOT, mode: 'paper' }), []);
-    // the executor redeems it once, from the frozen plan
-    const store = new MemoryStore();
-    const first = a.verifier.redeem(decision.token, PLAN, { currentSlot: SLOT, mode: 'paper' }, store);
+    assert.deepEqual(a.verifier.verify(decision.token, PLAN), []);
+    // the executor redeems it once, from the frozen plan, in the store bound to the authority
+    const first = a.verifier.redeem(decision.token, PLAN);
     assert.equal(first.ok, true);
-    assert.deepEqual(a.verifier.redeem(decision.token, PLAN, { currentSlot: SLOT, mode: 'paper' }, store), { ok: false, problems: ['already-consumed'] });
+    assert.deepEqual(a.verifier.redeem(decision.token, PLAN), { ok: false, problems: ['already-consumed'] });
   });
 
   it('the decision is frozen and the input is never changed', () => {
@@ -663,7 +662,7 @@ describe('approveExit: reduce-only exits have no flag to be blocked by (s.9)', (
     if (decision.approved) {
       assert.equal(decision.token.reduceOnly, true);
       assert.equal(decision.token.kind, 'sell');
-      assert.deepEqual(a.verifier.verify(decision.token, SELL, { currentSlot: SELL.quoteSlot + 5n, mode: 'paper' }), []);
+      assert.deepEqual(a.verifier.verify(decision.token, SELL), []); // the slot source is at SLOT = the quote + 5
       assert.ok(Object.isFrozen(decision));
     }
   });

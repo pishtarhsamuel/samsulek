@@ -264,7 +264,10 @@ Honest note: pump.fun and PumpSwap trades start at about 2.5% in venue fees alon
    token can be issued for. The token (src/risk/approval.ts) binds plan hash, mode, kind,
    worst-case spend, minOut and an expiry slot <= quote slot + 25 under an HMAC; it works
    once, in one mode (an authority serves one mode), and the executor builds its transaction
-   from the frozen plan that redeem returns. One re-check gives at most one token: issuing
+   from the frozen plan that redeem returns. The single-use store and the slot source are
+   bound when the authority is created, never passed by the executor; the slot only moves
+   forward, and an unknown slot (no answer, or a broken source) means no token is issued or
+   redeemed; the store records the order from the snapshot redeem validated. One re-check gives at most one token: issuing
    spends the plan's checked status, so a second order for the same plan needs its own
    re-check against fresh inputs. Confidence never raises a size.
    The approval step (src/risk/approve.ts) puts steps 1-5 together, in this order, on ONE

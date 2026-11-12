@@ -66,13 +66,24 @@ can trade, and no key or account exists anywhere.
   24 hours in live). Nothing here can switch a strategy to live. Both Opus reviewers approved
   with notes (REVIEWS.md M); everything they found is fixed (exit settings now wait too, undo
   can no longer soften the paper model, stored records are checked strictly).
+- Step 6, the database, is designed (docs/STORAGE_DESIGN.md, by the architect): one small file
+  talks to the built-in database, every money decision is written in one locked transaction,
+  and the database adds its own safety checks (one position per token, a token works once, no
+  live mode except /golive, a waiting change really waits 24 hours). It is built in five parts.
+  Part 6a is done: the approval tokens' single-use record and their slot clock are now fixed
+  when the bot starts, so the part that sends orders can never bring its own (this closes the
+  open item of the security review K). Both Opus reviewers approved (REVIEWS.md N); their
+  fixes are in (the order sender gets a redeem-only key, impossible slot numbers are ignored,
+  stricter import rules), and one item waits for part 6d: the slot feed must reject a
+  wrong-but-possible slot number by comparing it with the clock and a second provider.
+  602 tests pass.
 - For you to know before live: at 5% per trade, live trading needs at least 0.4 SOL in the
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: storage (the database, where the approval step's effects, the setting versions and
-  the waiting changes are written in one transaction); then chain clients, the paper engine,
-  Telegram and logging.
+- Next: the rest of step 6 (6b the database core, 6c the tables, 6d the approval transaction,
+  6e settings and day-state transactions); then chain clients, the paper engine, Telegram and
+  logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;

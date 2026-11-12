@@ -32,7 +32,7 @@ import { HARD_CAPS } from '../config/caps.ts';
 import { isIdText, isStrategyId, type StrategyId } from '../core/ids.ts';
 import { isTimestamp } from '../core/time.ts';
 import { U64_MAX, bpsOfFloor, lamports, microLamportsPerCu, tokenUnits, type Lamports } from '../core/units.ts';
-import { type ApprovalIssuer, type ApprovalToken } from './approval.ts';
+import type { ApprovalIssuer, ApprovalToken } from './approval.ts';
 import { entryBlocks, type EntryState } from './blocks.ts';
 import { planMaxSpend, validatePlan, type OrderPlan } from './plan.ts';
 import { checkPlan, type ApprovedPool, type CheckedPlan, type PlanCaps, type PlanContext, type PlanProblem, type QuoteContext } from './recheck.ts';
@@ -592,7 +592,8 @@ export function approveBuy(inputRaw: BuyApprovalInput, issuerRaw: ApprovalIssuer
   }
 
   // 5. the token, last
-  const token = issuer.issue(checked.plan, currentSlot);
+  // the issuer reads its own bound slot source (it can only be at or past currentSlot: stricter)
+  const token = issuer.issue(checked.plan);
   return Object.freeze({
     approved: true,
     token,
@@ -631,6 +632,6 @@ export function approveExit(inputRaw: ExitApprovalInput, issuerRaw: ApprovalIssu
   if (!checked.ok) {
     return Object.freeze({ approved: false, problems: checked.problems });
   }
-  const token = issuer.issue(checked.plan, slot('currentSlot', context.currentSlot));
+  const token = issuer.issue(checked.plan);
   return Object.freeze({ approved: true, token, plan: checked.plan });
 }
