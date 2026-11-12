@@ -109,18 +109,26 @@ the SOL and EUR cap applies; no price means no live entries.
   re-quotes every position from two fresh samples 10 s apart that agree with Jupiter within 3%.
   If fills, confirmed deposits and these verified marks explain the rise, it clears by itself
   and only then may the peak move; otherwise HALT (owner at the server). Until then baseline
-  and peak stay put, so real pumps count only once verified. A confirmation is only possible
-  for a held jump and records the verified equity (a fresh, fully valued read, within the
-  sanity limits): for the next hour a rise is measured from
-  the higher of the hour-ago snapshot and that verified level, so the same rise is not held
-  again and again while the snapshot is still from before it (a livelock); a further rise of
-  more than 50% above the verified level holds again, and a confirmation from the future
-  (the clock stepped back) is ignored, which only makes the test stricter.
+  and peak stay put, so real pumps count only once verified. The state remembers the latest
+  held observation (its equity and time). A confirmation is only possible for a held jump,
+  within five minutes after that observation (never before it; else observe again first), from
+  a fresh, fully valued read within the sanity limits, and it records the LOWER of the verified
+  level and what the held observation saw, so a confirmation can never vouch for more than was
+  observed (and still clears after a pump that collapses, where the verified level is lower).
+  For the next hour a rise is measured from the higher of the hour-ago snapshot and that
+  record, so the same rise is not held again and again while the snapshot is still from before
+  it (a livelock); a further rise of more than 50% above the record holds again.
+- Two daily stops on consecutive days set a STICKY halt for the owner: it is reported on every
+  observation until the owner's /resume, so a quiet day or a gap in between cannot lift it (the
+  streak itself restarts on a gap, the halt does not).
 - The owner's /resume has two separate effects, never both at once: after a peak halt the
   peak restarts at the last accepted equity (fully valued and sanity-checked; no caller can
   supply a value, so a tiny wrong one cannot weaken the halt), refused while a jump is held
-  or when no equity is known; after a daily stop on two days in a row the streak starts
-  again. Today's daily stop still holds until Athens midnight.
+  or when no equity is known; after a daily stop on two days in a row the halt is lifted and
+  the streak starts again. Today's daily stop still holds until Athens midnight.
+- A daily stop also holds if the clock then reads an earlier time or day (it stepped back), and
+  entries stay blocked while the clock reads earlier than the last observation's day, until the
+  next observation reports the clock problem.
 - Clock moving backwards across a day boundary halts (root rule). A clock before 1970 or
   after the year 2200 is refused as a clock problem, so a wild clock cannot lock a stored day
   ahead of real time. A clock that jumps forward by a little less (say to 2199) is accepted
@@ -138,15 +146,18 @@ while they hold), so the engine sets and keeps the persistent flags itself.
 2. HALT on equity-zero, sanity-max, sanity-bankroll and clock-backwards (the stops are
    skipped on those paths). Pause entries on equity-jump and start the verification above.
    daily-stop sets DAILY_STOP and entries stay blocked through dailyStopActive until 00:00
-   Athens. daily-stop-twice blocks entries until the owner's streak restart; peak-halt keeps
-   PEAK_HALT until the owner's peak restart. A RiskError from any of these functions turns
-   entries off and alerts the owner. Exits always continue. If both equity and stop-equity
-   are null, entries are off.
+   Athens. daily-stop-twice (state.streakHalt, sticky, reported on every observation) blocks
+   entries until the owner's streak restart; peak-halt keeps PEAK_HALT until the owner's peak
+   restart. A RiskError from any of these functions turns entries off and alerts the owner.
+   Exits always continue. If both equity and stop-equity are null, entries are off. Between
+   observations entries are gated by dailyStopActive (which also holds through a clock that
+   stepped back) and by the saved flags.
 3. confirmEquityJump is called only by the verification routine (or by the owner at the
    server), with the fully valued equity of a fresh read taken by that verification, never the
-   held observation itself, and the current clock. No strategy, Telegram or AI path can call
-   it. The engine observes again right after it; if no observation lands within the hour the
-   hold returns and needs another confirmation.
+   held observation itself, and the current clock, within five minutes after the latest held
+   observation (observe again first if the verification took longer). No strategy, Telegram
+   or AI path can call it. The engine observes again right after it; if no observation lands
+   within the hour the hold returns and needs another confirmation.
 4. The peak restart runs only on the owner's /resume (live: after the 24 h wait with notice,
    s.12), right after a tick that observed a fully valued equity. The streak restart is a
    separate owner action. Neither runs automatically.
@@ -210,13 +221,21 @@ Honest note: pump.fun and PumpSwap trades start at about 2.5% in venue fees alon
    never stop the bot).
 5. Risk re-checks the plan and issues the token in transaction T1 (ARCHITECTURE s.4),
    re-running every cap against open and opening positions. The re-check (src/risk/recheck.ts)
-   never trusts the planner. It takes from the engine, never from the plan: the pool and venue
-   the safety filter approved (SOL-quoted), the position, wallet and own token account, risk's
-   own quote of the plan's input (from the venue math), the exit intent's urgency and origin,
-   and the cost basis from the ledger. It checks: mode, ownership, route, a fresh quote and fee
-   config (25 slots); minOut against the declared slippage on risk's own quote (a planner that
-   understates its expected output cannot buy a low minOut) and the buy slippage cap; the CU
-   (a live plan needs a simulation), tip and landing-spend caps (limits 18 and 19); the
+   never trusts the planner. It takes from the engine, never from the plan: the intent id,
+   the pool and venue the safety filter approved (SOL-quoted), the position, wallet and own
+   token account, risk's own quote of the plan's input (from the venue math) with the slot and
+   the fee config it read, the exit intent's urgency and origin, and the cost basis from the
+   ledger. It checks: mode, the intent id (a plan carries the engine's, never its own),
+   ownership, route, a fresh quote and fee config (25 slots) that are the same ones risk read
+   (a planner that declares a cheaper fee or another slot is refused); one buy order per
+   position, ever; minOut against the declared slippage on risk's own quote (a planner that
+   understates its expected output cannot buy a low minOut) and the buy slippage cap, both
+   compared EXACTLY (a floor never rounds down, a cap never rounds up: the CU limit is at most
+   1.2 x the simulated units, not its rounded-up value); the CU (a live plan needs a
+   simulation), tip and landing-spend caps (limits 18 and 19); backstops that hold whatever
+   sizing says (limits 2 and 15 "hold even if equity is misread"): a buy's swap input at most
+   0.06 SOL and at least 0.01 SOL, its worst-case spend (input + rent + every attempt) at most
+   0.07 SOL (a margin above limit 2's 0.0617; added in review K, loosens nothing); the
    attempts and the worst-case fees against what sizing reserved (buys) or the failed-fee
    budget left (automatic exits, s.3a: no automatic exits once stopped, a passing sell
    simulation, never a worthless sell); the input between the minimum trade and the sized
@@ -230,6 +249,23 @@ Honest note: pump.fun and PumpSwap trades start at about 2.5% in venue fees alon
    from the frozen plan that redeem returns. One re-check gives at most one token: issuing
    spends the plan's checked status, so a second order for the same plan needs its own
    re-check against fresh inputs. Confidence never raises a size.
+   The approval step (src/risk/approve.ts) puts steps 1-5 together, in this order, on ONE
+   snapshot of the world that the engine re-reads inside the T1 transaction: the entry blocks,
+   sizing, the plan re-check, an independent check of the hard limits from the plan's own
+   worst-case numbers, then the token. It counts every opening, open, exiting and stuck
+   position (for the position cap, the exposure caps and one position per mint, and in the fee
+   reserve, where the new position joins them), holds back the SOL that buys in flight will
+   still spend before computing the free SOL (invariant 17), sizes from the lower of
+   start-of-day and current equity, and blocks on unknown equity before sizing. It returns the
+   opening position (at its worst-case spend) and the day's new entry count for the engine to
+   write in the same transaction; any throw is a refusal. approveExit has no flag input at all:
+   a valid reduce-only exit is always approved (s.9), and it issues tokens for sells and
+   closes only. It is a thin wrapper: every exit fact (exits in flight, holdings, the intent
+   id, the quote) comes from the caller, so the transaction around it must re-read them inside
+   the transaction. The approval step passes "no earlier buy order" for a new position only
+   because the position is new: the partial unique index on positions(mint) stays in T1. Its
+   caps come from the config; until config/caps.ts clamps them against the hard values
+   (step 5; a gate recorded in REVIEWS.md K), only the re-check's backstops are hard.
 
 ## 7. Cooldowns (P)
 

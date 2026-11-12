@@ -96,6 +96,27 @@ function room(cap: bigint, used: bigint): Lamports {
   return lamports(cap > used ? cap - used : 0n);
 }
 
+/**
+ * The account minimum (the configured minimum trade, never below its floor, which itself cannot be
+ * below the 0.01 SOL hard floor) and the entry minimum (the larger of that and the pool's cost-rule
+ * minimum). One definition, used by sizing and by the plan re-check, so they cannot disagree.
+ */
+function minimums(poolMinTrade: Lamports, caps: SizingCaps): { readonly account: Lamports; readonly entry: Lamports } {
+  const poolMinimum = lamports(poolMinTrade);
+  const floor = lamports(caps.minTradeFloorLamports);
+  if (floor < HARD_MIN_TRADE_FLOOR) {
+    throw new RiskError('the minimum-trade floor cannot be below the 0.01 SOL hard floor');
+  }
+  const configured = lamports(caps.minTradeLamports);
+  const account = configured > floor ? configured : floor;
+  return { account, entry: lamports(poolMinimum > account ? poolMinimum : account) };
+}
+
+/** The smallest entry the caps and the pool's cost rule allow (RISK_POLICY.md limit 15 and s.5). */
+export function tradeMinimum(poolMinTrade: Lamports, caps: SizingCaps): Lamports {
+  return minimums(poolMinTrade, caps).entry;
+}
+
 export function sizeEntry(input: SizingInput, caps: SizingCaps): SizingResult {
   if (!isStrategyId(input.strategy)) {
     throw new RiskError('unknown strategy');
@@ -114,14 +135,7 @@ export function sizeEntry(input: SizingInput, caps: SizingCaps): SizingResult {
   const sol = lamports(input.sol);
   const reserveAfterBuy = lamports(input.reserveAfterBuy);
   const overhead = lamports(input.rent) + lamports(input.buyAttemptFees); // the new position's spend beyond its size
-  const poolMinimum = lamports(input.minTrade);
-  const floor = lamports(caps.minTradeFloorLamports);
-  if (floor < HARD_MIN_TRADE_FLOOR) {
-    throw new RiskError('the minimum-trade floor cannot be below the 0.01 SOL hard floor');
-  }
-  const configured = lamports(caps.minTradeLamports);
-  const accountMinimum = configured > floor ? configured : floor;
-  const minimum = poolMinimum > accountMinimum ? poolMinimum : accountMinimum;
+  const { account: accountMinimum, entry: minimum } = minimums(input.minTrade, caps);
 
   const exposureUsed = exposure + overhead;
   const exposureCap = bpsOfFloor(equity, caps.exposureBps);

@@ -109,7 +109,11 @@ type ApprovalToken = { readonly [approved]: true; id: string; intentId: string; 
 // issuing spends it via consumeCheckedPlan after the newTokenId callback, so one re-check gives at most one token), the
 // executor only the verifier. verify and redeem never throw; redeem = verify, then TokenStore.consume (only an explicit true
 // counts), so a bad token is never burned, and it returns the frozen plan the executor must build its transaction from.
-// Only risk/ and app/ may import anything in risk/ at runtime (architecture test); everyone else imports types.
+// Only risk/ and app/ may import anything in risk/ at runtime (architecture test); everyone else imports types. app/ may not
+// re-export risk/ values and is reached at runtime only from cli/; pure folders (core, venues, portfolio, risk, strategies,
+// exits) import only pure folders at runtime, so purity holds across imports; there are no symlinks under src/.
+// These rules are a lint: a tripwire for mistakes, not a sandbox against a hostile file. What holds against hostile code
+// is review, the issuer/verifier split, the signer's own policy, and (later) running untrusted parts in separate processes.
 type RiskDecision = { approved: false; intentId: string; reasons: string[]; checks: string[] }
   | { approved: true; intentId: string; checks: string[]; token: ApprovalToken };
 // src/risk/plan.ts: validatePlan (a frozen snapshot, each field read once), canonicalPlan, planHash, planMaxSpend.
@@ -184,7 +188,9 @@ const Tunables = z.object({     // versioned DB rows; /set and approved AI propo
 
 Money-path transactions: each is one synchronous SQLite transaction (no `await` between
 `BEGIN IMMEDIATE` and `COMMIT`), so two intents can never both take the last room.
-- **T1 approve** (`risk/approve.ts`): re-read flags, modes, counters and every position in
+- **T1 approve** (the pure decision is `risk/approve.ts`: `approveBuy` and `approveExit`; the
+  transaction that reads the snapshot and writes the effects it returns lives in `app/`, the
+  composition root, because risk/ is pure and may not import storage/ at runtime): re-read flags, modes, counters and every position in
   opening, open, exiting or stuck (open at their mark, opening at `maxSpendLamports`); re-run
   every buy cap (limits 1-8, 11, 13-24) and the fee reserve *after* this buy; insert the
   position (opening), the day's entry count and the token. Partial unique index
@@ -460,7 +466,7 @@ providers, hard caps, the paper model or code.
 
 | Topic | Design |
 |---|---|
-| Containers | `bot`, plus `signer` in Phase 8, separate images; no container mounts the Docker socket. Node 26.13.0 base pinned by digest (UNVERIFIED), separate numeric non-root uids, `cap_drop: [ALL]`, `no-new-privileges`, pids limit 256, read-only root fs, tmpfs /tmp, memory 700 MB, `--max-old-space-size=400`, `--disallow-code-generation-from-strings` (eval and `new Function` throw; the tests run with it too), core dumps off (`ulimits core 0`), no `--heapsnapshot-signal` or `--report` (start-up refuses them), `restart: unless-stopped`, no published ports; signer logging driver `none` |
+| Containers | `bot`, plus `signer` in Phase 8, separate images; no container mounts the Docker socket. Node 26.13.0 base pinned by digest (UNVERIFIED), separate numeric non-root uids, `cap_drop: [ALL]`, `no-new-privileges`, pids limit 256, read-only root fs, tmpfs /tmp, memory 700 MB, `--max-old-space-size=400`, `--disallow-code-generation-from-strings` (eval and `new Function` throw; the tests run with it too) and `--frozen-intrinsics` (the built-ins cannot be patched; the tests run with it too, and start-up checks that `Object.isFrozen(Array.prototype)` before anything else runs, so the bot never runs with other flags than the ones the tests relied on), core dumps off (`ulimits core 0`), no `--heapsnapshot-signal` or `--report` (start-up refuses them), `restart: unless-stopped`, no published ports; signer logging driver `none` |
 | Files on the server | checkout `/opt/fomo-bot` holds code only; `/etc/fomo-bot/` server file and bot secrets (Compose `secrets` file mounts, 0400, bot uid); `/srv/fomo-signer/` key, policy, counters; volume `/data` (db, logs, backups, run lock) |
 | Image build | multi-stage Dockerfile: `npm ci --ignore-scripts` plus the lockfile checks of TEST_PLAN s.11; tests, typecheck and lint in a throwaway stage with `RUN --network=none`; runtime stage `npm ci --omit=dev --ignore-scripts` and `src/`. Allowlist `.dockerignore`: `*`, then `!src/`, `!tests/`, `!package*.json`, `!.npmrc`, `!tsconfig.json` |
 | Health, heartbeat | Docker healthcheck `node src/ops/healthcheck.ts` (`data/run/heartbeat.json` older than 60 s = unhealthy); Healthchecks.io ping each minute while exits can be managed, `/fail` with reason after a breaker is open 10 min; 5 min grace, email and Telegram channels; second check `fomo-notice` for live loosenings |
