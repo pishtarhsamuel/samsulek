@@ -20,7 +20,8 @@ export const GATED: readonly RegExp[] = [
   /^src\/venues\//,
   /^src\/portfolio\//,
   /^src\/risk\//,
-  /^src\/config\/caps\.ts$/,
+  // the hard limits and the rules for changing the tunables: money code like risk/
+  /^src\/config\//,
 ];
 export const GATED_PERCENT = 90;
 export const OTHER_PERCENT = 80;

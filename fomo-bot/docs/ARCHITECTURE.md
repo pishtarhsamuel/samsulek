@@ -26,7 +26,7 @@ enums, namespaces or parameter properties); `tsc --noEmit` type-checks; no build
 | Folder | Responsibility | May import |
 |---|---|---|
 | core/ | branded bigint units, checked integer math (caps round down, costs round up), ids, clock (UTC + Athens day), Result, redactor | nothing |
-| config/ | zod schemas, `HARD_CAPS`, `TUNABLE_BOUNDS`, `LIVE_CAPS`, layered loading, versioned tunables (no modes), /set and AI bounds | core, storage |
+| config/ | `caps.ts` (`HARD_CAPS`, `TUNABLE_BOUNDS`, `LIVE_CAPS`); `tunables.ts` (the tunables: rules, defaults, strict checks, stored form; no modes); `changes.ts` (/set, AI proposals and approval, /rollback, versions, the 24 h live loosenings: pure plans); the server-file schema and layered loading later | core, storage |
 | storage/ | `sqlite.ts` (only importer of `node:sqlite`), migrations, repositories, backup | core |
 | chain/ | ProviderClient (JSON-RPC over fetch, WebSocket), BudgetGovernor, v1-only reads, block height, clock drift | core, config |
 | venues/ | pump curve, PumpSwap, Raydium CPMM: decoders hand-written from the official IDLs, fee-config readers, exact quote math rounded in the venue's favour, PDAs; Phase 8 instruction builders | core |
@@ -185,10 +185,14 @@ const ServerFile = z.object({   // /config/fomo-bot.json from /etc/fomo-bot (rea
   providers: z.array(ProviderSpec).min(1), paperStartingLamports: LamportsString,
   withdrawAddress: AddressStr.optional(), probePayer: AddressStr.optional(), // public keys only: rejects 64-byte keys, arrays
   strategyParams: TunedParams.optional(), emergencyTriggers: EmergencyTriggers.optional() }).strict(); // D2: out of git
-const Tunables = z.object({     // versioned DB rows; /set and approved AI proposals create new versions; NO modes here
-  risk: RiskParams, strategies: z.record(StrategyIdEnum, StrategyParams), exits: ExitParams,
-  paper: PaperModelParams,      // floors in HARD_CAPS; may only become more pessimistic; never the AI
-  ai: z.object({ model: z.enum(['claude-haiku-5-5', 'claude-sonnet-5-5']) }) }).strict().superRefine(withinHardCapsAndBounds);
+// Tunables (built in Phase 2 step 5b, config/tunables.ts; checked by hand, no schema package): versioned DB rows;
+// /set, approved AI proposals, /rollback and due pending rows create new versions; NO modes here. Groups risk,
+// crowdflow, momentum, launch, exits, paper, exactly the names of TUNABLE_BOUNDS (anything extra is refused);
+// values in base units, lamports as bigint (stored as decimal text). The paper model: floors in HARD_CAPS, only
+// more pessimistic, never the AI. The AI model choice (s.12 ai.model) joins in Phase 5 with the daily review.
+// ConfigVersion { id, createdAt, author: default | owner | ai-approved | rollback, values, changed, undoTo }:
+// /rollback goes to undoTo, and a rollback's own version takes its target's undoTo (one more /rollback goes
+// one step further back). PendingChange { path, from, to, source, requestedAt, applyAt }: at most one per tunable.
 ```
 
 ## 4. Money path and sequence diagrams
@@ -417,8 +421,16 @@ a 60 s single-use nonce in `callback_data` (under 64 bytes). No copy-trading com
 | /withdraw amount or all | live only: SOL to the address in the server file | yes |
 
 /set, /approve and /rollback never write a mode; changing a live strategy's signal or exit
-parameters demotes it to paper (its gate used the frozen config). Live loosening (an unsafe-
-direction change by /set, /approve or /rollback, compared field by field; /resume) is
+parameters demotes it to paper (its gate used the frozen config; the exit values are shared,
+so changing one demotes every live strategy). Changes are planned by config/changes.ts (pure):
+what waits is a risk or exit value moving any way but the safer one while live trading is
+possible (the server's arm flag, or any strategy live); strategy values apply at once with the
+demotion, exit values demote every live strategy when they apply; nothing makes the paper model
+less pessimistic (/rollback leaves such a value as it is); a new /set or approval of a value
+replaces its pending row, a /rollback replaces them all; the engine contracts are in RISK_POLICY
+s.12 (stored AI proposals approved once, no empty version, cancelled rows deleted in the same
+transaction, the guarded clock, an unbroken stretch of versions). Live
+loosening (an unsafe-direction change by /set, /approve or /rollback, compared field by field; /resume) is
 announced in Telegram and via the separate Healthchecks check
 `fomo-notice` pinged on `/fail` (it emails), and applies after 24 h unless cancelled
 (`fomo apply-pending` at the server applies it at once).

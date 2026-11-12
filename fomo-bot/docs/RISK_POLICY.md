@@ -394,6 +394,47 @@ applies after 24 h with an immediate Telegram and email notice (ARCHITECTURE s.8
 is compared field by field like /set: every field it would move in the unsafe direction waits
 24 h the same way; safer fields apply at once.
 
+How the code applies this (Phase 2 step 5b: `config/tunables.ts`, `config/changes.ts`, pure):
+- "Live" means live trading is possible: the server's arm flag is set or any strategy is live.
+  Then a risk value or a shared exit value (open live positions follow the exit values) moving
+  any way but the safer one waits 24 h; everything else applies at once. A strategy's signal
+  values apply at once and demote that strategy if it is live; an exit value, when it applies,
+  demotes every live strategy; the paper model demotes none. Each of these restarts the go-live
+  count of the strategies it touches (the paper model: all of them).
+- No command makes the paper model less pessimistic: /set refuses it, and /rollback leaves such a
+  value as it is and says so (a rollback that would do nothing else is refused).
+- A stored pending change must wait at least 24 h from when it was asked for, and cannot have been
+  asked for in the future; otherwise the change, and the command, are refused (fail closed).
+- The safer way, per value: lower for every cap, share, slippage, stop, the landing spend and the
+  curve limit; higher for the token age, the buyer, completeness, age, liquidity and holder
+  minimums, and the paper model (more pessimistic). The values the AI may move either way have no
+  safer way, except the landing spend (a risk value: lower is safer, so in live a higher one
+  waits like any risk value); the others are strategy values (in live: the demotion) or exit
+  values (in live: any move waits 24 h). "Lower is safer" for the sell slippage and the landing
+  spend means a lower value makes a normal exit fail more often; the floors (1% sell slippage,
+  0.05% landing) and the separate protective and emergency caps (10%, absolute fee caps only,
+  s.9) keep exits possible.
+- The AI: at most a quarter of the current value, compared exactly (|change| x 4 <= current, so
+  nothing moves from 0); once in 7 days per value, counting approved AI versions and AI changes
+  still pending; the first 3 proposals of a review are considered, one per value; a proposal must
+  quote the value the bot runs with; the approval checks every rule again at approval time. The
+  token age and curve limits are not marked for the AI (only /set changes them).
+- A new /set or AI approval of a value replaces that value's pending change (setting the current
+  value cancels a waiting loosening); /rollback replaces every pending change. A due change whose
+  value was changed meanwhile, or which falls outside the bounds now, is dropped and the owner told.
+- Every set of values has exactly the tunables (no mode, hard cap or address can ride along), each
+  inside its bounds; every change that applies makes a version; /rollback goes back one version
+  per use and, once its pending changes apply, restores the earlier values exactly, except the
+  paper-model values it leaves as they are (invariant 11).
+- Engine contracts (REVIEWS.md M): the arm flag is the server's, never anything Telegram can
+  change; the engine approves only an AI proposal it stored from a review, each at most once; a
+  /rollback whose fields all wait makes no version now, only the pending rows; the cancelled
+  pending rows are deleted in the same transaction as the new version; pending rows fall due by
+  the guarded clock (s.4 contract 8); stored versions are passed as one unbroken stretch ending
+  at the active version; before Phase 8, `arm-live` lists every value loosened in the last 24 h.
+  Phase 4: crowdflow keeps its 10-minute minimum token age (limit 22) as a fixed strategy rule
+  with a test, because the shared `risk.tokenAgeMs` defaults to the 3-minute floor.
+
 | Parameter | /set bound | AI |
 |---|---|---|
 | risk: tradePct [1%, 10%], openPositions [1, 4], exposurePct [10%, 50%], entriesPerDay [1, 12], costRule [2%, 5%], poolShare [0.1%, 0.5%], priceCrossCheck [1%, 5%] | as listed | lower only |
@@ -456,7 +497,8 @@ zero at 1x and 2x costs (P). The change demotes the strategy and restarts its ga
 9. The cost estimate at 2x >= at 1x; the 2x shadow PnL <= the 1x PnL for every trade.
 10. Rent is refunded only after a 100% sell plus close.
 11. Every effective config value is within HARD_CAPS and its bounds; every TUNABLE_BOUNDS max
-    <= its H; each accepted change creates a version; rollback restores the previous exactly.
+    <= its H; each accepted change creates a version; rollback restores the previous exactly,
+    except paper-model values it would make less pessimistic, which stay (s.12).
 12. The signer signs nothing outside its policy (THREAT_MODEL s.5): SOL leaves only to the
     own wSOL ATA (closed in the same transaction), an allowlisted tip <= 5,000 lamports, or
     the pinned withdraw address; its caps hold under any request sequence.

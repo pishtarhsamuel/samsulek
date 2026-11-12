@@ -46,7 +46,10 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    modes only in the flags table. Done in step 5a: the tables' values, bounds and freezing;
    every risk check given a config far above the hard values (and live caps, and a live entry
    without today's EUR caps) decides exactly as under the hard values, in unit tests and in the
-   sizing, entry-block and approval properties, with planted bugs for each clamp.
+   sizing, entry-block and approval properties, with planted bugs for each clamp. Done in step
+   5b: the tunables (each rule pinned to s.12, strict checks, the stored form), /set, AI review
+   and approval, /rollback, versions and the 24 h live loosening, at every boundary; properties
+   over random command sequences for invariants 11, 15 and 24; planted bugs for each rule.
 6. `storage/`: migrations, WAL, TEXT amounts, partial unique indexes, crash during write,
    quick_check failure.
 

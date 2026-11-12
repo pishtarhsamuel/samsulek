@@ -56,13 +56,23 @@ can trade, and no key or account exists anywhere.
   case, whatever the sizing says (the 0.07 SOL ceiling is new, a margin above the 0.0617 SOL
   of limit 2; it loosens nothing); and sizing always assumes the highest allowed fees, never
   the fees an order plan claims it will pay.
+- Step 5b, the settings you can change (/set) and the AI's suggestions: 36 settings, each with
+  its allowed range, which direction is safer, and what the AI may do with it. While live
+  trading is possible, a risk or exit setting made riskier waits 24 hours (you can cancel it);
+  a strategy's own settings apply at once but put that strategy back on paper if it is live.
+  The AI may change a setting by at most a quarter, once a week, at most 3 suggestions per
+  review, and never the paper-trading model, which nothing can make less pessimistic. Every
+  change is a saved version, and /rollback goes back one version (riskier values again wait
+  24 hours in live). Nothing here can switch a strategy to live. Both Opus reviewers approved
+  with notes (REVIEWS.md M); everything they found is fixed (exit settings now wait too, undo
+  can no longer soften the paper model, stored records are checked strictly).
 - For you to know before live: at 5% per trade, live trading needs at least 0.4 SOL in the
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: step 5b (the settings themselves: their bounds, which changes count as riskier,
-  versions and undo), then storage (the database, where the approval step's effects are
-  written in one transaction); then chain clients, the paper engine, Telegram and logging.
+- Next: storage (the database, where the approval step's effects, the setting versions and
+  the waiting changes are written in one transaction); then chain clients, the paper engine,
+  Telegram and logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
