@@ -49,6 +49,18 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
 
 /** Runtime third-party imports per folder. Empty until a package is approved in REVIEWS.md. */
 const PACKAGES: Readonly<Record<string, readonly string[]>> = {};
+
+/**
+ * Folders whose files only some folders may import at runtime (types are always fine). risk/ holds
+ * the means to mint approval tokens: only risk/ itself and the composition root may use it at
+ * runtime, so the executor is handed a verifier and can never make a token ("the constructor is
+ * not exported from risk/", ARCHITECTURE.md s.3). The whole folder is restricted, not one file, so
+ * a re-export cannot launder the issuer through another risk/ file. Folder names are compared in
+ * lower case: Windows and macOS file systems ignore case.
+ */
+const RUNTIME_ONLY_FROM: Readonly<Record<string, readonly string[]>> = {
+  risk: ['risk', 'app'],
+};
 const CLOCK_FILES = new Set(['core/clock.ts', 'core/rng.ts']);
 const RNG_FILE = 'core/rng.ts';
 
@@ -197,6 +209,10 @@ function formatsNow(args: ts.NodeArray<ts.Expression>): boolean {
 }
 
 const FORMATTERS = new Set(['format', 'formatToParts']);
+/** Host objects whose members can reach the clock, randomness or code generation. */
+const HOST_OBJECTS = new Set(['process', 'globalThis', 'global']);
+/** Members of those objects that read a clock (process.hrtime and process.uptime) or are clock globals. */
+const HOST_CLOCK_MEMBERS = new Set(['hrtime', 'uptime', ...CLOCK_GLOBALS]);
 
 /** Why this use of Date, Math, Temporal or performance can read the clock or randomness, or null. */
 function clockProblem(node: ts.Identifier): string | null {
@@ -255,6 +271,10 @@ export function checkSource(rel: string, text: string): string[] {
         problems.push(`${rel}: pure code may import ${target} only as types (time and randomness are passed in)`);
       }
       const targetFolder = target.split('/')[0] ?? '';
+      const onlyFrom = RUNTIME_ONLY_FROM[targetFolder.toLowerCase()];
+      if (onlyFrom !== undefined && !typeOnly && !onlyFrom.includes(folder.toLowerCase())) {
+        problems.push(`${rel}: ${target} may be imported at runtime only from ${onlyFrom.join(' and ')} (types are fine)`);
+      }
       if (typeOnly || targetFolder === folder || allowed.includes('*') || allowed.includes(targetFolder)) {
         return;
       }
@@ -311,19 +331,59 @@ export function checkSource(rel: string, text: string): string[] {
         }
       } else if (ts.isIdentifier(node.expression) && node.expression.text === 'require') {
         problems.push(`${rel}: require() is not allowed`);
-      } else if (!CLOCK_FILES.has(rel) && ts.isPropertyAccessExpression(node.expression)) {
-        const callee = node.expression;
-        const direct = FORMATTERS.has(callee.name.text) && formatsNow(node.arguments);
-        const indirect =
-          ts.isPropertyAccessExpression(callee.expression) &&
-          FORMATTERS.has(callee.expression.name.text) &&
-          ['call', 'apply', 'bind'].includes(callee.name.text);
-        if (direct || indirect) {
-          problems.push(`${rel}: a format() without a plain value formats the current time`);
-        }
       }
     } else if (ts.isIdentifier(node) && node.text === 'createRequire') {
       problems.push(`${rel}: createRequire is not allowed`);
+    }
+    if (!CLOCK_FILES.has(rel)) {
+      // Every reference to a date formatter's format must be a direct call with a real value:
+      // a bare reference, an alias, destructuring, .call/.apply/.bind or format() formats "now".
+      const formatter =
+        (ts.isPropertyAccessExpression(node) && FORMATTERS.has(node.name.text)) ||
+        (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression) && FORMATTERS.has(node.argumentExpression.text));
+      if (formatter) {
+        const call = node.parent;
+        if (!(ts.isCallExpression(call) && call.expression === node && !formatsNow(call.arguments))) {
+          problems.push(`${rel}: format must be called directly with a value (anything else can format the current time)`);
+        }
+      }
+      if (ts.isBindingElement(node)) {
+        const key = node.propertyName ?? node.name;
+        if ((ts.isIdentifier(key) || ts.isStringLiteralLike(key)) && FORMATTERS.has(key.text)) {
+          problems.push(`${rel}: do not destructure format (it could format the current time)`);
+        }
+      }
+      // Destructuring the host objects: named members only, none that reads the clock or randomness.
+      if (
+        ts.isVariableDeclaration(node) &&
+        ts.isObjectBindingPattern(node.name) &&
+        node.initializer !== undefined &&
+        ts.isIdentifier(node.initializer) &&
+        HOST_OBJECTS.has(node.initializer.text)
+      ) {
+        for (const element of node.name.elements) {
+          const key = element.propertyName ?? element.name;
+          const plainName = ts.isIdentifier(key) || ts.isStringLiteralLike(key);
+          if (element.dotDotDotToken !== undefined || !plainName || HOST_CLOCK_MEMBERS.has(key.text)) {
+            problems.push(`${rel}: do not destructure ${node.initializer.text} with a rest, a computed key or a clock member`);
+          }
+        }
+      }
+    }
+    if (
+      (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+      node.moduleSpecifier !== undefined &&
+      ts.isStringLiteral(node.moduleSpecifier) &&
+      (node.moduleSpecifier.text === 'node:process' || node.moduleSpecifier.text === 'process') &&
+      !CLOCK_FILES.has(rel)
+    ) {
+      const bindings = ts.isImportDeclaration(node) ? node.importClause?.namedBindings : node.exportClause;
+      const names = bindings !== undefined && (ts.isNamedImports(bindings) || ts.isNamedExports(bindings)) ? bindings.elements : [];
+      for (const element of names) {
+        if (HOST_CLOCK_MEMBERS.has((element.propertyName ?? element.name).text)) {
+          problems.push(`${rel}: ${(element.propertyName ?? element.name).text} from node:process reads the clock outside core/clock.ts`);
+        }
+      }
     }
     if ((ts.isIdentifier(node) || ts.isStringLiteralLike(node)) && node.text === 'getBuiltinModule') {
       problems.push(`${rel}: process.getBuiltinModule is a hidden require and is not allowed`);
@@ -361,8 +421,8 @@ export function checkSource(rel: string, text: string): string[] {
       if (hostObject && member === null) {
         problems.push(`${rel}: computed access on ${owner} can reach the clock or randomness`);
       }
-      if (owner === 'process' && member === 'hrtime') {
-        problems.push(`${rel}: process.hrtime reads the clock outside core/clock.ts`);
+      if (owner === 'process' && member !== null && HOST_CLOCK_MEMBERS.has(member)) {
+        problems.push(`${rel}: process.${member} reads the clock outside core/clock.ts`);
       }
       if ((owner === 'globalThis' || owner === 'global') && member !== null && CLOCK_GLOBALS.has(member)) {
         problems.push(`${rel}: ${owner}.${member} outside core/clock.ts and core/rng.ts`);
@@ -401,6 +461,60 @@ describe('architecture: imports and determinism', () => {
     assert.ok(files.length > 0, 'found the source files');
     const problems = files.flatMap((rel) => checkSource(rel, readFileSync(path.join(SRC, rel), 'utf8')));
     assert.deepEqual(problems, []);
+  });
+
+  it('CANARY: only risk/ and app/ may import anything in risk/ at runtime (so the token issuer cannot be laundered); everyone else gets types', () => {
+    flagged([
+      ['execution/x.ts', "import { createApprovalAuthority } from '../risk/approval.ts';"],
+      ['execution/x.ts', "export { createApprovalAuthority } from '../risk/approval.ts';"],
+      ['execution/x.ts', "const m = await import('../risk/approval.ts');"],
+      ['execution/x.ts', "import { exitProblems } from '../risk/exits.ts';"], // any risk/ file, not only the issuer
+      ['execution/x.ts', "import { x } from '../Risk/approval.ts';"], // Windows and macOS ignore case
+      ['cli/x.ts', "import { createApprovalAuthority } from '../risk/approval.ts';"],
+      ['signer/x.ts', "import { createApprovalAuthority } from '../risk/approval.ts';"],
+    ]);
+    for (const [rel, text] of [
+      ['execution/x.ts', "import type { ApprovalToken, ApprovalVerifier } from '../risk/approval.ts';"],
+      ['execution/x.ts', "import { type TokenStore } from '../risk/approval.ts';"],
+      ['execution/x.ts', "import type { ExitPlan } from '../risk/exits.ts';"],
+      ['app/x.ts', "import { createApprovalAuthority } from '../risk/approval.ts';"],
+      ['app/x.ts', "import { exitProblems } from '../risk/exits.ts';"],
+      ['risk/x.ts', "import { createApprovalAuthority } from './approval.ts';"],
+      ['risk/x.ts', "import { exitProblems } from './exits.ts';"],
+    ] as const) {
+      const problems = checkSource(rel, text).filter((p) => p.includes('imported at runtime only'));
+      // `import { type X }` is not type-only (the import statement survives), so it is flagged on
+      // purpose; plain `import type` and the allowed folders pass.
+      assert.equal(problems.length, rel === 'execution/x.ts' && text.includes('{ type') ? 1 : 0, `${rel}: ${text}`);
+    }
+  });
+
+  it('CANARY: no way to format "now", and no clock member smuggled out of process or globalThis', () => {
+    const formatter = "const d = new Intl.DateTimeFormat('en'); ";
+    flagged([
+      ['execution/x.ts', `${formatter}const f = d.format; f();`],
+      ['execution/x.ts', `${formatter}d['format']();`],
+      ['execution/x.ts', `${formatter}const { format } = d;`],
+      ['execution/x.ts', `${formatter}[undefined].map(d.format);`],
+      ['execution/x.ts', `${formatter}d.format.call(d);`],
+      ['execution/x.ts', `${formatter}d.formatToParts();`],
+      ['execution/x.ts', 'const { hrtime } = process;'],
+      ['execution/x.ts', 'const { uptime: up } = process;'],
+      ['execution/x.ts', 'const { ...rest } = process;'],
+      ['execution/x.ts', "const k = 'hr'; const { [`${k}time`]: h } = process;"],
+      ['execution/x.ts', 'const { Date: D } = globalThis;'],
+      ['execution/x.ts', 'const t = process.uptime();'],
+      ['execution/x.ts', "import { hrtime } from 'node:process';"],
+      ['execution/x.ts', "import { uptime as up } from 'node:process';"],
+    ]);
+    for (const [rel, text] of [
+      ['execution/x.ts', "const s = new Intl.NumberFormat('en').format(5);"],
+      ['execution/x.ts', "const d = new Intl.DateTimeFormat('en'); const s = d.format(new Date(0));"],
+      ['execution/x.ts', 'const { env, argv } = process; const home = env;'],
+      ['execution/x.ts', "import { env } from 'node:process';"],
+    ] as const) {
+      assert.deepEqual(checkSource(rel, text), [], `should allow ${rel}: ${text}`);
+    }
   });
 
   it('CANARY: catches forbidden edges, packages, require and dynamic imports', () => {

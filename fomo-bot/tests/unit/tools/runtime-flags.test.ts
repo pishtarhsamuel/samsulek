@@ -14,4 +14,16 @@ describe('runtime flags', () => {
     const indirectEval = eval;
     assert.throws(() => indirectEval('1 + 1'), EvalError);
   });
+
+  it('CANARY: built-in prototypes are frozen, so code cannot patch Array, Object or JSON (--frozen-intrinsics)', () => {
+    assert.equal(Object.isFrozen(Array.prototype), true);
+    assert.equal(Object.isFrozen(Object.prototype), true);
+    assert.equal(Object.isFrozen(JSON), true);
+    assert.throws(() => {
+      (Array.prototype as unknown as { every: unknown }).every = () => true;
+    }, TypeError);
+    assert.throws(() => {
+      (JSON as unknown as { stringify: unknown }).stringify = () => '';
+    }, TypeError);
+  });
 });

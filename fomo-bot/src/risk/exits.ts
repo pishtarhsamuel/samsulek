@@ -111,7 +111,7 @@ function slot(what: string, value: unknown): bigint {
 }
 
 /** The caps, read once: fresh slots 1-25; 1% <= normal <= 5%; normal <= emergency <= 10%. */
-function checkCaps(capsInput: ExitCaps): { fresh: bigint; normal: Bps; emergency: Bps } {
+export function checkExitCaps(capsInput: ExitCaps): { fresh: bigint; normal: Bps; emergency: Bps } {
   const { planFreshSlots, normalSlippageBps, emergencySlippageBps } = object('caps', capsInput);
   if (
     typeof planFreshSlots !== 'number' ||
@@ -148,7 +148,7 @@ export function exitProblems(planInput: ExitPlan, contextInput: ExitContext): re
   if (!URGENCIES.includes(urgency)) {
     throw new RiskError('unknown exit urgency');
   }
-  const caps = checkCaps(context.caps);
+  const caps = checkExitCaps(context.caps);
   const inAmount = tokenUnits(plan.inAmount);
   const slippage = bps(plan.slippageBps);
   const ledger = tokenUnits(context.ledgerTokens);
