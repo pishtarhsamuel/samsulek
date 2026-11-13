@@ -1,9 +1,10 @@
 # Phase 2 step 6 design: storage layer and composition-root transactions
 
-Status: PROPOSED by the architect (2026-11-12), not yet reviewed; built in sub-steps 6a-6e
-(section 7), each reviewed by risk-guardian and security-auditor before its commit. The owner
-decisions in section 8 are open. Where this file and ARCHITECTURE.md differ, ARCHITECTURE.md
-wins until a sub-step's review moves the change there.
+Status: PROPOSED by the architect (2026-11-12); built in sub-steps 6a-6e (section 7), each
+reviewed by risk-guardian and security-auditor before its commit. 6a is done (REVIEWS.md N).
+The owner accepted the four decisions of section 8 on 2026-11-13 (DECISIONS.md D5). Where this
+file and ARCHITECTURE.md differ, ARCHITECTURE.md wins until a sub-step's review moves the
+change there.
 
 The design rests only on facts in docs/VERIFIED_FACTS.md (node:sqlite rows) and docs/research/phase0-toolchain.md F5-F10. Items marked UNVERIFIED are listed in section 9 for a scratch test.
 
