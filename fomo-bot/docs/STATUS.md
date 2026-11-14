@@ -93,12 +93,34 @@ can trade, and no key or account exists anywhere.
   they asked for are done, and both then approved, with notes for the next parts (the tables
   in 6c, the start-up checks in 6d). 700 tests pass; 101 of 102 planted bugs are caught (the
   one left is the disk sync of a backup copy, which only a power cut could show).
+- Part 6c-1, the database tables, is built (tests first): 17 tables for settings, flags and
+  halts, strategy modes, the day state, the book, positions, the order path and an audit log.
+  The database itself refuses what must never happen, under the code's own checks: a second
+  position in one token, a fifth position, a second buy for a position, two sells at once, an
+  approval used twice or after it expired, an order without its approval, a strategy going live
+  except through /golive, more than 12 entries a day. KILL and a halt can be lifted only right
+  after your own audited command; per your decision D4, the live halts only at the server.
+  Nothing that looks like a key, a seed phrase, a bot token or a web address can be written. I
+  found and closed a gap in the design: a halt could have been deleted when no audit record
+  existed at all. Both Opus reviewers first blocked it (REVIEWS.md P). They found ways to lift a
+  halt or KILL without you (rename or backdate a halt, rewrite the KILL time, or forge an audit
+  record with a chosen number or the wrong sender). They also found a way to hide a settings
+  change inside a database upgrade script. All of it is fixed and tested. Halts and KILL now
+  keep their name and time; audit records must come in order and say who wrote them; an
+  approval must match its own approved decision and position. The re-check found one more:
+  had the server clock ever jumped ahead, the database would have refused a KILL afterwards.
+  Now KILL and halts follow the audit records' numbers instead of the clock, and no clock
+  jump can block a safety write. 798 tests pass. 159 of 161 planted bugs are caught; the two
+  left are harmless by design, because another rule already does what they remove. After the
+  fixes both Opus reviewers approved, with notes for the next parts (REVIEWS.md P; the list is
+  in STORAGE_DESIGN.md s.12.1).
 - For you to know before live: at 5% per trade, live trading needs at least 0.4 SOL in the
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: the rest of step 6 (6c the tables, 6d the approval transaction, 6e settings and
-  day-state transactions); then chain clients, the paper engine, Telegram and logging.
+- Next: the rest of step 6 (6c-2 the code that reads and writes the tables, 6d the approval
+  transaction, 6e settings and day-state transactions); then chain clients, the paper engine,
+  Telegram and logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;

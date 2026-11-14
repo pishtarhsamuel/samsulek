@@ -3,6 +3,8 @@
 Status: PROPOSED by the architect (2026-11-12); built in sub-steps 6a-6e (section 7), each
 reviewed by risk-guardian and security-auditor before its commit. 6a is done (REVIEWS.md N);
 6b is built (REVIEWS.md O), with the differences from sections 1.1-1.3 listed in section 11.
+6c is built in two parts: 6c-1, the schema with the secret filter and the JSON codec (REVIEWS.md
+P, differences from section 2 in section 12), then 6c-2, the repositories.
 The owner accepted the four decisions of section 8 on 2026-11-13 (DECISIONS.md D5). Where this
 file and ARCHITECTURE.md differ, ARCHITECTURE.md wins until a sub-step's review moves the
 change there.
@@ -699,10 +701,16 @@ function writeChangePlan(tx: Tx, active: ConfigVersion, p: ChangePlan, source: C
   for (const row of p.pending) repoConfig.insertPending(tx, row);
   repoFlags.demote(tx, p.demote, now);     // live -> paper, changed_by 'auto-demote'
   repoFlags.restartGate(tx, p.restartGate, now);
-  repoAudit.append(tx, { action: `config:${source}`, detail: { applied, pending, cancelled, kept, demote } });
+  repoAudit.append(tx, { action: CONFIG_AUDIT_ACTION[source], detail: { applied, pending, cancelled, kept, demote } });
   return v?.id ?? null;
 }
 ```
+
+The audit action names a prefix that the audit CHECK of migration 1 ties to its actor (review P;
+the first draft wrote `config:${source}`, which the CHECK refuses): the owner's change
+`owner:set`, a rollback `owner:rollback`, the owner's approval of an AI proposal
+`owner:ai-approve`, and a due change the engine applies `engine:apply-due`. They belong to the
+typed union of audit actions (step 6e).
 
 - `rollbackTx` passes `undoTo = result.undoTo`.
 - `applyDueTx` writes one version per step (author = the row's source, chained `active = v`), deletes each applied row and each stale row, applies the demotions and gate restarts, and audits. A ConfigError (a clock that stepped back makes `requestedAt > now`) rolls back and becomes a clock alert with entries off.
@@ -1065,3 +1073,223 @@ Conditions from review O for the next sub-steps (REVIEWS.md O has the details):
   is refused, UNC paths are refused (WAL on a network share can corrupt silently), and on Windows
   the folder stays under the user profile with the OneDrive check.
 - Before any migration 2: the pre-migration copy is checked (quick_check) before migrating.
+
+## 12. Step 6c-1 as built: the schema, the secret filter and the JSON codec
+
+Both reviews of this step (P) first blocked it; everything below is as built after their fixes.
+
+`core/redact.ts` (pure): `secretKinds(text)` and `assertNoSecrets(text, what)` refuse, never mask,
+and never repeat the text. They find:
+
+- runs of 64+ key-like characters (base58, base64, base64url, hex: keys, seeds, signatures,
+  hashes; an address is at most 44);
+- 32 or more bytes: a JSON array of small numbers, quoted or not (a seed, a keypair file, or
+  bigints after `jsonParam`), or hex pairs split by spaces or colons (a Buffer as printed);
+  stricter than the 64 of THREAT_MODEL;
+- PEM headers, and credential words: api key, secret, password, passphrase, private key, mnemonic,
+  seed phrase, authorization, bearer, `token=`, access token, refresh token;
+- the Telegram bot-token shape (an id of 6-12 digits), and `sk-ant-`;
+- URLs: the scheme bounded to 32 characters (an unbounded one was quadratic on long words), the
+  slashes also as JSON writes them (`https:\/\/`), and `://` percent-encoded;
+- twelve or more short lower-case words in a row (a recovery phrase).
+
+Limits, written down: a 32-byte seed in 44 characters of base58 or base64 looks exactly like an
+address, and an API key shaped like a UUID (Helius) looks like a random id. The exact-value list
+of the bot's own secrets (6d) is the defence for both. A seed phrase in capitals, numbered or
+comma-separated waits for the BIP39 word check (Phase 3). Split or escaped secrets are not
+reassembled.
+
+`storage/codec.ts`:
+
+- `jsonParam(v)` walks the value without running its code. It reads property descriptors, never
+  properties, so no getter runs, and it refuses proxies, so no trap runs. It also spends a budget
+  of the characters the text will need, so a huge or self-repeating value stops after a bounded
+  amount of work. It takes plain data only: finite numbers, bigints as decimal text, printable
+  ASCII strings and keys, and plain objects and arrays. Holes, extra or hidden properties,
+  symbols, getters and class instances are refused. At most 16 levels and 8,192 characters, then
+  the secret filter. A `__proto__` key stays a key.
+- `jsonCell(r, col)` reads back only the exact text `jsonParam` writes: it parses the text, runs
+  `jsonParam` again and compares. The `json` fragment still lets some text in: printable ASCII,
+  1-8,192 characters, valid JSON up to 1,000 levels deep. The reader refuses what the writer
+  never produces: spaces, escapes (a NUL, a lone surrogate, a bidi override), `1e400`, `-0` and
+  more than 16 levels. So the property test checks two things:
+  - whatever the reader reads, the column takes;
+  - what `jsonParam` writes, the column takes and the reader returns unchanged.
+  Deep-frozen.
+- `idParam` and `codeParam` also refuse text that looks like a secret, so generated ids stay under
+  64 characters.
+- `u64AtMost(c, bound)` (the 0.07 SOL backstops) and `u64NotAbove(a, b)` (a buy order's input at
+  most its max spend) each have a property test. Every property test also checks its boundary
+  values on every run.
+
+`storage/sqlite.ts`: values above 1 MiB are refused (`limits.length`, read back; SQLITE_TOOBIG maps
+to `bad-param`). Rules for migration scripts:
+
+- Keywords and comments count only outside quoted text, so the value `'rollback'` of a config
+  source is just data.
+- Names in `[brackets]` or backticks are refused. A quote inside one put the quote tracking out of
+  step, and review P hid a PRAGMA that way.
+- `pragma_` is refused anywhere in the raw text. SQLite reads a single-quoted word as a name where
+  a name belongs, so `'pragma_optimize'(65538)` ran ANALYZE.
+- After every script the safety settings are read again. Any change, or a script that ended the
+  transaction, poisons the handle.
+
+`storage/schema-v1.ts` (migration 1), against section 2:
+
+- The version table is the runner's (section 11). The SQL carries no comments, every TEXT primary
+  key is NOT NULL, and every column has a fragment check. IN lists are built only from plain
+  words (asserted).
+- Each optional column belongs to exactly one case:
+  - an intent's strategy and size only for entries;
+  - its sequence, fraction and urgency only for exits;
+  - its confidence never for an exit;
+  - a KILL's time and its source each exactly while KILL is on.
+  The first version used one combined CHECK per case, which let the other case's fields through.
+  The new tests found it.
+- Required rows (`flags`, `strategy_modes`, `ledger_accounts`, `day_state`) are never deleted.
+  Recursive triggers are on, so INSERT OR REPLACE is refused on every table that refuses deletes.
+- These tables are never changed, only inserted into (and deleted from where allowed):
+  - `halt_reasons`: no rename, backdate or upsert;
+  - `pending_changes`: a change is replaced, never edited, so a waiting loosening cannot be made
+    due at once;
+  - `equity_snapshots`: the hour-ago base of the jump test;
+  - the audit log, intents, decisions and config versions.
+- A ledger account keeps its mode, and a position never goes back to opening.
+- Mint and creator bans stay. A cooldown or pause is never shortened; it may be lengthened, and
+  removed once it is over.
+- KILL keeps its time, source and audit link until it is cleared. Setting it again with
+  `coalesce` changes nothing, and an upsert on `flags` runs the same triggers.
+- The audit log:
+  - ids run 1, 2, 3; times are recorded but not ordered;
+  - each row names the hash of the row before it (zeros for the first), and hashes are unique;
+  - the action names its actor: `server:*` only `owner-server`; `owner:*` `owner-telegram` or
+    `owner-server`; `engine:*` only `engine`; `ai:*` only `ai`.
+  The database cannot compute sha256, so 6d checks the chain at start-up.
+- KILL and each halt name the id of the newest audit row when they are set (`kill_audit_id`,
+  `set_audit_id`; a trigger checks it). KILL is cleared, and a halt lifted, only while the newest
+  audit row is the owner's own command with a larger id. Ids, not clock times, give the order.
+  So a clock that jumps forward or back cannot block a KILL, a halt or the owner's command, and
+  an older owner row cannot stand in.
+  - The re-check found that the first fix used times: after one audit row dated in the future,
+    KILL, halts and the owner's own commands were refused (security P-R1).
+  - The check is written as `count(*) = 1`. The design's `(SELECT ...) NOT IN (...)` is NULL when
+    there is no audit row, and a trigger treats NULL as false.
+- No time is compared across rows (audit rows, config versions, a position's close against its
+  open): a safety write must never fail because the clock jumped. Within one row, only a token's
+  use after its issue is checked; a retry gets a new token.
+  - Which command lifts which halt: `server:reset-halt` lifts anything; `owner:resume-peak` only
+    `peak-halt:paper`; `owner:resume-streak` only `daily-stop-twice:paper`. The live halts lift
+    only at the server (decision D4); the 24 h wait of a live `/resume` arrives in Phase 8 with a
+    reviewed migration.
+- A token needs all of these:
+  - an approved decision for its own intent;
+  - the same position, token (mint) and mode as that intent, and a position in that mode;
+  - the right kind: a buy for an entry, a sell or close for an exit;
+  - a position that can take the order: a buy only while it is opening, an exit only while it
+    holds tokens (open, exiting or stuck).
+  It is used only while that still holds, never before it was issued, and only within its slots.
+- An order needs its used token, matching in every field, and a position in its mode that can
+  still take it. A buy's input is at most its max spend.
+- Tests cover:
+  - every table STRICT, with TEXT or INTEGER columns and each amount column carrying its check;
+  - the starting rows (strategies off, D5; the empty day state, all four jump columns);
+  - the copied hard limits and lists, against their sources;
+  - every index, trigger and CHECK at its boundary, plus each review P probe;
+  - the migration text: each RAISE has one quoted message and is ABORT only; every BEGIN and END
+    pairs up in triggers or CASE (with the "END; BEGIN" canary); no NOT IN after a sub-expression;
+  - the sha256 pin.
+- Planted bugs (scratchpad `mut/run17.py`): 161, 159 caught. The two left are equivalent by
+  design: the gate's own actor test can never decide alone, because the audit CHECK already ties
+  those actions to the owner (kept as a second line).
+  - The first run found four test gaps, each now with its own test: an array subclass, and three
+    token rules that another rule always refused first (the intent's mode, its position, its
+    kind).
+  - The list includes each wrong audit link (any, older, future) and each dropped time rule put
+    back (each blocks a write after a clock fault, and a test notices).
+
+### 12.1 Conditions for the next steps (reviews P)
+
+For 6c-2 (the repositories and the constant-SQL rule):
+
+- The rule that SQL text never changes covers `get`, `all`, `run` and `script`, and only
+  `migrations.ts` may call `script`.
+- `setAuthorizer` refuses PRAGMA (except the wrapper's own reads), ATTACH, DETACH, transaction
+  statements and SAVEPOINT. The security reviewer checked on 26.13 that it refuses
+  `PRAGMA ignore_check_constraints` and `'pragma_optimize'`.
+- No `OR REPLACE` or `OR IGNORE` anywhere, enforced by an architecture rule.
+  - The halt insert uses `ON CONFLICT (reason) DO NOTHING`. `INSERT OR IGNORE` also drops a row that
+    fails a CHECK without a word, so a halt could vanish (VERIFIED_FACTS, 2026-11-14).
+  - Every write checks how many rows it changed.
+- A 'stuck' row throws until `portfolio/ledger.ts` gains 'stuck' and its moves; it is never mapped
+  silently.
+- JSON:
+  - every `*_json` column is bound only through `jsonParam`, and with objects
+    (`jsonParam(encodeTunables(x))` would store a JSON string literal);
+  - no `e.message`, signature or hash goes into JSON; those live in typed columns;
+  - a test shows that the largest buy, sell and close plans pass `jsonParam`;
+  - a filter refusal on the exit path alerts as a bug;
+  - no raw arrays of 32 or more small numbers (bps lists).
+- Ids and fixed values:
+  - generated ids stay at most 63 characters (the filter refuses 64), tested on the longest one;
+  - hex64 values (`plan_hash`, `prev_hash`, `hash`) are computed inside the repositories, because
+    they skip the filter;
+  - `pending_changes.path` comes only from the TunablePath list.
+- Audit writers:
+  - audit actions are a typed union;
+  - `server:*` rows come only from the owner's terminal commands, and `owner:*` rows only after
+    the Telegram owner check;
+  - the engine cannot import those writers (architecture test).
+- Audit links:
+  - KILL and a halt name the newest audit id in the same statement
+    (`(SELECT coalesce(max(id), 0) FROM audit_log)`);
+  - setting KILL and setting a halt each also add their own audit row in the same transaction;
+  - the owner's audit row is the last audit row before the clear or the deletes.
+- In the same transaction, the streak resume also resets `day_state.streak_halt`, and the peak
+  resume rebases the peak.
+- The database cannot see the clock, so these stay code rules (risk re-check, note 1):
+  - a cooldown is deleted only once `until <= now` (a repository test);
+  - snapshot pruning removes only rows older than an hour.
+  The ban on OR REPLACE covers both.
+- The config audit actions use names the audit CHECK takes (`owner:set`, `owner:rollback`,
+  `owner:ai-approve`, `engine:apply-due`; s.3.4).
+
+For 6d and 6e:
+
+- The audit hash chain is checked at start-up.
+- A deliberate test for the branch of `setUp` where `chmodSync` fails (`sqlite.ts:701-702`, step
+  6b). Today a race in another test reaches it only sometimes: 99.22% of the file's lines in one
+  run, 99.48% in the next. Root in the container cannot make chmod fail, so it needs a non-root
+  user or an injected file system.
+- The ledger rows and config version 1 come only from the owner's setup, and a normal start refuses
+  to run when they are missing.
+- Snapshot pruning keeps at least an hour.
+- The exact-value list of the bot's own secrets (the HMAC key, the bot token, the RPC key, the
+  Anthropic key) is registered at boot in hex, base64, base64url and base58.
+- Token ids are random and independent of the MAC; the MAC and the HMAC key are never stored.
+- T1 blocks on any halt row of either mode (D5.4) and on KILL, never on `day_state` flags alone. A
+  constraint hit that "cannot fire if the parts agree" also alerts as a bug.
+- If a KILL or halt write still fails:
+  - the in-memory entry latch holds;
+  - the sentinel KILL file still stops orders;
+  - the owner is alerted outside the database;
+  - the KILL command exits the bot even if its write failed.
+- A clock behind the newest audit row raises an alert (a clock fault), and never blocks a write.
+  After an extreme clock fault the owner is not locked out, because ids decide. This is tested
+  with an audit row at the largest timestamp the schema takes (risk re-check, note 4).
+- The code is the gate for times now (risk second re-check, note 1). The schema drops these time
+  rules on purpose, so a frozen migration never adds a second blocker:
+  - `config/changes.ts` `nextVersion` refuses a version older than the active one, and
+    `checkHistory` refuses a history out of order. So during a clock fault the owner's
+    tightening is still refused by the code. 6e decides how a tightening gets through, for
+    example `created_at = max(now, active.createdAt)`.
+  - `portfolio/ledger.ts` `eventTime` refuses an event dated before the position opened.
+- 6e sets one order for writing a halt and its own audit row, with a test. Either order is safe,
+  because both still need a later owner row (risk second re-check, note 2).
+
+For T3: settlement must not throw when the clock steps back. It books at max(now, opened_at) or
+at chain time, so an exit that landed on chain is always booked.
+
+For T3: a settlement record unique per order, so a replayed event cannot book twice.
+
+For Phase 3: the BIP39 word check (any case, any separator), and an input cap on `assertNoSecrets`
+(for example 64 KiB) before it guards a log line, a Telegram message or an AI prompt.

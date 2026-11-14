@@ -100,6 +100,7 @@ const PRIMARY: Readonly<Record<number, StorageErrorCode>> = {
   13: 'full',
   14: 'io', // SQLITE_CANTOPEN
   19: 'constraint',
+  18: 'bad-param', // SQLITE_TOOBIG: a value above the size limit
   26: 'not-a-database',
 };
 
@@ -205,12 +206,40 @@ const PRAGMA_FUNCTION = /pragma_/i;
  * between BEGIN and its semicolon hid the BEGIN; review O). Notes belong in the TypeScript around it.
  */
 const SCRIPT_FORBIDDEN =
-  /\b(?:COMMIT|ROLLBACK|SAVEPOINT|RELEASE|PRAGMA|ATTACH|DETACH|VACUUM)\b|pragma_|\bBEGIN\s*(?:;|$|(?:TRANSACTION|DEFERRED|IMMEDIATE|EXCLUSIVE)\b)|\bEND\s+TRANSACTION\b|--|\/\*/i;
+  /\b(?:COMMIT|ROLLBACK|SAVEPOINT|RELEASE|PRAGMA|ATTACH|DETACH|VACUUM)\b|\bBEGIN\s*(?:;|$|(?:TRANSACTION|DEFERRED|IMMEDIATE|EXCLUSIVE)\b)|\bEND\s+TRANSACTION\b|--|\/\*/i;
 
+/** The text with the inside of the chosen kinds of quotes blanked; both kinds are tracked, so neither hides in the other. */
+function blankQuoted(text: string, blank: ReadonlySet<string>): string {
+  let out = '';
+  let quote = '';
+  for (const ch of text) {
+    if (quote === '') {
+      quote = ch === "'" || ch === '"' ? ch : '';
+      out += ch;
+    } else if (ch === quote) {
+      quote = ''; // a doubled quote closes and reopens: still inside
+      out += ch;
+    } else {
+      out += blank.has(quote) ? ' ' : ch;
+    }
+  }
+  return out;
+}
+
+const BOTH_QUOTES: ReadonlySet<string> = new Set(["'", '"']);
+
+/**
+ * Keywords and comments count only outside quotes (the value 'rollback' of a config source is
+ * data). Names in [brackets] or `backticks` are refused: a quote inside one would put the quote
+ * tracking out of step with SQLite and hide what follows. pragma_ is refused anywhere in the raw
+ * text: SQLite reads even a single-quoted word as a name where a name belongs, so
+ * 'pragma_optimize'(65538) runs ANALYZE (security-auditor, review P).
+ */
 function scriptText(sql: unknown): string {
   const text = plainText(sql);
-  if (SCRIPT_FORBIDDEN.test(text)) {
-    throw badSql('a script may not control transactions, change settings, attach files or vacuum');
+  const bare = blankQuoted(text, BOTH_QUOTES);
+  if (SCRIPT_FORBIDDEN.test(bare) || /[[`]/.test(bare) || PRAGMA_FUNCTION.test(text)) {
+    throw badSql('a script may not control transactions, change settings, attach files, vacuum, carry comments or quote names with [ or `');
   }
   return text;
 }
@@ -462,6 +491,7 @@ class SqliteDb implements Db {
     });
     const script = guarded((sql: string): void => {
       const text = scriptText(sql);
+      const before = mapped(() => readSettings(this.#conn));
       let failure: StorageError | null = null;
       try {
         this.#conn.exec(text);
@@ -473,6 +503,12 @@ class SqliteDb implements Db {
       if (!this.#holdsTransaction()) {
         this.#poisoned = true;
         throw new StorageError('poisoned', 'a script ended the transaction itself: part of it may be saved');
+      }
+      // a script that changed a safety setting got past the text checks: nothing on this handle is trusted
+      const after = mapped(() => readSettings(this.#conn));
+      if (SETTINGS.some((name) => after[name] !== before[name])) {
+        this.#poisoned = true;
+        throw new StorageError('poisoned', 'a script changed a safety setting of the database');
       }
       if (failure !== null) {
         throw failure;
@@ -625,6 +661,8 @@ export function wrapConnection(conn: Connection, file: string, readOnly: boolean
 /** PRAGMA application_id of every bot database: "FOMO" in ASCII. Another value means another program's file. */
 export const APPLICATION_ID = 0x464f4d4f;
 const MAX_BUSY_MS = 60_000;
+/** SQLite's limit on any one string, blob or row (review O): far above any record, far below a runaway write. */
+export const MAX_VALUE_BYTES = 1_048_576;
 
 interface Opening {
   readonly busyTimeoutMs: number;
@@ -692,7 +730,10 @@ function setUp(conn: DatabaseSync, file: string, o: Opening, memory: boolean): v
     application_id: BigInt(APPLICATION_ID),
   };
   const got = readSettings(conn);
-  const wrong = SETTINGS.filter((name) => got[name] !== want[name]);
+  const wrong: string[] = SETTINGS.filter((name) => got[name] !== want[name]);
+  if (conn.limits.length !== MAX_VALUE_BYTES) {
+    wrong.push('the value size limit');
+  }
   if (wrong.length > 0) {
     throw new StorageError('pragma', `the database refused these settings: ${wrong.join(', ')}`);
   }
@@ -719,6 +760,7 @@ export function openDb(file: string, options: OpenOptions): Db {
         enableDoubleQuotedStringLiterals: false,
         defensive: true,
         allowExtension: false,
+        limits: { length: MAX_VALUE_BYTES },
       }),
   );
   try {

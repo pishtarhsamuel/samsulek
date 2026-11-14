@@ -65,6 +65,31 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    data, the health check after migrating, the pinned version table); a property that each
    SQL CHECK accepts exactly what its codec reads (invariant 7); 101 of 102 planted bugs
    caught (the one left is the disk sync of a copy, which only a power cut could show).
+   Done in step 6c-1 (the schema): every table STRICT, amounts TEXT with their checks; the
+   starting rows; the hard-limit copies equal config/caps.ts; every index, trigger and CHECK
+   at its boundary (one position per token, at most 4, one buy ever, one exit in flight, a
+   token used once inside its life, an order only with its consumed matching token, the entry
+   count, live only by /golive, KILL and halts lifted only while the owner's own command is the
+   newest audit row and came after the KILL or halt, decision D4 for the peak and streak
+   halts); the migration text (literal RAISE messages, BEGIN and END paired, no NOT IN after a
+   sub-expression) with canaries; the secret filter with fake canaries of every kind and
+   hostile long text; the JSON codec (the reader takes only the writer's form; the walk runs no
+   getter or proxy trap and stops early on a huge value). After review P, every reviewer probe
+   is a test:
+   - halts are never renamed, backdated, upserted or replaced, and KILL keeps its time, source
+     and audit link;
+   - audit ids and hashes come in order, and each action names its actor;
+   - KILL and halts name the newest audit id: an older owner row cannot stand in, and a clock a
+     year ahead, a year behind or at the largest timestamp blocks neither a KILL, a halt nor the
+     owner's command (P-R1);
+   - a token matches its approved decision, intent, position, mode and kind, and is used only
+     while its position can take the order; a buy order spends at most its max spend;
+   - pending changes, snapshots, bans, ledger modes and the move back to opening are each tried
+     at their boundary;
+   - the script check is tried with brackets, backticks, a single-quoted pragma_ function, and a
+     settings change it then catches.
+   Planted bugs: 159 of 161 caught. The two left are equivalent by design: the audit CHECK
+   already does what they remove.
 
 ## 4. Property-based tests (fast-check)
 

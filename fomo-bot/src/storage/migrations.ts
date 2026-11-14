@@ -14,6 +14,7 @@ import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { isTimestamp } from '../core/time.ts';
 import { code, codeCell, codeParam, hex64, hex64Cell, hex64Param, intCell, intParam, isCodeText, ms, msParam } from './codec.ts';
+import { SCHEMA_V1 } from './schema-v1.ts';
 import { StorageError, type Db } from './sqlite.ts';
 
 export interface Migration {
@@ -40,8 +41,8 @@ export interface MigrateResult {
   readonly backup: string | null; // the copy made before the first pending migration, if any
 }
 
-/** The bot's migrations, 1..N in order, frozen. Migration 1 (the step 6 schema) arrives in step 6c. */
-export const MIGRATIONS: readonly Migration[] = Object.freeze([]);
+/** The bot's migrations, 1..N in order, frozen; each one's SQL is pinned by sha256 in a test. */
+export const MIGRATIONS: readonly Migration[] = Object.freeze([SCHEMA_V1]);
 
 export const VERSION_TABLE_SQL: string = [
   'CREATE TABLE schema_migrations (',

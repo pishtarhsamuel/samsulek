@@ -2,7 +2,9 @@
 // trip through a real column exactly, and for every column kind the SQL CHECK accepts exactly what
 // the codec reads back, so the database and the code can never disagree about what a valid value
 // is: random text with leading zeros, signs, spaces, exponents, Unicode digits, NUL characters and
-// lengths around the limits, and random 64-bit integers around every bound.
+// lengths around the limits, and random 64-bit integers around every bound. JSON is the one
+// exception, on purpose (review P): its CHECK is a looser tripwire, and the reader takes only the
+// writer's own form, so there the property is an implication plus a round trip.
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fc from 'fast-check';
@@ -22,6 +24,9 @@ import {
   idCell,
   int,
   intCell,
+  json,
+  jsonCell,
+  jsonParam,
   lamportsCell,
   lamportsCellOrNull,
   ms,
@@ -35,6 +40,8 @@ import {
   slotCell,
   tokenUnitsCell,
   u64,
+  u64AtMost,
+  u64NotAbove,
   u64OrNull,
 } from '../../../src/storage/codec.ts';
 import { StorageError, type Row, type SqlCell } from '../../../src/storage/sqlite.ts';
@@ -190,6 +197,10 @@ const nearInt: fc.Arbitrary<bigint> = fc.oneof(
 describe('codec and SQL agree (invariant 7)', () => {
   for (const p of PAIRS) {
     it(`${p.name}: the column takes a value exactly when the codec reads it back`, () => {
+      // every boundary value, every run (a random draw finds a length boundary only by chance)
+      for (const value of [...(p.kind === 'TEXT' ? SPECIAL_TEXT : SPECIAL_INT), null]) {
+        assert.equal(sqlAccepts(p, value), codecAccepts(p, value), `${p.name} disagrees on ${JSON.stringify(typeof value === 'bigint' ? `${value}n` : value)}`);
+      }
       const seen = { accepted: 0, refused: 0 };
       const near: fc.Arbitrary<SqlCell> = p.kind === 'TEXT' ? nearText : nearInt;
       const values = fc.oneof({ weight: 15, arbitrary: near }, { weight: 5, arbitrary: p.valid }, { weight: 1, arbitrary: fc.constant(null) });
@@ -205,6 +216,142 @@ describe('codec and SQL agree (invariant 7)', () => {
       assert.ok(seen.refused >= 30, `${p.name}: only ${seen.refused} refused`);
     });
   }
+
+  it('json: the column takes whatever the reader reads, the reader reads only what jsonParam writes, and that text comes back unchanged (review P)', () => {
+    const p: Pair = { name: 'json_v', kind: 'TEXT', fragment: json('v'), read: (r) => jsonCell(r, 'v'), nullable: false, valid: fc.constant('{}') };
+    const asciiJson = fc.json({ maxDepth: 4, stringUnit: 'grapheme-ascii' });
+    // a valid document with one character dropped, doubled or replaced: mostly invalid, sometimes not
+    const mutated = fc.tuple(asciiJson, fc.nat(), fc.constantFrom('', '"', ',', ']', '}', ' ', '\\', 'x', '0', '\u0000', 'é', '\t')).map(([text, at, ch]) => {
+      const i = text.length === 0 ? 0 : at % text.length;
+      return `${text.slice(0, i)}${ch}${text.slice(i + 1)}`;
+    });
+    const nested = fc.tuple(fc.integer({ min: 990, max: 1_010 }), fc.boolean()).map(([depth, array]) =>
+      array ? `${'['.repeat(depth)}${']'.repeat(depth)}` : `${'{"a":'.repeat(depth)}1${'}'.repeat(depth)}`,
+    );
+    const long = fc.integer({ min: 8_186, max: 8_196 }).map((n) => JSON.stringify('x'.repeat(n - 2)));
+    const special = fc.constantFrom('', ' ', '01', '1.', '.5', 'NaN', "'a'", '{a:1}', '[1,]', '"\\ud800"', '"\\u0000"', '"\\x41"', 'true', ' null ', '1e400', '-0', '{"a":1,"a":2}');
+    const values = fc.oneof(
+      { weight: 6, arbitrary: asciiJson },
+      { weight: 6, arbitrary: mutated },
+      { weight: 2, arbitrary: fc.json({ maxDepth: 2, stringUnit: 'binary' }) },
+      { weight: 2, arbitrary: nested },
+      { weight: 2, arbitrary: long },
+      { weight: 2, arbitrary: special },
+      { weight: 1, arbitrary: fc.string({ unit: 'binary-ascii', maxLength: 12 }) },
+    );
+    db.transaction((tx) => tx.script(`CREATE TABLE ${p.name} (v TEXT NOT NULL CHECK ${p.fragment}) STRICT;`));
+    // the CHECK on its own boundaries: printable ASCII, 1-8192 characters, valid JSON, nesting up to 1000
+    const boundaries: [string, boolean][] = [
+      [JSON.stringify('a '.repeat(4_095)), true], // 8,192 characters, the writer's longest text too
+      [JSON.stringify(`${'a '.repeat(4_095)}a`), false], // 8,193
+      [`${'['.repeat(1_000)}${']'.repeat(1_000)}`, true],
+      [`${'['.repeat(1_001)}${']'.repeat(1_001)}`, false],
+      [`${'{"a":'.repeat(1_000)}1${'}'.repeat(1_000)}`, true],
+      [`${'{"a":'.repeat(1_001)}1${'}'.repeat(1_001)}`, false],
+      ['"é"', false],
+      ['"a\u0000"', false],
+      ['{}', true],
+      ['', false],
+      ['{"a": 1}', true], // the CHECK takes it, the reader does not
+    ];
+    for (const [value, sql] of boundaries) {
+      assert.equal(sqlAccepts(p, value), sql, `the CHECK on a boundary of ${value.length} characters`);
+      assert.ok(!codecAccepts(p, value) || sql, `the reader takes what the column refuses (${value.length} characters)`);
+    }
+    assert.equal(codecAccepts(p, JSON.stringify('a '.repeat(4_095))), true);
+    const seen = { read: 0, refused: 0, sqlOnly: 0, deep: 0 };
+    fc.assert(
+      fc.property(values, (value) => {
+        const sql = sqlAccepts(p, value);
+        const read = codecAccepts(p, value);
+        assert.ok(!read || sql, `the reader takes what the column refuses: ${JSON.stringify(value.slice(0, 80))} (${value.length} characters)`);
+        if (read) {
+          assert.equal(jsonParam(jsonCell(Object.freeze({ v: value }), 'v')), value, 'what is read is written back as the same text');
+        }
+        seen[read ? 'read' : 'refused'] += 1;
+        seen.sqlOnly += sql && !read ? 1 : 0;
+        seen.deep += value.startsWith('[[[[[[[[[[') || value.startsWith('{"a":{"a":') ? 1 : 0;
+      }),
+    );
+    assert.ok(seen.read >= 150 && seen.refused >= 200 && seen.sqlOnly >= 50 && seen.deep >= 30, JSON.stringify(seen));
+    // the writer: plain values become text the column takes and the reader returns unchanged
+    const written = { ok: 0, refused: 0 };
+    fc.assert(
+      fc.property(fc.jsonValue({ maxDepth: 6, stringUnit: 'grapheme-ascii' }), (value) => {
+        let text: string;
+        try {
+          text = jsonParam(value);
+        } catch (e) {
+          assert.ok(e instanceof StorageError && e.code === 'bad-param', `unexpected ${String(e)}`);
+          written.refused += 1;
+          return;
+        }
+        assert.ok(sqlAccepts(p, text), `the column refuses what jsonParam wrote: ${text.slice(0, 80)}`);
+        const back = jsonCell(Object.freeze({ v: text }), 'v');
+        assert.deepEqual(back, JSON.parse(text));
+        assert.equal(jsonParam(back), text);
+        written.ok += 1;
+      }),
+    );
+    assert.ok(written.ok >= 500, JSON.stringify(written));
+  });
+
+  it('u64NotAbove: one canonical amount is no larger than another exactly when the numbers say so (a buy order\'s input and its max spend)', () => {
+    db.transaction((tx) => tx.script(`CREATE TABLE not_above (a TEXT NOT NULL CHECK ${u64('a')}, b TEXT NOT NULL CHECK ${u64('b')}, CHECK ${u64NotAbove('a', 'b')}) STRICT;`));
+    const takes = (a: bigint, b: bigint): boolean => {
+      try {
+        db.transaction((tx) => {
+          tx.run('INSERT INTO not_above (a, b) VALUES (?, ?)', amountParam(a), amountParam(b));
+          return tx.run('DELETE FROM not_above');
+        });
+        return true;
+      } catch (e) {
+        assert.ok(e instanceof StorageError && e.code === 'constraint', `unexpected ${String(e)}`);
+        return false;
+      }
+    };
+    const special = [0n, 1n, 9n, 10n, 11n, 99n, 100n, 70_000_000n, 70_000_001n, 10n ** 19n - 1n, 10n ** 19n, U64_MAX - 1n, U64_MAX];
+    for (const a of special) {
+      for (const b of special) {
+        assert.equal(takes(a, b), a <= b, `${a} <= ${b}`);
+      }
+    }
+    const amount = fc.oneof(fc.bigInt({ min: 0n, max: U64_MAX }), fc.bigInt({ min: 0n, max: 1_000n }), fc.constantFrom(...special));
+    fc.assert(
+      fc.property(amount, amount, fc.bigInt({ min: -2n, max: 2n }), (a, b, d) => {
+        const near = b + d < 0n || b + d > U64_MAX ? b : b + d;
+        assert.equal(takes(a, b), a <= b, `${a} <= ${b}`);
+        assert.equal(takes(near, b), near <= b, `${near} <= ${b}`);
+      }),
+    );
+  });
+
+  it('u64AtMost: the column takes a canonical amount exactly when it is a u64 no larger than the bound', () => {
+    const bounds = [0n, 1n, 9n, 10n, 70_000_000n, 99_999_999n, 10n ** 19n, U64_MAX];
+    db.transaction((tx) => {
+      bounds.forEach((bound, i) => tx.script(`CREATE TABLE at_most_${i} (v TEXT NOT NULL CHECK ${u64AtMost('v', bound)}) STRICT;`));
+    });
+    const seen = { accepted: 0, refused: 0 };
+    const check = (i: number, value: string): void => {
+      const bound = bounds[i] as bigint;
+      const p: Pair = { name: `at_most_${i}`, kind: 'TEXT', fragment: '', read: (r) => lamportsCell(r, 'v'), nullable: false, valid: fc.constant('0') };
+      const sql = sqlAccepts(p, value);
+      const codec = codecAccepts(p, value) && BigInt(value) <= bound;
+      assert.equal(sql, codec, `at most ${bound}: disagrees on ${JSON.stringify(value)}`);
+      seen[sql ? 'accepted' : 'refused'] += 1;
+    };
+    bounds.forEach((bound, i) => {
+      for (const value of [bound - 1n, bound, bound + 1n, bound * 10n, bound / 10n].filter((v) => v >= 0n).map(String)) {
+        check(i, value);
+      }
+    });
+    fc.assert(
+      fc.property(fc.nat({ max: bounds.length - 1 }), fc.oneof(nearText, fc.bigInt({ min: 0n, max: U64_MAX }).map(String), fc.bigInt({ min: -2n, max: 2n })), (i, delta) => {
+        check(i, typeof delta === 'bigint' ? ((bounds[i] as bigint) + delta).toString() : delta);
+      }),
+    );
+    assert.ok(seen.accepted >= 100 && seen.refused >= 100, JSON.stringify(seen));
+  });
 
   it('every u64 and every signed amount within +-u64 round-trips exactly through real columns', () => {
     fc.assert(

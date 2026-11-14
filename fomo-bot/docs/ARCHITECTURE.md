@@ -398,7 +398,8 @@ never bound and a REAL cell never read; one statement per call, its first word c
 SQLite sees it; a statement that throws sinks its whole transaction, even if the caller catches
 it; one writer; forward-only migrations, each in its own transaction with its version row, after
 a quick_check and an owner-only copy, and a fresh schema only through the owner's setup
-(STORAGE_DESIGN.md s.11). Nothing is acted on before it is persisted (intent, decision, order). Every free-text
+(STORAGE_DESIGN.md s.11). Migration 1 (`storage/schema-v1.ts`, STORAGE_DESIGN.md s.2 and s.12) is
+pinned by sha256; JSON columns hold plain data that passed the secret filter (`core/redact.ts`). Nothing is acted on before it is persisted (intent, decision, order). Every free-text
 column (reasons, details, audit entries) passes the redactor on write; transaction
 signatures live only in typed `signature` columns.
 

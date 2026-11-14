@@ -10,6 +10,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   APPLICATION_ID,
+  MAX_VALUE_BYTES,
   StorageError,
   openDb,
   wrapConnection,
@@ -674,6 +675,33 @@ describe('transaction(): all or nothing, synchronous, one at a time', () => {
     });
   });
 
+  it('a script that changes a safety setting past the text checks poisons the handle (review P)', () => {
+    const real = rawDb(':memory:');
+    real.exec(T_DDL);
+    real.exec('PRAGMA recursive_triggers = ON');
+    real.exec('PRAGMA trusted_schema = OFF');
+    // a stand-in for a bypass of the text checks: the script also flips a setting
+    const db = wrapConnection(
+      fakeOver(real, {
+        exec: (sql) => {
+          real.exec(sql);
+          if (sql.startsWith('CREATE TABLE sneaky')) {
+            real.exec('PRAGMA ignore_check_constraints = 1');
+          }
+        },
+      }),
+      ':memory:',
+      false,
+    );
+    try {
+      db.transaction((tx) => tx.script('CREATE TABLE fine (x TEXT) STRICT;'));
+      storageError(() => db.transaction((tx) => tx.script('CREATE TABLE sneaky (x TEXT) STRICT;')), 'poisoned');
+      storageError(() => db.get('SELECT 1 AS one'), 'poisoned');
+    } finally {
+      db.close();
+    }
+  });
+
   it('a script that ends the transaction itself poisons the handle (the transaction boundary was broken), also when it fails after the END', () => {
     for (const script of ["INSERT INTO t (id) VALUES ('b');\nEND;", "INSERT INTO t (id) VALUES ('b');\nEND;\nTHIS IS NOT SQL;"]) {
       const db = withTable(memDb());
@@ -928,6 +956,19 @@ describe('statements: one constant statement, nothing float-like in or out', () 
     }
   });
 
+  it('a value above the size limit (1 MiB) is refused (bad-param) and sinks its transaction (review O)', () => {
+    const db = withTable(memDb(), 'CREATE TABLE big (v TEXT) STRICT');
+    try {
+      assert.equal(MAX_VALUE_BYTES, 1_048_576);
+      db.transaction((tx) => tx.run('INSERT INTO big (v) VALUES (?)', 'a '.repeat(500_000)));
+      const e = storageError(() => db.transaction((tx) => tx.run('INSERT INTO big (v) VALUES (?)', 'a '.repeat(600_000))), 'bad-param');
+      assert.equal(e.sqliteCode, 18);
+      assert.equal(count(db, 'big'), 1n);
+    } finally {
+      db.close();
+    }
+  });
+
   it('two result columns with one name are refused: one would silently replace the other (bad-sql)', () => {
     const db = memDb();
     try {
@@ -999,6 +1040,26 @@ describe('statements: one constant statement, nothing float-like in or out', () 
       for (const sql of ['', "CREATE TABLE w (x TEXT DEFAULT 'é') STRICT", 'CREATE TABLE w (x TEXT) STRICT;\r\n', 42 as unknown as string]) {
         storageError(() => db.transaction((tx) => tx.script(sql)), 'bad-sql');
       }
+      // quoted text is data, not a command or a comment (a config source is called 'rollback'); a quoted
+      // name is still a name, so "pragma_optimize" counts
+      db.transaction((tx) => tx.script("CREATE TABLE q (x TEXT CHECK (x IN ('rollback', 'commit', 'it''s -- not /* a comment'))) STRICT;"));
+      storageError(() => db.transaction((tx) => tx.script('CREATE VIEW v2 AS SELECT * FROM "pragma_optimize"(65538);')), 'bad-sql');
+      // SQLite reads a single-quoted word as a name where a name belongs; a quote inside [ ] or ` `
+      // would put the quote tracking out of step (security-auditor, review P: each of these ran)
+      for (const sql of [
+        "SELECT 1 FROM 'pragma_optimize'(65538);",
+        "CREATE TABLE tq (x INTEGER) STRICT;\nCREATE TRIGGER tq_after AFTER INSERT ON tq BEGIN SELECT 1 FROM 'pragma_optimize'(65538); END;", // a trigger body too
+        "CREATE TABLE [a'b] (x INTEGER) STRICT;\nPRAGMA ignore_check_constraints = 1;\nCREATE TABLE [c'd] (y INTEGER) STRICT;",
+        "CREATE TABLE `a'b` (x INTEGER) STRICT;\nPRAGMA recursive_triggers = 0;\nCREATE TABLE `c'd` (y INTEGER) STRICT;",
+        "CREATE TABLE r (x TEXT DEFAULT 'pragma_x') STRICT;",
+      ]) {
+        storageError(() => db.transaction((tx) => tx.script(sql)), 'bad-sql');
+      }
+      assert.equal(setting(db, 'ignore_check_constraints'), 0n);
+      assert.equal(setting(db, 'recursive_triggers'), 1n);
+      assert.equal(db.get("SELECT count(*) AS n FROM sqlite_schema WHERE name = 'sqlite_stat1'")?.['n'], 0n);
+      storageError(() => db.transaction((tx) => tx.script('CREATE TABLE r ("x" TEXT) STRICT;\nrollback;')), 'bad-sql');
+      storageError(() => db.transaction((tx) => tx.script("CREATE TABLE r (x TEXT DEFAULT 'a\"b') STRICT;\nVACUUM;")), 'bad-sql');
       // words inside longer names are fine
       db.transaction((tx) => tx.script('CREATE TABLE w (commit_sha TEXT, released_at INTEGER) STRICT;'));
       assert.equal(count(db, 'w'), 0n);

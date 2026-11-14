@@ -27,6 +27,9 @@ import {
   int,
   intCell,
   intParam,
+  json,
+  jsonCell,
+  jsonParam,
   lamportsCell,
   lamportsCellOrNull,
   ms,
@@ -42,6 +45,7 @@ import {
   slotParam,
   tokenUnitsCell,
   u64,
+  u64AtMost,
   u64OrNull,
 } from '../../../src/storage/codec.ts';
 import type { Row, SqlCell } from '../../../src/storage/sqlite.ts';
@@ -191,22 +195,181 @@ describe('parameter writers: canonical out, anything out of range refused', () =
   });
 });
 
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const fakeKey = Array.from({ length: 88 }, (_v, i) => B58[(i * 7 + 3) % 58]).join('');
+
+describe('JSON columns: plain data in, plain data out, never a secret (step 6c)', () => {
+  it('writes plain data as compact JSON, bigints as decimal text, and reads it back deep-frozen', () => {
+    const value = { reasons: ['blocked:kill', 'sizing:no-live-price'], equity: 123_456_789_012_345_678n, bps: [100, 250], ok: true, none: null, nested: { depth: { two: 2.5 } } };
+    const text = jsonParam(value);
+    assert.equal(text, '{"reasons":["blocked:kill","sizing:no-live-price"],"equity":"123456789012345678","bps":[100,250],"ok":true,"none":null,"nested":{"depth":{"two":2.5}}}');
+    const back = jsonCell(row(text), 'v') as Record<string, unknown>;
+    assert.deepEqual(back, { ...value, equity: '123456789012345678' });
+    assert.ok(Object.isFrozen(back) && Object.isFrozen(back['reasons']) && Object.isFrozen((back['nested'] as Record<string, unknown>)['depth']));
+    assert.equal(jsonParam([]), '[]');
+    assert.equal(jsonParam('code'), '"code"');
+  });
+
+  it('refuses anything JSON.stringify would change or drop silently, and anything that is not plain data (bad-param)', () => {
+    const getter = Object.defineProperty({}, 'x', { get: () => 1, enumerable: true });
+    const hidden = Object.defineProperty({ a: 1 }, 'b', { value: 2, enumerable: false });
+    const sparse = [1, , 3]; // a hole on purpose: JSON.stringify would write null
+    const withSymbol = { a: 1, [Symbol('s')]: 2 };
+    class Thing {
+      a = 1;
+    }
+    class List extends Array<number> {}
+    const deep = JSON.parse(`${'['.repeat(17)}${']'.repeat(17)}`) as unknown;
+    const bad: unknown[] = [
+      undefined,
+      { a: undefined },
+      [undefined],
+      () => 1,
+      Symbol('x'),
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      { a: -Infinity },
+      new Date(0),
+      new Map([[1, 2]]),
+      new Uint8Array([1, 2]),
+      new Thing(),
+      getter,
+      hidden,
+      sparse,
+      withSymbol,
+      deep,
+      'café',
+      { 'kéy': 1 },
+      'line\nbreak',
+      `${'a '.repeat(4_095)}a`, // 8,193 characters with its quotes (short words: no key-like run)
+      '"'.repeat(4_097), // 4,099 characters by the walk's count, 8,196 once each quote is escaped
+      Object.assign([1, 2], { extra: 3 }), // JSON.stringify would drop the extra property
+      Object.assign([1], { [Symbol('s')]: 2 }),
+      List.of(1, 2), // an array subclass is a class instance too
+      Object.setPrototypeOf([1, 2], null) as unknown,
+    ];
+    for (const value of bad) {
+      storageError(() => jsonParam(value), 'bad-param');
+    }
+    // a getter is refused as such (its function is never called), not as a missing value
+    assert.match(storageError(() => jsonParam(getter), 'bad-param').detail, /plain, visible values/);
+    assert.equal(jsonParam(JSON.parse(`${'['.repeat(16)}${']'.repeat(16)}`)), `${'['.repeat(16)}${']'.repeat(16)}`);
+    assert.equal(jsonParam('a '.repeat(4_095)).length, 8_192); // the limit, quotes included
+  });
+
+  it('a __proto__ key is just a key: no prototype is changed on the way in or out', () => {
+    const tricky = JSON.parse('{"__proto__":{"polluted":true},"a":1}') as unknown;
+    const text = jsonParam(tricky);
+    assert.equal(text, '{"__proto__":{"polluted":true},"a":1}');
+    const back = jsonCell(row(text), 'v') as Record<string, unknown>;
+    assert.equal(Object.getPrototypeOf(back), Object.prototype);
+    assert.equal(({} as Record<string, unknown>)['polluted'], undefined);
+    assert.ok(Object.hasOwn(back, '__proto__'));
+  });
+
+  it('refuses a value that looks like it holds a secret, naming the kinds and never the value (secrets canary)', () => {
+    const canaries: unknown[] = [
+      { key: fakeKey },
+      { rpc: 'https://rpc.example.invalid/?x=1' },
+      { seed: Array.from({ length: 64 }, (_v, i) => i) },
+      ['-----BEGIN PRIVATE KEY-----'],
+      { note: 'api_key' },
+      { words: 'abandon ability able about above absent absorb abstract absurd abuse access accident' },
+    ];
+    for (const value of canaries) {
+      const e = storageError(() => jsonParam(value), 'bad-param');
+      assert.match(e.detail, /secret/);
+      for (const piece of [fakeKey.slice(0, 12), 'rpc.example', 'BEGIN PRIVATE', 'abandon ability']) {
+        assert.ok(!e.message.includes(piece), piece);
+      }
+    }
+  });
+
+  it('reads back only the exact form jsonParam writes: what the CHECK also lets in (spaces, escapes, 1e400, deep nesting) is a bad cell (review P, security 4)', () => {
+    assert.deepEqual(jsonCell(row('{"a":[1,2]}'), 'v'), { a: [1, 2] });
+    assert.deepEqual(jsonCell(row(`${'['.repeat(16)}${']'.repeat(16)}`), 'v'), JSON.parse(`${'['.repeat(16)}${']'.repeat(16)}`));
+    assert.equal(jsonCell(row('-2.5'), 'v'), -2.5);
+    const notWritten = [
+      '{"a": 1}', // a space jsonParam never writes
+      ' []',
+      '"\\u0000"', // a NUL, escaped
+      '"\\ud800"', // a lone surrogate
+      '"\\u202e"', // a bidi override that could spoof a Telegram message
+      '"\\u0041"', // an escape for a plain letter: the same value, not the same text
+      '1e400', // read as Infinity
+      '1E2',
+      '-0',
+      '1.0',
+      `${'['.repeat(17)}${']'.repeat(17)}`, // deeper than the writer goes
+      `${'['.repeat(1_000)}${']'.repeat(1_000)}`, // still valid for the CHECK
+      '{"a":1,"a":2}', // a repeated key
+      `"${fakeKey}"`, // valid JSON the writer refuses as a secret
+    ];
+    for (const bad of [...notWritten, '', ' ', '{', 'café', '"a\tb"', `${'['.repeat(1_001)}${']'.repeat(1_001)}`, `"${'x'.repeat(8_191)}"`, 5n, null] as SqlCell[]) {
+      const e = storageError(() => jsonCell(row(bad), 'v'), 'bad-cell');
+      assert.ok(!e.message.includes(fakeKey.slice(0, 12)), 'the stored text is never repeated');
+    }
+  });
+
+  it('walks a value without running its code: no getter or proxy trap is called, and a huge or self-repeating value stops early (review P, security 7)', () => {
+    let calls = 0;
+    const arrayGetter: unknown[] = [1, 2];
+    Object.defineProperty(arrayGetter, '1', { get: () => { calls += 1; return 2; }, enumerable: true });
+    const hiddenIndex: unknown[] = [1, 2];
+    Object.defineProperty(hiddenIndex, '0', { value: 1, enumerable: false });
+    const trapped = new Proxy({ a: 1 }, {
+      ownKeys: (t) => { calls += 1; return Reflect.ownKeys(t); },
+      getOwnPropertyDescriptor: (t, k) => { calls += 1; return Reflect.getOwnPropertyDescriptor(t, k); },
+      getPrototypeOf: (t) => { calls += 1; return Reflect.getPrototypeOf(t); },
+    });
+    const trappedArray = new Proxy([1], { getPrototypeOf: (t) => { calls += 1; return Reflect.getPrototypeOf(t); } });
+    for (const value of [arrayGetter, hiddenIndex, trapped, trappedArray, { inner: trapped }]) {
+      storageError(() => jsonParam(value), 'bad-param');
+    }
+    assert.equal(calls, 0, 'no getter and no trap ran');
+    // 40 references to the same 40-element value, five levels deep: 40^5 leaves if walked in full
+    let shared: unknown = Array.from({ length: 40 }, () => 1);
+    for (let level = 0; level < 4; level += 1) {
+      shared = Array.from({ length: 40 }, () => shared);
+    }
+    const huge = new Array<number>(5_000_000).fill(1);
+    for (const value of [shared, huge, { a: 'x'.repeat(1_000_000) }]) {
+      const started = Date.now();
+      assert.match(storageError(() => jsonParam(value), 'bad-param').detail, /at most 8192/);
+      assert.ok(Date.now() - started < 200, `took ${Date.now() - started} ms`);
+    }
+  });
+
+  it('ids and codes that look like secrets are refused on the way in too (a key pasted as a mint, a hex secret as a code)', () => {
+    assert.equal(idParam('So11111111111111111111111111111111111111112'), 'So11111111111111111111111111111111111111112');
+    const e = storageError(() => idParam(fakeKey), 'bad-param');
+    assert.ok(!e.message.includes(fakeKey.slice(0, 12)));
+    storageError(() => codeParam('ab'.repeat(32)), 'bad-param');
+    assert.equal(codeParam('a'.repeat(63)), 'a'.repeat(63));
+    // reading is not refused: the CHECK and the reader describe what may be stored, the writer is stricter
+    assert.equal(idCell(row(fakeKey), 'v'), fakeKey);
+  });
+});
+
 describe('SQL CHECK fragments', () => {
   it('are built from a plain lower-case column name only (no SQL can be smuggled in through a fragment)', () => {
-    for (const make of [u64, u64OrNull, signed, ms, msOrNull, slot, bool, id, code, day, hex64]) {
+    for (const make of [u64, u64OrNull, signed, ms, msOrNull, slot, bool, id, code, day, hex64, json, (c: string) => u64AtMost(c, 70_000_000n)]) {
       assert.match(make('amount_in'), /amount_in/);
       for (const bad of ['', 'Amount', '1a', 'a b', "a') OR 1=1 --", 'a;b', 'x'.repeat(64)]) {
         storageError(() => make(bad), 'bad-sql');
       }
     }
     assert.equal(int('n', -5, 5), "(typeof(n) = 'integer' AND n BETWEEN -5 AND 5)");
+    for (const bound of [-1n, U64_MAX + 1n, 5 as unknown as bigint]) {
+      storageError(() => u64AtMost('n', bound), 'bad-sql');
+    }
     storageError(() => int('n', 5, -5), 'bad-sql');
     storageError(() => int('n', 0.5, 1), 'bad-sql');
     storageError(() => int('N', 0, 1), 'bad-sql');
   });
 
   it('are plain ASCII on one line and the timestamp bound comes from core/time', () => {
-    for (const make of [u64, u64OrNull, signed, ms, msOrNull, slot, bool, id, code, day, hex64]) {
+    for (const make of [u64, u64OrNull, signed, ms, msOrNull, slot, bool, id, code, day, hex64, json, (c: string) => u64AtMost(c, 70_000_000n)]) {
       assert.match(make('c'), /^[\x20-\x7e]+$/);
     }
     assert.ok(ms('c').includes(String(MAX_TIMESTAMP_MS)));
