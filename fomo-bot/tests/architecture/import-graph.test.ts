@@ -75,6 +75,13 @@ const RUNTIME_ONLY_FROM: Readonly<Record<string, readonly string[]>> = {
 const AUTHORITY_FILES = new Set(['risk/approval.ts', 'app/authority.ts']);
 /** A relative import: a plain path of letters, digits, dots, slashes, underscores and dashes, ending in .ts. */
 const RELATIVE_SPEC = /^\.{1,2}\/[./A-Za-z0-9_-]*\.ts$/;
+/**
+ * The database module is opened in one file, which checks every statement, parameter and cell
+ * (STORAGE_DESIGN.md s.1.1); everything else, types included, goes through that wrapper. Only the
+ * schema runner may run multi-statement SQL (tx.script), which skips the one-statement checks.
+ */
+const SQLITE_FILE = 'storage/sqlite.ts';
+const SCRIPT_FILES = new Set([SQLITE_FILE, 'storage/migrations.ts']);
 /** Lower case: the check compares import targets in lower case, because Windows and macOS ignore case in file names. */
 const CLOCK_FILES = new Set(['core/clock.ts', 'core/rng.ts']);
 const RNG_FILE = 'core/rng.ts';
@@ -278,6 +285,9 @@ export function checkSource(rel: string, text: string): string[] {
   const declared = pure === undefined ? new Set<string>() : declaredNames(source);
 
   const checkSpecifier = (spec: string, typeOnly: boolean, reexport = false): void => {
+    if ((spec === 'node:sqlite' || spec === 'sqlite') && (rel !== SQLITE_FILE || reexport)) {
+      problems.push(`${rel}: only storage/sqlite.ts may import node:sqlite, types included, and it hands none of it on (everything else uses its checked wrapper)`);
+    }
     if (pureFile !== undefined && !typeOnly && !spec.startsWith('node:')) {
       problems.push(`${rel}: a pure file outside the pure folders imports and re-exports nothing at runtime ("${spec}")`);
       return;
@@ -483,6 +493,22 @@ export function checkSource(rel: string, text: string): string[] {
       node.text === 'constructor';
     if (named) {
       problems.push(`${rel}: "constructor" is not allowed (it reaches Function and the clock)`);
+    }
+    // the wrapper over a connection that is already open is for the fault-injection tests: no source file uses it
+    if (rel !== SQLITE_FILE && (ts.isIdentifier(node) || ts.isStringLiteralLike(node)) && node.text === 'wrapConnection') {
+      problems.push(`${rel}: wrapConnection is for the storage tests only (the bot opens databases with openDb)`);
+    }
+    // multi-statement SQL skips the one-statement checks: only the schema runner may run it
+    if (!SCRIPT_FILES.has(rel)) {
+      const isScript = (n: ts.Node | undefined): boolean =>
+        n !== undefined && (ts.isIdentifier(n) || ts.isStringLiteralLike(n)) && n.text === 'script';
+      if (
+        (ts.isPropertyAccessExpression(node) && node.name.text === 'script') ||
+        (ts.isElementAccessExpression(node) && isScript(node.argumentExpression)) ||
+        (ts.isBindingElement(node) && isScript(node.propertyName ?? node.name))
+      ) {
+        problems.push(`${rel}: only storage/migrations.ts runs multi-statement SQL (tx.script)`);
+      }
     }
     // the authority is made in one place only (names compared exactly: this is our own code), and that
     // place calls the factory under its own name and hands out built authorities, never the factory
@@ -804,6 +830,42 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
     ]);
     assert.deepEqual(checkSource('risk/x.ts', "import { approveBuy } from './approve.ts'; import { HARD_CAPS } from '../config/caps.ts'; export const a = [approveBuy, HARD_CAPS];"), []);
     assert.deepEqual(checkSource('app/engine.ts', "import type { ApprovalVerifier } from '../risk/approval.ts'; export const v = (x: ApprovalVerifier): ApprovalVerifier => x;"), []);
+  });
+
+  it('CANARY: only storage/sqlite.ts imports node:sqlite, and only storage/migrations.ts runs scripts (STORAGE_DESIGN.md s.5)', () => {
+    flagged([
+      ['storage/repo-x.ts', "import { DatabaseSync } from 'node:sqlite';"],
+      ['storage/codec.ts', "import type { DatabaseSync } from 'node:sqlite'; export type D = DatabaseSync;"],
+      ['storage/x.ts', "export { DatabaseSync } from 'node:sqlite';"],
+      ['app/x.ts', "export const load = async () => import('node:sqlite');"],
+      ['storage/x.ts', "import * as s from 'sqlite'; export const t = s;"],
+      ['storage/SQLite.ts', "import { DatabaseSync } from 'node:sqlite'; export const d = DatabaseSync;"], // a look-alike name is another file
+      ['app/x.ts', "import type { Tx } from '../storage/sqlite.ts'; export const f = (tx: Tx): void => tx.script('DROP TABLE a');"],
+      ['app/x.ts', "import type { Tx } from '../storage/sqlite.ts'; export const f = (tx: Tx): void => tx['script']('DROP TABLE a');"],
+      ['storage/repo-x.ts', "import type { Tx } from './sqlite.ts'; export const f = (tx: Tx): void => { const { script } = tx; script('x'); };"],
+      ['storage/repo-x.ts', "import type { Tx } from './sqlite.ts'; export const f = (tx: Tx): void => { const { script: s } = tx; s('x'); };"],
+    ]);
+    assert.deepEqual(checkSource('storage/sqlite.ts', "import { DatabaseSync } from 'node:sqlite'; export const d = DatabaseSync;"), []);
+    assert.deepEqual(
+      checkSource('storage/migrations.ts', "import type { Tx } from './sqlite.ts'; export const f = (tx: Tx): void => tx.script('CREATE TABLE a (x TEXT) STRICT;');"),
+      [],
+    );
+    assert.deepEqual(checkSource('app/x.ts', 'export const o = { script: 1 };'), []); // a key named script runs nothing
+    // the wrapper hands nothing of node:sqlite on, and the test-only seam is not used in src/ (review O)
+    flagged([
+      ['storage/sqlite.ts', "export { DatabaseSync } from 'node:sqlite';"],
+      ['storage/sqlite.ts', "export * from 'node:sqlite';"],
+      ['storage/sqlite.ts', "export type { DatabaseSync } from 'node:sqlite';"],
+      ['app/x.ts', "import { wrapConnection } from '../storage/sqlite.ts'; export const w = wrapConnection;"],
+      ['storage/repo-x.ts', "import * as s from './sqlite.ts'; export const w = s['wrapConnection'];"],
+    ]);
+  });
+
+  it('src/ holds only .ts files: a .js or .mjs file there would never be checked by these rules (review O)', () => {
+    const others = readdirSync(SRC, { recursive: true, withFileTypes: true })
+      .filter((entry) => !entry.isDirectory() && !entry.name.endsWith('.ts'))
+      .map((entry) => path.join(entry.parentPath, entry.name));
+    assert.deepEqual(others, []);
   });
 
   it('no two source files differ only in case (one file on Windows and macOS, two on Linux)', () => {

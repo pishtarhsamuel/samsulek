@@ -22,6 +22,8 @@ export const GATED: readonly RegExp[] = [
   /^src\/risk\//,
   // the hard limits and the rules for changing the tunables: money code like risk/
   /^src\/config\//,
+  // the database wrapper, the amount codec and the schema runner: every money record passes through them
+  /^src\/storage\//,
 ];
 export const GATED_PERCENT = 90;
 export const OTHER_PERCENT = 80;

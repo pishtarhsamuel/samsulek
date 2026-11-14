@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-11-12
+Updated: 2026-11-14
 
 **Phase 2 (foundations, tests first): in progress.** Paper-only building blocks; nothing
 can trade, and no key or account exists anywhere.
@@ -77,13 +77,28 @@ can trade, and no key or account exists anywhere.
   stricter import rules), and one item waits for part 6d: the slot feed must reject a
   wrong-but-possible slot number by comparing it with the clock and a second provider.
   602 tests pass.
+- Part 6b, the database core, is built (tests first): one file opens the database and checks
+  every command before the database sees it (one command at a time, no hidden settings
+  changes, never a decimal number for money), and every write is one all-or-nothing step; if
+  the disk fills up halfway, nothing of that step is saved. A second file is the only place
+  where stored text turns into amounts, and a test proves the database's own checks and the
+  code agree on what a valid amount is. Layout upgrades of the database only go forward,
+  after a health check and a private copy. Building it turned up three traps in the built-in
+  database, now blocked and tested: a second command in one text is silently skipped, a
+  settings change acts even when only prepared, and "insert or replace" can delete a row
+  that is meant to be permanent. Both Opus reviewers checked it (REVIEWS.md O). The risk
+  reviewer first blocked it over one real gap: if the code inside a database step caught an
+  error and carried on, the rest of the step was still saved (say, a new position without the
+  count that limits positions). Now any error sinks the whole step. That and every other fix
+  they asked for are done, and both then approved, with notes for the next parts (the tables
+  in 6c, the start-up checks in 6d). 700 tests pass; 101 of 102 planted bugs are caught (the
+  one left is the disk sync of a backup copy, which only a power cut could show).
 - For you to know before live: at 5% per trade, live trading needs at least 0.4 SOL in the
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: the rest of step 6 (6b the database core, 6c the tables, 6d the approval transaction,
-  6e settings and day-state transactions); then chain clients, the paper engine, Telegram and
-  logging.
+- Next: the rest of step 6 (6c the tables, 6d the approval transaction, 6e settings and
+  day-state transactions); then chain clients, the paper engine, Telegram and logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;

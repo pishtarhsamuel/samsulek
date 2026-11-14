@@ -51,7 +51,20 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    and approval, /rollback, versions and the 24 h live loosening, at every boundary; properties
    over random command sequences for invariants 11, 15 and 24; planted bugs for each rule.
 6. `storage/`: migrations, WAL, TEXT amounts, partial unique indexes, crash during write,
-   quick_check failure.
+   quick_check failure. Done in step 6b (the core, no schema yet): the settings read back at
+   open, foreign, missing, empty, damaged and read-only files; a transaction all or nothing
+   (a throw, an async callback, nesting, a kept tx, a statement error the callback swallows,
+   a ROLLBACK that fails, SQLite rolling back by itself after a full disk, a COMMIT that
+   fails with the transaction kept or lost, busy between two handles and two processes, a
+   process that dies mid-write); one checked statement per call, on every call (parameters,
+   placeholders, first word, a refused PRAGMA or pragma_ function has no effect, REAL cells,
+   duplicate columns, the 500-statement cap); scripts without transaction control or comments; the
+   fragments pin the storage class outside STRICT tables; errors carry codes and never a
+   bound value; owner-only copies; the migration runner (fresh only with the setup flag,
+   no-op, edited, newer, foreign, broken, failing, two runners at once, damaged or orphaned
+   data, the health check after migrating, the pinned version table); a property that each
+   SQL CHECK accepts exactly what its codec reads (invariant 7); 101 of 102 planted bugs
+   caught (the one left is the disk sync of a copy, which only a power cut could show).
 
 ## 4. Property-based tests (fast-check)
 

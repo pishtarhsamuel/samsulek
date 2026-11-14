@@ -27,7 +27,7 @@ enums, namespaces or parameter properties); `tsc --noEmit` type-checks; no build
 |---|---|---|
 | core/ | branded bigint units, checked integer math (caps round down, costs round up), ids, clock (UTC + Athens day), Result, redactor | nothing |
 | config/ | `caps.ts` (`HARD_CAPS`, `TUNABLE_BOUNDS`, `LIVE_CAPS`); `tunables.ts` (the tunables: rules, defaults, strict checks, stored form; no modes); `changes.ts` (/set, AI proposals and approval, /rollback, versions, the 24 h live loosenings: pure plans); the server-file schema and layered loading later | core, storage |
-| storage/ | `sqlite.ts` (only importer of `node:sqlite`), migrations, repositories, backup | core |
+| storage/ | `sqlite.ts` (only importer of `node:sqlite`, types included: one checked statement per call, one synchronous transaction as the only way to write); `codec.ts` (the only TEXT<->bigint place: readers, writers and the SQL CHECK fragments); `migrations.ts` (forward-only runner, the only caller of `tx.script`); repositories, backup | core |
 | chain/ | ProviderClient (JSON-RPC over fetch, WebSocket), BudgetGovernor, v1-only reads, block height, clock drift | core, config |
 | venues/ | pump curve, PumpSwap, Raydium CPMM: decoders hand-written from the official IDLs, fee-config readers, exact quote math rounded in the venue's favour, PDAs; Phase 8 instruction builders | core |
 | ingest/ | provider data to `MarketEvent`s, dedupe, slot watermark | core, chain, venues, fomo |
@@ -389,10 +389,16 @@ confirmations and reconciliation are P0, never shed; if P0 is denied, all entrie
 
 ## 7. Storage (SQLite WAL, only through `storage/sqlite.ts`)
 
-WAL, busy timeout 5 s, foreign keys, `readBigInts`; amounts are TEXT of decimal digits
-(CHECK `[0-9]+`; signed PnL columns such as `positions.realized` allow a leading `-`),
-converted to bigint in one place; one writer; forward-only migrations with a backup before
-each. Nothing is acted on before it is persisted (intent, decision, order). Every free-text
+WAL, synchronous FULL, busy timeout 5 s, foreign keys, recursive triggers (so INSERT OR
+REPLACE cannot skip a no-delete trigger), `trusted_schema` off, `readBigInts`, the bot's
+application id, each read back at open; amounts are canonical TEXT of decimal digits (CHECK
+from `storage/codec.ts`: no leading zero, at most 2^64-1, ASCII only; signed PnL columns such
+as `positions.realized` allow a leading `-`), converted to bigint in one place; a JS number is
+never bound and a REAL cell never read; one statement per call, its first word checked before
+SQLite sees it; a statement that throws sinks its whole transaction, even if the caller catches
+it; one writer; forward-only migrations, each in its own transaction with its version row, after
+a quick_check and an owner-only copy, and a fresh schema only through the owner's setup
+(STORAGE_DESIGN.md s.11). Nothing is acted on before it is persisted (intent, decision, order). Every free-text
 column (reasons, details, audit entries) passes the redactor on write; transaction
 signatures live only in typed `signature` columns.
 

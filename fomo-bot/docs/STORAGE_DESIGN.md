@@ -1,7 +1,8 @@
 # Phase 2 step 6 design: storage layer and composition-root transactions
 
 Status: PROPOSED by the architect (2026-11-12); built in sub-steps 6a-6e (section 7), each
-reviewed by risk-guardian and security-auditor before its commit. 6a is done (REVIEWS.md N).
+reviewed by risk-guardian and security-auditor before its commit. 6a is done (REVIEWS.md N);
+6b is built (REVIEWS.md O), with the differences from sections 1.1-1.3 listed in section 11.
 The owner accepted the four decisions of section 8 on 2026-11-13 (DECISIONS.md D5). Where this
 file and ARCHITECTURE.md differ, ARCHITECTURE.md wins until a sub-step's review moves the
 change there.
@@ -929,7 +930,7 @@ VERIFIED_FACTS line 142 already covers on Linux, Node 26.13.0: loading under the
 ## 10. Inconsistencies found while reading (for the main session)
 
 - `portfolio/ledger.ts` `PositionStatus` has no `'stuck'`. ARCHITECTURE s.3, approve.ts and this schema do. One must change before T3.
-- The architecture test does not yet enforce "only storage/sqlite.ts imports node:sqlite" (TEST_PLAN line 103 wants it). Added to 6b.
+- The architecture test does not yet enforce "only storage/sqlite.ts imports node:sqlite" (TEST_PLAN line 103 wants it). Added to 6b. (Done in 6b, with types included and a rule that only storage/migrations.ts calls `tx.script`.)
 - ARCHITECTURE s.7 lists config_versions columns "parent, active". changes.ts uses `undoTo`, and the active version is the newest, so this design has no active column. s.7 should be updated.
 - ARCHITECTURE s.4's in-flight index is `kind = 'sell'`. I propose sell plus close-account (one exit in flight per position, as s.12 says). This is stricter.
 - `fomo apply-pending` (apply now at the server) has no pure plan in changes.ts. It must never be built by passing a faked `now`. It needs a reviewed `planApplyNow` (open).
@@ -938,3 +939,129 @@ VERIFIED_FACTS line 142 already covers on Linux, Node 26.13.0: loading under the
 - Phase 8: T1 must read the intent mode's own SOL and exposure, while one-per-mint and the 4-position trigger stay global (stricter).
 
 Key files the main session will touch when merging: /home/user/samsulek/fomo-bot/docs/ARCHITECTURE.md (s.4, s.7, s.12), /home/user/samsulek/fomo-bot/src/risk/approval.ts, /home/user/samsulek/fomo-bot/src/risk/approve.ts, /home/user/samsulek/fomo-bot/tests/architecture/import-graph.test.ts, /home/user/samsulek/fomo-bot/docs/VERIFIED_FACTS.md (section 9 results), /home/user/samsulek/fomo-bot/docs/REVIEWS.md (K gate closure).
+
+## 11. Step 6b as built: differences from sections 1.1-1.3
+
+The scratch runs behind these are in VERIFIED_FACTS.md (the node:sqlite rows of 2026-11-13).
+
+`storage/sqlite.ts`:
+
+- Error codes added: `bad-sql` (a statement that breaks the rules below), `bad-option` (bad
+  arguments to openDb, vacuumInto, migrate), `missing` (no bot database where create is false, or
+  no schema without the setup flag), `tx-failed` (a statement of this transaction already threw),
+  `schema-edited`, `schema-newer`, `schema-broken` (migrations). `StorageError` also carries
+  `sqliteCode`, SQLite's extended result code. `detail` is printable ASCII, at most 200
+  characters.
+- Any throw from `tx.run`, `tx.get`, `tx.all` or `tx.script` marks the whole transaction failed:
+  every later statement and the commit are refused (`tx-failed`) and everything rolls back.
+  SQLite undoes only the failing statement and keeps the transaction open (a CHECK, a trigger, a
+  UNIQUE), so a callback that caught the error would otherwise commit the rest without it, for
+  example a position without its counter (review O, risk finding 1).
+- A COMMIT that fails while SQLite still holds the transaction (a deferred foreign key, a busy
+  lock) is rolled back as before; one that fails after SQLite let go of it (an I/O error) poisons
+  the handle, because whether it reached the disk is unknown: the app stops, restarts and reads
+  the truth back (review O, risk finding 3).
+- One statement per call, checked before SQLite sees it, because `prepare()` drops a second
+  statement silently and a flag PRAGMA takes effect when it is only prepared: ASCII text with LF,
+  no semicolon, no comments, names quoted with double quotes only, plain `?` placeholders
+  (counted outside quotes; `:a`, `@a`, `$a`, `#a` and `?1` are refused, since SQLite binds a
+  missing parameter as NULL), and no `pragma_` anywhere (`pragma_optimize(65538)` runs ANALYZE
+  from a SELECT; review O, security finding 2). The first word decides: the handle reads with
+  SELECT only; `tx.get`/`tx.all` take SELECT, INSERT, UPDATE, DELETE (RETURNING); `tx.run` takes
+  INSERT, UPDATE, DELETE. These checks run on every call, also for a statement already prepared.
+  `tx.script` (migrations only) refuses COMMIT, ROLLBACK, SAVEPOINT, RELEASE, PRAGMA, `pragma_`,
+  ATTACH, DETACH, VACUUM, BEGIN as a statement (as opposed to a trigger body), END TRANSACTION
+  and comments (a comment between BEGIN and its semicolon hid the BEGIN; notes go in the
+  TypeScript around the SQL); a script that ends the transaction anyway (a lone END) poisons the
+  handle, also when it fails afterwards. Two result columns with one name are refused. More than 500
+  different statements on one handle are refused (SQL is constant text). Parameters: text, a
+  bigint within 64 bits, null or bytes; a number, boolean, undefined or object is refused.
+- `Db.settings()` reads the safety settings back (diagnostics and tests), since the `pragma_`
+  functions are refused.
+- `PRAGMA recursive_triggers = ON` is added to the settings (read back like the others, with
+  `ignore_check_constraints = 0` and the busy timeout): without it `INSERT OR REPLACE` deletes a
+  row past a no-delete trigger, which the append-only tables of 6c rely on.
+- Every statement in a transaction first checks that SQLite still holds the transaction: after
+  SQLITE_FULL (or IOERR, BUSY, NOMEM) SQLite may roll it back itself, and the next statement
+  would then be saved on its own. The commit checks the same; the final ROLLBACK runs only if
+  the transaction is still open, so a full disk does not poison the handle. A script that ends
+  the transaction itself poisons the handle.
+- Reads, copies, checks and close on the handle inside its own transaction are refused
+  (`nested-transaction`); the tx is the only way in. A kept tx used later, also inside a newer
+  transaction, is refused (`tx-closed`).
+- `Db.readOnly` is added; a read-only handle refuses `transaction()` before the callback runs.
+  A read-only open needs `create: false` and a file already in WAL mode (`pragma` otherwise).
+- `create: false` also refuses an existing empty file (a file created between the existence
+  check and the open is never claimed); `create: true` claims a file with no tables and
+  application id 0, and refuses any other foreign file.
+- `vacuumInto` creates the copy itself, exclusively and owner-only (`wx`, 0600), then fills it
+  with `VACUUM INTO ?` (the name is a bound parameter) and syncs it to disk; an existing file is
+  never touched; a failed copy is removed.
+- `wrapConnection(conn, file, readOnly)` puts the wrapper over a connection that is already
+  open: the tests use it for a ROLLBACK that fails, a full disk (`max_page_count`) and odd
+  errors. Only this file can make a real connection, so it hands nobody a way around the checks.
+
+`storage/codec.ts`:
+
+- Each fragment first pins the storage class (`typeof(c) = 'text'` or `'integer'`), so it holds
+  outside a STRICT table too (text and bytes compare above every number, so `slot >= 0` took them,
+  and a REAL passed BETWEEN; review O, risk note 8). A TEXT one then checks `octet_length(c) =
+  length(c)`: `length()` and GLOB stop at a NUL inside TEXT, so `'12<NUL>abc'` passed the u64
+  digit checks; the same test refuses non-ASCII.
+- `code` also requires the first character to be a letter or digit (as `codeParam` does); `day`
+  is a real date from year 100 (`date(c) IS c`, since date() turns 02-30 into 03-02), as `isDay`.
+- Added, each with its reader, writer and fragment: `idCell`/`idParam`, `codeCell`, `dayCell`/
+  `dayParam`, `hex64Cell`/`hex64Param`, `slotParam`, `msCellOrNull`, the `slot` and `int`
+  fragments, `isCodeText`. `textCell` is dropped: no column holds free text. `jsonParam` and the
+  `json` fragment move to 6c with `core/redact.ts`, which they need.
+- Fragments take a plain lower-case column name only. A reader names the column, never the
+  stored value.
+- A property test (1,000 cases per column kind) proves each CHECK accepts exactly what its
+  reader accepts.
+
+`storage/migrations.ts`:
+
+- The runner owns `schema_migrations` (`VERSION_TABLE_SQL`, sha256 pinned in a test): it is
+  created in migration 1's own transaction, with CHECKs on every column (the two version columns
+  are codes) and triggers that keep its rows in order and unchangeable. So `schema-v1.ts` (6c)
+  does not define it.
+- `migrateWith(db, list, options)` takes the list (tests use small ones); `migrate()` uses
+  `MIGRATIONS`, which is empty until 6c.
+- `MigrateOptions.allowFresh`: only the owner's one-time setup passes true. A normal start passes
+  false, so a database without a schema is refused (`missing`) instead of quietly becoming a new,
+  empty ledger with no positions, halts or peak (review O, risk finding 5).
+- Inside each migration's transaction the version is read again, so a second runner at the same
+  moment stops (`schema-broken`) instead of applying a migration twice.
+- An empty database (version 0) gets no copy: there is nothing to restore. With data, the copy
+  is `pre-migration-v<from>-v<to>-<YYYYMMDDTHHMMSSZ>.sqlite` in an existing absolute folder;
+  `:memory:` takes none.
+- The clock is read once (backup name and every `applied_at`); a gap or an empty version table
+  is `schema-broken`; a failing migration's error names it and keeps its code.
+
+Architecture rules added: only `storage/sqlite.ts` imports `node:sqlite` (types included) and it
+re-exports none of it; only `storage/migrations.ts` calls `tx.script`; no source file uses
+`wrapConnection` (a test-only seam); `src/` holds only `.ts` files (anything else would escape
+these checks).
+
+Conditions from review O for the next sub-steps (REVIEWS.md O has the details):
+
+- 6c: a test over `MIGRATIONS` that the second argument of every RAISE is one quoted literal
+  (SQLite puts whatever it evaluates into the error text) and that every END closes a trigger
+  body or a CASE (a standalone `END;` is refused, with the "END; BEGIN" script of review O as its
+  canary); JSON paths written into the SQL, never bound; `detail` reaches logs and
+  Telegram only through `assertNoSecrets` (the `StorageError` comment now states these rules as
+  the conditions for "no bound value in an error"); a schema test that every table is STRICT and every
+  amount column TEXT; an architecture rule that the SQL of `get`, `all` and `run` is constant (a
+  literal, a template without substitutions, or a module constant built from literals and
+  fragments), with canaries; consider `setAuthorizer` (allowing ATTACH only during `vacuumInto`)
+  and a `length` limit as defense in depth.
+- 6d (storage boot and the app transactions): only `busy` at BEGIN and expected `constraint`
+  refusals may be handled per intent, every other code latches; cap, exposure and one-per-mint
+  reads go through the tx; a poisoned handle leads to a controlled exit and restart; the start
+  passes `create: false` and `allowFresh: false` (only the owner's one-time setup command passes
+  true for either) and refuses missing required rows; the single-instance run lock, and
+  quick_check plus foreign_key_check at every boot, exist before the bot runs on a real file; the data folder is created 0700,
+  existing `-wal`/`-shm` files are made 0600 (or refused), a database path that is a symbolic link
+  is refused, UNC paths are refused (WAL on a network share can corrupt silently), and on Windows
+  the folder stays under the user profile with the OneDrive check.
+- Before any migration 2: the pre-migration copy is checked (quick_check) before migrating.
