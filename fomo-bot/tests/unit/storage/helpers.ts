@@ -7,7 +7,36 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { migrate } from '../../../src/storage/migrations.ts';
 import { StorageError, openDb, type Db, type StorageErrorCode } from '../../../src/storage/sqlite.ts';
+
+/** A fixed instant for the repository tests: 2026-11-16 12:00 UTC. */
+export const TEST_NOW = Date.UTC(2026, 10, 16, 12);
+
+/** A database with every migration applied (as the owner's one-time setup would), in memory or in a file. */
+export function migratedDb(file = ':memory:'): Db {
+  const db = file === ':memory:' ? memDb() : fileDb(file);
+  try {
+    migrate(db, { now: () => TEST_NOW, backupDir: file === ':memory:' ? null : path.dirname(file), nodeVersion: 'v26.13.0', allowFresh: true });
+  } catch (e) {
+    db.close();
+    throw e;
+  }
+  return db;
+}
+
+/**
+ * Changes a closed database file behind the bot's back (a stand-in for tampering or a bug): a raw
+ * handle with no authorizer and no wrapper, so the tests can show what the readers do with it.
+ */
+export function tamper(file: string, script: string): void {
+  const raw = new DatabaseSync(file, { ...RAW_OPTIONS });
+  try {
+    raw.exec(script);
+  } finally {
+    raw.close();
+  }
+}
 
 export const TEST_TIMEOUT_MS = 100;
 

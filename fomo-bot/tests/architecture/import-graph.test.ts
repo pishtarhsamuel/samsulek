@@ -66,6 +66,9 @@ const RUNTIME_ONLY_FROM: Readonly<Record<string, readonly string[]>> = {
   risk: ['risk', 'app'],
   // the composition root is reached only from the process entry (cli/) and from itself, so nothing else can pick up what it holds
   app: ['app', 'cli'],
+  // the process entry and the owner's terminal commands: nothing outside cli/ reaches them, so the
+  // engine cannot pick up a command that wraps the server's writers (review Q, security finding 1a)
+  cli: ['cli'],
 };
 /**
  * The approval authority holds the token key and binds the single-use store and the slot source
@@ -82,6 +85,44 @@ const RELATIVE_SPEC = /^\.{1,2}\/[./A-Za-z0-9_-]*\.ts$/;
  */
 const SQLITE_FILE = 'storage/sqlite.ts';
 const SCRIPT_FILES = new Set([SQLITE_FILE, 'storage/migrations.ts']);
+/**
+ * Files only some files may import at runtime (types are always fine), with a static import, and that
+ * no file may re-export (reviews P, the audit writers): the chain's row writer, used by the three files
+ * that decide who may write which action; the owner's writers, for the Telegram commands after the
+ * owner check (app/owner.ts) and the server's terminal (cli/); the server's writers, for cli/ only;
+ * and app/owner.ts itself, which only its Telegram wiring file may import (none yet: Phase 3 names it;
+ * review Q, security finding 1b). Their functions are only called where they are imported, never handed
+ * on (the typed rule below), and nothing outside cli/ imports cli/. So the engine can never write an
+ * owner's or a server's audit row, and with it lift a halt or clear KILL. Keys and the allowed
+ * importers are compared exactly (a look-alike name is another file on Linux).
+ */
+const RESTRICTED_FILES: Readonly<Record<string, { readonly allows: (rel: string) => boolean; readonly who: string }>> = {
+  'storage/audit-chain.ts': {
+    allows: (rel) => ['storage/repo-audit.ts', 'storage/repo-owner.ts', 'storage/repo-server.ts'].includes(rel),
+    who: 'storage/repo-audit.ts, repo-owner.ts and repo-server.ts',
+  },
+  'storage/repo-owner.ts': { allows: (rel) => rel === 'app/owner.ts' || rel.startsWith('cli/'), who: 'app/owner.ts (Telegram, after the owner check) and cli/' },
+  'storage/repo-server.ts': { allows: (rel) => rel.startsWith('cli/'), who: 'cli/ (the owner at the server)' },
+  'app/owner.ts': { allows: () => false, who: 'its one Telegram wiring file (Phase 3 names it; none until then)' },
+};
+/**
+ * Who each writer of the audit chain may write as (review Q re-check, security R1): its every call
+ * of appendAuditRow passes an actor whose type is one of these literals, or a union of them, never a
+ * string. The database ties an action's prefix to its actor, so this decides which rows a file can
+ * write at all: a wrapper in repo-audit.ts that took the actor as a value would hand the engine the
+ * owner's rows. A file not listed writes as nobody.
+ */
+const AUDIT_ACTORS: Readonly<Record<string, readonly string[]>> = {
+  'storage/repo-audit.ts': ['engine'],
+  'storage/repo-owner.ts': ['owner-telegram', 'owner-server'],
+  'storage/repo-server.ts': ['owner-server'],
+};
+/**
+ * A conflict clause in SQL text (reviews P; VERIFIED_FACTS, conflict clauses): OR REPLACE deletes the
+ * row in the way, OR IGNORE drops a row that fails a CHECK without a word, and a column's ON CONFLICT
+ * clause would do either for every later insert. ON CONFLICT (...) DO NOTHING or DO UPDATE is the way.
+ */
+const CONFLICT_CLAUSE = /\b(?:INSERT|UPDATE)\s+OR\s+(?:REPLACE|IGNORE|ROLLBACK|ABORT|FAIL)\b|\bREPLACE\s+INTO\b|\bON\s+CONFLICT\s+(?:REPLACE|IGNORE|ROLLBACK|ABORT|FAIL)\b/i;
 /** Lower case: the check compares import targets in lower case, because Windows and macOS ignore case in file names. */
 const CLOCK_FILES = new Set(['core/clock.ts', 'core/rng.ts']);
 const RNG_FILE = 'core/rng.ts';
@@ -279,12 +320,16 @@ export function checkSource(rel: string, text: string): string[] {
     return [`${rel}: unknown top-level folder "${folder}"`];
   }
   const source = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  // a directive that switches the type check off for a line or a file hides it from the typed rules too
+  if (/@ts-(?:ignore|expect-error|nocheck)\b/.test(text)) {
+    problems.push(`${rel}: no @ts-ignore, @ts-expect-error or @ts-nocheck`);
+  }
   // A pure file is found whatever the case of its name (a look-alike `Caps.ts` is held to the same rules).
   const pureFile = Object.hasOwn(PURE_FILES, rel.toLowerCase()) ? PURE_FILES[rel.toLowerCase()] : undefined;
   const pure = CLOCK_FILES.has(rel) ? undefined : (pureFile ?? PURE[folder]);
   const declared = pure === undefined ? new Set<string>() : declaredNames(source);
 
-  const checkSpecifier = (spec: string, typeOnly: boolean, reexport = false): void => {
+  const checkSpecifier = (spec: string, typeOnly: boolean, reexport = false, dynamic = false): void => {
     if ((spec === 'node:sqlite' || spec === 'sqlite') && (rel !== SQLITE_FILE || reexport)) {
       problems.push(`${rel}: only storage/sqlite.ts may import node:sqlite, types included, and it hands none of it on (everything else uses its checked wrapper)`);
     }
@@ -330,6 +375,11 @@ export function checkSource(rel: string, text: string): string[] {
       // A re-export hands the values on to whoever imports this file: only the folder itself may do that.
       if (onlyFrom !== undefined && !typeOnly && reexport && folder.toLowerCase() !== targetFolder.toLowerCase()) {
         problems.push(`${rel}: ${target} may not be re-exported outside ${targetFolder}/ (types are fine)`);
+      }
+      // a dynamic import hands the whole module on as a value, past the rule that its functions are only called
+      const restricted = RESTRICTED_FILES[target.toLowerCase()];
+      if (restricted !== undefined && !typeOnly && (reexport || dynamic || !restricted.allows(rel))) {
+        problems.push(`${rel}: ${target} may be imported at runtime only by ${restricted.who}, with a static import, and re-exported by none (types are fine)`);
       }
       // A pure file only under its exact name: a look-alike in another case is another file on Linux.
       if (typeOnly || targetFolder === folder || allowed.includes('*') || allowed.includes(targetFolder) || Object.hasOwn(PURE_FILES, target)) {
@@ -379,7 +429,7 @@ export function checkSource(rel: string, text: string): string[] {
           problems.push(`${rel}: no dynamic import in ${folder}/ (pure code)`);
         }
         if (arg !== undefined && ts.isStringLiteral(arg)) {
-          checkSpecifier(arg.text, false);
+          checkSpecifier(arg.text, false, false, true);
           if (isCrypto(arg) && rel !== RNG_FILE) {
             problems.push(`${rel}: node:crypto may not be imported dynamically`);
           }
@@ -494,9 +544,23 @@ export function checkSource(rel: string, text: string): string[] {
     if (named) {
       problems.push(`${rel}: "constructor" is not allowed (it reaches Function and the clock)`);
     }
+    // `arguments` hands every argument on as any: a database handle among them would pass the typed rules unseen (review Q re-check, security R2)
+    if (ts.isIdentifier(node) && node.text === 'arguments' && !isPropertyName(node)) {
+      problems.push(`${rel}: no "arguments" (it hands every argument on as any, past the typed rules)`);
+    }
     // the wrapper over a connection that is already open is for the fault-injection tests: no source file uses it
     if (rel !== SQLITE_FILE && (ts.isIdentifier(node) || ts.isStringLiteralLike(node)) && node.text === 'wrapConnection') {
       problems.push(`${rel}: wrapConnection is for the storage tests only (the bot opens databases with openDb)`);
+    }
+    // no "any": a value cast to it hides its type from the typed rules (the SQL rule below), and from the type check
+    if (node.kind === ts.SyntaxKind.AnyKeyword) {
+      problems.push(`${rel}: no "any" (every value keeps a type the checks can see)`);
+    }
+    if (
+      (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) &&
+      CONFLICT_CLAUSE.test(node.text)
+    ) {
+      problems.push(`${rel}: no OR REPLACE, OR IGNORE or other conflict clause in SQL (ON CONFLICT (...) DO NOTHING or DO UPDATE instead)`);
     }
     // multi-statement SQL skips the one-statement checks: only the schema runner may run it
     if (!SCRIPT_FILES.has(rel)) {
@@ -551,9 +615,655 @@ function caseCollisions(files: readonly string[]): string[] {
   return clashes;
 }
 
+// ---------------------------------------------------------------- the SQL rule (typed)
+
+/** The compiler options of tsconfig.json: the typed rule sees the code exactly as the type check does. */
+function compilerOptions(): ts.CompilerOptions {
+  const parsed = ts.getParsedCommandLineOfConfigFile(path.resolve(SRC, '../tsconfig.json'), {}, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: () => undefined });
+  assert.ok(parsed !== undefined, 'tsconfig.json parses');
+  return parsed.options;
+}
+
+const SQL_METHODS = new Set(['get', 'all', 'run', 'script']);
+/** The wrapper's handle types: their get, all, run and script take SQL text. */
+const HANDLE_TYPES = new Set(['Reader', 'Tx', 'Db']);
+/** The files that may run SQL: the repositories, the audit chain and the schema runner (and the wrapper itself). */
+const SQL_FILE = /^storage\/(?:repo-[a-z0-9-]+|audit-[a-z0-9-]+|migrations)\.ts$/;
+
+// ---------------------------------------------------------------- which file writes what (review Q, security finding 2)
+
+interface SqlToken {
+  readonly kind: 'word' | 'name' | 'string' | 'number' | 'param' | 'punct';
+  readonly text: string;
+}
+
+const SQL_TOKEN_PATTERNS: readonly (readonly [SqlToken['kind'], RegExp])[] = [
+  ['word', /^[A-Za-z_][A-Za-z0-9_$]*/],
+  ['number', /^(?:0[xX][0-9A-Fa-f]+|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)/],
+  ['param', /^[?:@$#][A-Za-z0-9_]*/],
+  ['punct', /^(?:<>|!=|==|<=|>=|\|\||<<|>>|->>|->|\S)/],
+];
+
+/**
+ * SQL as tokens: keywords and plain names as lower-case words, quoted names (lower case), 'strings',
+ * numbers, parameters and punctuation. Comments are skipped (the wrapper refuses them anyway).
+ */
+function sqlTokens(sql: string): SqlToken[] {
+  const tokens: SqlToken[] = [];
+  let i = 0;
+  while (i < sql.length) {
+    const rest = sql.slice(i);
+    const skip = /^(?:\s+|--[^\n]*|\/\*[\s\S]*?(?:\*\/|$))/.exec(rest)?.[0];
+    const open = sql.charAt(i);
+    if (skip !== undefined) {
+      i += skip.length;
+    } else if (open === "'" || open === '"' || open === '`' || open === '[') {
+      const close = open === '[' ? ']' : open;
+      let text = '';
+      let j = i + 1;
+      while (j < sql.length) {
+        const c = sql.charAt(j);
+        j += 1;
+        if (c !== close) {
+          text += c;
+        } else if (close !== ']' && sql.charAt(j) === close) {
+          text += c; // a doubled quote stands for one
+          j += 1;
+        } else {
+          break;
+        }
+      }
+      tokens.push(open === "'" ? { kind: 'string', text } : { kind: 'name', text: text.toLowerCase() });
+      i = j;
+    } else {
+      let kind: SqlToken['kind'] = 'punct';
+      let text = open;
+      for (const [k, pattern] of SQL_TOKEN_PATTERNS) {
+        const found = pattern.exec(rest)?.[0];
+        if (found !== undefined) {
+          kind = k;
+          text = found;
+          break;
+        }
+      }
+      tokens.push({ kind, text: kind === 'word' ? text.toLowerCase() : text });
+      i += Math.max(1, text.length);
+    }
+  }
+  return tokens;
+}
+
+const isWordToken = (t: SqlToken | undefined, ...words: readonly string[]): boolean => t?.kind === 'word' && words.includes(t.text);
+const isPunctToken = (t: SqlToken | undefined, text: string): boolean => t?.kind === 'punct' && t.text === text;
+const isNameToken = (t: SqlToken | undefined): t is SqlToken => t?.kind === 'word' || t?.kind === 'name';
+/** The same tokens; a quoted name and a plain one are the same name. */
+const sameTokens = (a: readonly SqlToken[], b: readonly SqlToken[]): boolean =>
+  a.length === b.length &&
+  a.every((t, k) => {
+    const u = b[k];
+    return u !== undefined && t.text === u.text && (t.kind === u.kind || (isNameToken(t) && isNameToken(u)));
+  });
+
+interface SetItem {
+  /** The column, or null when the item is not `column = value` (the (a, b) = (...) form). */
+  readonly column: string | null;
+  readonly value: readonly SqlToken[];
+}
+
+interface SqlWrite {
+  /** The table written ([schema.]table: the table's own name), or null when the rule cannot read it. */
+  readonly table: string | null;
+  readonly kind: 'insert' | 'update' | 'delete';
+  readonly sets: readonly SetItem[];
+  readonly where: readonly SqlToken[];
+}
+
+/** An UPDATE's SET clause, item by item (split at the commas outside brackets). */
+function setItems(clause: readonly SqlToken[]): SetItem[] {
+  const items: SetItem[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let k = 0; k <= clause.length; k += 1) {
+    const t = clause[k];
+    if (k === clause.length || (depth === 0 && isPunctToken(t, ','))) {
+      const item = clause.slice(start, k);
+      const first = item[0];
+      const named = isNameToken(first) && isPunctToken(item[1], '=');
+      items.push(named ? { column: first.text, value: item.slice(2) } : { column: null, value: item });
+      start = k + 1;
+    } else if (isPunctToken(t, '(')) {
+      depth += 1;
+    } else if (isPunctToken(t, ')')) {
+      depth -= 1;
+    }
+  }
+  return items;
+}
+
+/** Every INSERT, UPDATE and DELETE in the SQL text; an upsert's DO UPDATE updates the table of its INSERT. */
+function sqlWrites(tokens: readonly SqlToken[]): SqlWrite[] {
+  const writes: SqlWrite[] = [];
+  // the first top-level word of `stops` from `from` on (or the bracket that closes an outer level)
+  const stopAt = (from: number, stops: readonly string[]): number => {
+    let depth = 0;
+    for (let k = from; k < tokens.length; k += 1) {
+      const t = tokens[k];
+      if (isPunctToken(t, '(')) {
+        depth += 1;
+      } else if (isPunctToken(t, ')')) {
+        if (depth === 0) {
+          return k;
+        }
+        depth -= 1;
+      } else if (depth === 0 && isWordToken(t, ...stops)) {
+        return k;
+      }
+    }
+    return tokens.length;
+  };
+  const tableAt = (k: number): string | null => {
+    const first = tokens[k];
+    const second = isPunctToken(tokens[k + 1], '.') ? tokens[k + 2] : undefined;
+    if (!isNameToken(first)) {
+      return null;
+    }
+    if (second === undefined) {
+      return first.text;
+    }
+    return isNameToken(second) ? second.text : null;
+  };
+  const afterOr = (k: number): number => (isWordToken(tokens[k], 'or') ? k + 2 : k);
+  let insertTable: string | null = null;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i];
+    if (isWordToken(t, 'insert', 'replace') && isWordToken(tokens[afterOr(i + 1)], 'into')) {
+      i = afterOr(i + 1); // INSERT OR REPLACE INTO is one insert, not two
+      insertTable = tableAt(i + 1);
+      writes.push({ table: insertTable, kind: 'insert', sets: [], where: [] });
+    } else if (isWordToken(t, 'update') && !isWordToken(tokens[i - 1], 'before', 'after', 'of')) {
+      // (BEFORE, AFTER and INSTEAD OF UPDATE name a trigger's event, not a write)
+      const table = isWordToken(tokens[i - 1], 'do') ? insertTable : tableAt(afterOr(i + 1));
+      const set = stopAt(i + 1, ['set']); // past an alias or INDEXED BY
+      const end = stopAt(set + 1, ['where', 'from', 'returning', 'order', 'limit', 'on']);
+      const where = isWordToken(tokens[end], 'where') ? tokens.slice(end + 1, stopAt(end + 1, ['returning', 'order', 'limit', 'on'])) : [];
+      writes.push({ table, kind: 'update', sets: setItems(tokens.slice(set + 1, end)), where });
+    } else if (isWordToken(t, 'delete') && isWordToken(tokens[i + 1], 'from')) {
+      writes.push({ table: tableAt(i + 2), kind: 'delete', sets: [], where: [] });
+    }
+  }
+  return writes;
+}
+
+/** The files that lift what only the owner lifts (STORAGE_DESIGN s.12.1): the owner's commands and the owner at the server. */
+const OWNER_WRITERS: readonly string[] = ['storage/repo-owner.ts', 'storage/repo-server.ts'];
+
+/**
+ * What a statement writes that its file may not (review Q, security finding 2). The database checks
+ * an audit row's id, link and actor but not its hash, so a raw INSERT INTO audit_log anywhere could
+ * forge the owner's row that a clear needs; the import rules alone do not stop that. So: audit rows
+ * only from audit-chain.ts; lifting a halt, clearing KILL or the pause, the time halts were lifted and
+ * a strategy's mode only from the owner's and the server's files (the engine's file may only demote,
+ * live to paper); a gate start only moves later; the flags row and the mode rows are the migration's.
+ */
+function writeProblems(rel: string, sql: string): string[] {
+  const out: string[] = [];
+  const one = sqlTokens('1');
+  for (const w of sqlWrites(sqlTokens(sql))) {
+    // every assignment to the column: SQLite accepts one column twice in a SET and takes the last (VERIFIED_FACTS)
+    const items = (column: string): readonly SetItem[] => w.sets.filter((s) => s.column === column);
+    const has = (...columns: readonly string[]): boolean => columns.some((c) => items(c).length > 0);
+    const named = w.sets.flatMap((s) => (s.column === null ? [] : [s.column]));
+    if (w.table === null) {
+      out.push(`${rel}: write to a table named plainly (the write rules could not read this one)`);
+    } else if (w.table === 'audit_log') {
+      if (rel !== 'storage/audit-chain.ts') {
+        out.push(`${rel}: only storage/audit-chain.ts writes audit_log (everything else calls its writers)`);
+      }
+    } else if (w.table === 'halt_reasons') {
+      if (w.kind !== 'insert' && !OWNER_WRITERS.includes(rel)) {
+        out.push(`${rel}: only repo-owner.ts and repo-server.ts lift a halt (DELETE or UPDATE on halt_reasons)`);
+      }
+    } else if (w.table === 'entry_bans') {
+      if (w.kind === 'delete' && rel !== 'storage/repo-flags.ts') {
+        out.push(`${rel}: only repo-flags.ts deletes entry bans (its prune keeps them a day after they end)`);
+      }
+    } else if (w.table === 'flags' || w.table === 'strategy_modes') {
+      if (w.kind !== 'update') {
+        out.push(`${rel}: the flags row and the strategy modes are the migration's (no INSERT or DELETE)`);
+        continue;
+      }
+      if (w.sets.some((s) => s.column === null)) {
+        out.push(`${rel}: set each column of ${w.table} on its own (no (a, b) = (...))`);
+      }
+      if (new Set(named).size !== named.length) {
+        out.push(`${rel}: set each column of ${w.table} once (SQLite takes the last of two)`);
+      }
+      if (w.table === 'flags') {
+        const kill = items('kill');
+        const paused = items('paused');
+        if (kill.some((s) => !sameTokens(s.value, one)) && rel !== 'storage/repo-server.ts') {
+          out.push(`${rel}: only repo-server.ts clears KILL (anywhere else kill = 1 only)`);
+        }
+        if (kill.length === 0 && has('kill_at', 'kill_source', 'kill_audit_id')) {
+          out.push(`${rel}: kill_at, kill_source and kill_audit_id change only together with kill`);
+        }
+        if (paused.some((s) => !sameTokens(s.value, one)) && rel !== 'storage/repo-owner.ts') {
+          out.push(`${rel}: only repo-owner.ts clears the pause (anywhere else paused = 1 only)`);
+        }
+        if (paused.length === 0 && has('paused_at')) {
+          out.push(`${rel}: paused_at changes only together with paused`);
+        }
+        if (has('halt_cleared_at') && !OWNER_WRITERS.includes(rel)) {
+          out.push(`${rel}: only repo-owner.ts and repo-server.ts record when halts were lifted (it starts the recovery wait)`);
+        }
+      } else {
+        const mode = items('mode');
+        const demotes =
+          rel === 'storage/repo-flags.ts' &&
+          mode.length > 0 &&
+          mode.every((s) => sameTokens(s.value, sqlTokens("'paper'"))) &&
+          sameTokens(w.where, sqlTokens("strategy = ? AND mode = 'live'"));
+        if (mode.length > 0 && rel !== 'storage/repo-owner.ts' && !demotes) {
+          out.push(`${rel}: only repo-owner.ts sets a strategy's mode (repo-flags.ts only demotes: mode = 'paper' WHERE strategy = ? AND mode = 'live')`);
+        }
+        if (mode.length === 0 && has('changed_by', 'changed_at')) {
+          out.push(`${rel}: changed_by and changed_at change only together with the mode`);
+        }
+        if (items('gate_since').some((s) => !sameTokens(s.value, sqlTokens('max(gate_since, ?)')))) {
+          out.push(`${rel}: a gate start only moves later (gate_since = max(gate_since, ?))`);
+        }
+        if (has('strategy')) {
+          out.push(`${rel}: a strategy's row keeps its strategy`);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+interface TypedRuleResult {
+  readonly problems: string[];
+  /** Handle calls the constant-SQL rule checked. */
+  readonly calls: number;
+  /** Writes (INSERT, UPDATE, DELETE) the write rules read. */
+  readonly writes: number;
+  /** Values of a handle's type whose use was checked. */
+  readonly uses: number;
+  /** Direct calls to a restricted file's functions. */
+  readonly restrictedCalls: number;
+  /** Calls of the chain's row writer whose actor was checked. */
+  readonly auditCalls: number;
+}
+
+/** The expression is the callee of a call: `f(...)` or `ns.f(...)`. */
+const isDirectCallee = (e: ts.Node): boolean => ts.isCallExpression(e.parent) && e.parent.expression === e;
+
+/**
+ * The typed rules, with the type checker, so the wrapper's methods are told apart from a map's get:
+ * - constant SQL (review O, security condition 4; reviews P, condition 8a): every use of a handle's
+ *   get, all, run or script is a direct call (no alias, no reference, no [] access, no
+ *   destructuring), and only in the files of SQL_FILE: everything else calls a repository. Its SQL is
+ *   a literal, or a top-level const of a source file built from literals, other such consts,
+ *   templates and + (never a value: values go in parameters), and the text it adds up to has no
+ *   conflict clause; the schema runner may also run a migration's own `sql` (each is pinned by its
+ *   sha256). A get, all, run or script on a value of type any is refused (with "any" banned, only
+ *   JSON.parse and the like make one);
+ * - which file writes what (writeProblems; review Q, security finding 2), read from that same text;
+ * - a database handle keeps its type (review Q, security finding 4): a value with a handle's methods
+ *   has them called directly, goes only to a parameter typed Reader, Tx or Db of storage/sqlite.ts
+ *   (or a type parameter constrained to one), and is kept only where the type is one of those (a
+ *   variable, field, property, element or return value; one without a written type keeps the
+ *   handle's own). So Reflect, Object.*, an assertion or a hand-written structural type cannot carry
+ *   it past the rules above, and only sqlite.ts extends or implements the handle types;
+ * - a restricted file's functions (RESTRICTED_FILES) are only called where they are imported, never
+ *   exported again, aliased, stored, bound or passed on, and a namespace import of one is used only
+ *   as ns.name(...) (review Q, security finding 1c);
+ * - each writer of the audit chain writes only as its own actors (AUDIT_ACTORS; re-check, R1);
+ * - nothing calls a value of type any: its arguments, a handle among them, would go unchecked
+ *   (re-check, R2; with "any" and `arguments` banned, only JSON.parse, Reflect and the like make one).
+ * Returns the problems, and how much each rule saw (so a rule that sees nothing fails).
+ */
+export function sqlProblems(program: ts.Program, srcRoot: string): TypedRuleResult {
+  const checker = program.getTypeChecker();
+  const relOf = (sf: ts.SourceFile): string => path.relative(srcRoot, sf.fileName).split(path.sep).join('/');
+  const isHandleMethod = (symbol: ts.Symbol | undefined): boolean =>
+    symbol !== undefined &&
+    SQL_METHODS.has(symbol.name) &&
+    (symbol.declarations ?? []).some(
+      (d) => ts.isMethodSignature(d) && ts.isInterfaceDeclaration(d.parent) && HANDLE_TYPES.has(d.parent.name.text) && relOf(d.getSourceFile()) === SQLITE_FILE,
+    );
+  const isTopLevelConst = (d: ts.VariableDeclaration): boolean =>
+    ts.isVariableDeclarationList(d.parent) &&
+    (d.parent.flags & ts.NodeFlags.Const) !== 0 &&
+    ts.isVariableStatement(d.parent.parent) &&
+    ts.isSourceFile(d.parent.parent.parent);
+  /** The text a constant SQL expression adds up to, or null when it is not one. */
+  const constantText = (expr: ts.Expression, seen: Set<ts.Node>): string | null => {
+    const e = ts.isParenthesizedExpression(expr) ? expr.expression : expr;
+    if (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e)) {
+      return e.text;
+    }
+    if (ts.isTemplateExpression(e)) {
+      let out = e.head.text;
+      for (const span of e.templateSpans) {
+        const part = constantText(span.expression, seen);
+        if (part === null) {
+          return null;
+        }
+        out += part + span.literal.text;
+      }
+      return out;
+    }
+    if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = constantText(e.left, seen);
+      const right = constantText(e.right, seen);
+      return left === null || right === null ? null : left + right;
+    }
+    if (ts.isIdentifier(e)) {
+      let symbol = checker.getSymbolAtLocation(e);
+      if (symbol !== undefined && (symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+        symbol = checker.getAliasedSymbol(symbol);
+      }
+      const d = symbol?.valueDeclaration;
+      if (d === undefined || !ts.isVariableDeclaration(d) || d.initializer === undefined || !isTopLevelConst(d) || relOf(d.getSourceFile()).startsWith('..') || seen.has(d)) {
+        return null;
+      }
+      seen.add(d);
+      return constantText(d.initializer, seen);
+    }
+    return null;
+  };
+  /**
+   * The runner's own scripts: `m.sql` where m is a Migration of storage/migrations.ts, or a top-level
+   * const of that file (the version table, built from schema fragments). Each one's exact text is
+   * pinned by its sha256 in a test, which is what makes it constant.
+   */
+  const isPinnedScript = (e: ts.Expression): boolean => {
+    if (ts.isPropertyAccessExpression(e)) {
+      return (
+        e.name.text === 'sql' &&
+        (checker.getSymbolAtLocation(e.name)?.declarations ?? []).some(
+          (d) => ts.isPropertySignature(d) && ts.isInterfaceDeclaration(d.parent) && d.parent.name.text === 'Migration' && relOf(d.getSourceFile()) === 'storage/migrations.ts',
+        )
+      );
+    }
+    const d = ts.isIdentifier(e) ? checker.getSymbolAtLocation(e)?.valueDeclaration : undefined;
+    return d !== undefined && ts.isVariableDeclaration(d) && isTopLevelConst(d) && relOf(d.getSourceFile()) === 'storage/migrations.ts';
+  };
+  /** An object literal on the left of `=` (perhaps inside another one there): a destructuring assignment. */
+  const isAssignmentTarget = (literal: ts.Node): boolean => {
+    let child = literal;
+    let parent = literal.parent;
+    while (ts.isParenthesizedExpression(parent)) {
+      child = parent;
+      parent = parent.parent;
+    }
+    if (ts.isBinaryExpression(parent)) {
+      return parent.operatorToken.kind === ts.SyntaxKind.EqualsToken && parent.left === child;
+    }
+    return ts.isObjectLiteralExpression(literal) && ts.isPropertyAssignment(parent) && parent.initializer === child && isAssignmentTarget(parent.parent);
+  };
+  /** The type a destructuring pattern takes apart: the value it is given, or the parameter's own type. */
+  const destructured = (pattern: ts.ObjectBindingPattern): ts.Type | undefined => {
+    const owner = pattern.parent;
+    if (ts.isVariableDeclaration(owner)) {
+      return owner.initializer === undefined ? undefined : checker.getTypeAtLocation(owner.initializer);
+    }
+    return ts.isParameter(owner) || ts.isBindingElement(owner) ? checker.getTypeAtLocation(owner) : undefined;
+  };
+
+  // ---- a handle keeps its type
+  const isHandleInterface = (d: ts.Declaration): boolean => ts.isInterfaceDeclaration(d) && HANDLE_TYPES.has(d.name.text) && relOf(d.getSourceFile()) === SQLITE_FILE;
+  /** The value has a handle's methods: it is, or may be, a database handle. */
+  const carriesHandle = (type: ts.Type): boolean => (type.isUnion() ? type.types.some(carriesHandle) : [...SQL_METHODS].some((m) => isHandleMethod(type.getProperty(m))));
+  /** Reader, Tx or Db of storage/sqlite.ts (undefined or null besides is fine), or a type parameter constrained to one. */
+  const isHandleSlot = (type: ts.Type): boolean => {
+    if ((type.flags & ts.TypeFlags.TypeParameter) !== 0) {
+      const constraint = checker.getBaseConstraintOfType(type);
+      return constraint !== undefined && constraint !== type && isHandleSlot(constraint);
+    }
+    if (type.isUnion()) {
+      const rest = type.types.filter((t) => (t.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null)) === 0);
+      return rest.length > 0 && rest.every(isHandleSlot);
+    }
+    return (type.getSymbol()?.declarations ?? []).some(isHandleInterface);
+  };
+  /** The written type of the parameter an argument goes to (in the declaration, before inference); none for a rest parameter or one with no type written. */
+  const parameterType = (call: ts.CallExpression | ts.NewExpression, arg: ts.Expression): ts.Type | undefined => {
+    const args: readonly ts.Expression[] = call.arguments ?? [];
+    const parameter = checker.getResolvedSignature(call)?.getDeclaration()?.parameters[args.indexOf(arg)];
+    return parameter?.type === undefined || parameter.dotDotDotToken !== undefined ? undefined : checker.getTypeFromTypeNode(parameter.type);
+  };
+  const PASSES_ON = new Set([ts.SyntaxKind.QuestionQuestionToken, ts.SyntaxKind.BarBarToken, ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.CommaToken]);
+  const COMPARES = new Set([ts.SyntaxKind.EqualsEqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsEqualsToken]);
+  /** Why this use of a value with a handle's type could hand the handle on under another type, or null. */
+  const handleUseProblem = (use: ts.Expression): string | null => {
+    const p = use.parent;
+    if (ts.isPropertyAccessExpression(p) && p.expression === use) {
+      // a method is called, never taken; a data property (db.file) is only read
+      const data = (checker.getSymbolAtLocation(p.name)?.declarations ?? []).every((d) => ts.isPropertySignature(d));
+      return isDirectCallee(p) || data ? null : "call a database handle's methods directly (no reference, .call or .bind)";
+    }
+    if ((ts.isCallExpression(p) || ts.isNewExpression(p)) && p.arguments?.includes(use) === true) {
+      const slot = parameterType(p, use);
+      return slot !== undefined && isHandleSlot(slot) ? null : 'a database handle goes only to a parameter typed Reader, Tx or Db (or a type parameter constrained to one)';
+    }
+    if (ts.isAsExpression(p) || ts.isTypeAssertionExpression(p) || ts.isSatisfiesExpression(p)) {
+      return 'no type assertion on a database handle';
+    }
+    if (ts.isVariableDeclaration(p) && p.initializer === use && !ts.isIdentifier(p.name)) {
+      return 'do not destructure a database handle';
+    }
+    if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsToken && p.left === use) {
+      return null; // written to: what is written is checked
+    }
+    const kept =
+      ((ts.isVariableDeclaration(p) || ts.isPropertyDeclaration(p) || ts.isParameter(p)) && p.initializer === use) ||
+      ts.isReturnStatement(p) ||
+      (ts.isArrowFunction(p) && p.body === use) ||
+      (ts.isPropertyAssignment(p) && p.initializer === use) ||
+      ts.isShorthandPropertyAssignment(p) ||
+      ts.isArrayLiteralExpression(p) ||
+      (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsToken && p.right === use);
+    if (kept) {
+      const slot = checker.getContextualType(use);
+      return slot === undefined || isHandleSlot(slot) ? null : 'a database handle is kept only where the type is Reader, Tx or Db';
+    }
+    // it flows on inside a larger expression of the handle's type (checked in turn), or is only tested
+    const passes =
+      (ts.isBinaryExpression(p) && (PASSES_ON.has(p.operatorToken.kind) || COMPARES.has(p.operatorToken.kind))) ||
+      ts.isConditionalExpression(p) ||
+      ts.isAwaitExpression(p) ||
+      ts.isExpressionStatement(p) ||
+      ts.isExportAssignment(p) ||
+      ts.isTypeOfExpression(p) ||
+      ts.isVoidExpression(p) ||
+      (ts.isPrefixUnaryExpression(p) && p.operator === ts.SyntaxKind.ExclamationToken) ||
+      ((ts.isIfStatement(p) || ts.isWhileStatement(p) || ts.isDoStatement(p)) && p.expression === use);
+    return passes ? null : 'a database handle goes only to a parameter, variable or return value typed Reader, Tx or Db, or has its methods called';
+  };
+  /** A value expression whose own type is read (a name that is only a key, a declaration or a type is not one). */
+  const isValueExpression = (node: ts.Node): node is ts.Expression =>
+    ts.isIdentifier(node) ? !isPropertyName(node) && !isDeclarationName(node) && !inTypeContext(node) : ts.isExpression(node) && !inTypeContext(node);
+
+  // ---- a restricted file's functions are only called
+  const resolvedSymbol = (symbol: ts.Symbol | undefined): ts.Symbol | undefined =>
+    symbol !== undefined && (symbol.flags & ts.SymbolFlags.Alias) !== 0 ? checker.getAliasedSymbol(symbol) : symbol;
+  /** The restricted file a function comes from, or null (for its data and for everything else). */
+  const restrictedFunctionFile = (symbol: ts.Symbol | undefined): string | null => {
+    const target = resolvedSymbol(symbol);
+    const d = target?.valueDeclaration;
+    if (target === undefined || d === undefined || !Object.hasOwn(RESTRICTED_FILES, relOf(d.getSourceFile()))) {
+      return null;
+    }
+    return checker.getTypeOfSymbolAtLocation(target, d).getCallSignatures().length > 0 ? relOf(d.getSourceFile()) : null;
+  };
+  const isRestrictedNamespace = (symbol: ts.Symbol | undefined): boolean =>
+    (resolvedSymbol(symbol)?.declarations ?? []).some((d) => ts.isSourceFile(d) && Object.hasOwn(RESTRICTED_FILES, relOf(d)));
+
+  const problems: string[] = [];
+  let calls = 0;
+  let writes = 0;
+  let uses = 0;
+  let restrictedCalls = 0;
+  let auditCalls = 0;
+  for (const sf of program.getSourceFiles()) {
+    const rel = relOf(sf);
+    if (sf.isDeclarationFile || rel.startsWith('..') || rel === SQLITE_FILE) {
+      continue;
+    }
+    const checkCall = (access: ts.PropertyAccessExpression, method: string): void => {
+      const call = access.parent;
+      if (!ts.isCallExpression(call) || call.expression !== access) {
+        problems.push(`${rel}: call ${method} directly on the database handle (no alias and no reference)`);
+        return;
+      }
+      calls += 1;
+      if (!SQL_FILE.test(rel)) {
+        problems.push(`${rel}: only the storage repositories run SQL (storage/repo-*.ts); everything else calls them`);
+      }
+      const arg = call.arguments[0];
+      if (method === 'script' && rel === 'storage/migrations.ts' && arg !== undefined && isPinnedScript(arg)) {
+        return;
+      }
+      const text = arg === undefined ? null : constantText(arg, new Set());
+      if (text === null) {
+        problems.push(`${rel}: the SQL of ${method} must be a literal or a top-level const built from literals (values go in parameters)`);
+      } else if (CONFLICT_CLAUSE.test(text)) {
+        problems.push(`${rel}: no OR REPLACE, OR IGNORE or other conflict clause in SQL (ON CONFLICT (...) DO NOTHING or DO UPDATE instead)`);
+      } else {
+        writes += sqlWrites(sqlTokens(text)).length;
+        problems.push(...writeProblems(rel, text));
+      }
+    };
+    const visit = (node: ts.Node): void => {
+      if (isValueExpression(node) && !ts.isParenthesizedExpression(node.parent) && !ts.isNonNullExpression(node.parent) && carriesHandle(checker.getTypeAtLocation(node))) {
+        uses += 1;
+        const problem = handleUseProblem(node);
+        if (problem !== null) {
+          problems.push(`${rel}: ${problem}`);
+        }
+      }
+      if (ts.isHeritageClause(node) && node.types.some((t) => carriesHandle(checker.getTypeAtLocation(t)))) {
+        problems.push(`${rel}: only storage/sqlite.ts extends or implements Reader, Tx or Db (a look-alike type carries a handle past the rules)`);
+      }
+      if (ts.isCallExpression(node)) {
+        if ((checker.getTypeAtLocation(node.expression).flags & ts.TypeFlags.Any) !== 0) {
+          problems.push(`${rel}: a call of a value of type any (its arguments, a database handle among them, would go unchecked)`);
+        }
+        const callee = resolvedSymbol(checker.getSymbolAtLocation(ts.isPropertyAccessExpression(node.expression) ? node.expression.name : node.expression));
+        const d = callee?.valueDeclaration;
+        if (d !== undefined && ts.isFunctionDeclaration(d) && d.name?.text === 'appendAuditRow' && relOf(d.getSourceFile()) === 'storage/audit-chain.ts' && rel !== 'storage/audit-chain.ts') {
+          // the actor is the third argument: its type must be one of the file's own literals, or a union of them
+          auditCalls += 1;
+          const allowed = AUDIT_ACTORS[rel];
+          const actor = node.arguments[2];
+          const type = actor === undefined ? undefined : checker.getTypeAtLocation(actor);
+          const parts = type === undefined ? [] : type.isUnion() ? type.types : [type];
+          if (allowed === undefined || parts.length === 0 || !parts.every((t) => t.isStringLiteral() && allowed.includes(t.value))) {
+            const who = allowed === undefined ? "nobody (this file is not one of the chain's writers)" : allowed.join(' or ');
+            problems.push(`${rel}: appendAuditRow's actor here must be ${who}, as a literal type (never a string or a wider union)`);
+          }
+        }
+      }
+      const parent = node.parent; // undefined only at the file itself
+      const imported = ts.isIdentifier(node) && (ts.isImportSpecifier(parent) || ts.isImportClause(parent) || ts.isNamespaceImport(parent));
+      if (ts.isIdentifier(node) && !imported && !inTypeContext(node)) {
+        const symbol = ts.isShorthandPropertyAssignment(parent) && parent.name === node ? checker.getShorthandAssignmentValueSymbol(parent) : checker.getSymbolAtLocation(node);
+        const from = restrictedFunctionFile(symbol);
+        if (from !== null && from !== rel) {
+          // ns.f(...) is the call of f; anything but a direct call hands the function on
+          const use = ts.isPropertyAccessExpression(parent) && parent.name === node ? parent : node;
+          if (isDirectCallee(use)) {
+            restrictedCalls += 1;
+          } else {
+            problems.push(`${rel}: ${node.text} of ${from} is only called where it is imported, never handed on (no export, alias, value, binding or callback)`);
+          }
+        } else if (from === null && isRestrictedNamespace(symbol) && !(ts.isPropertyAccessExpression(parent) && parent.expression === node)) {
+          problems.push(`${rel}: a restricted file's namespace is used only as ${node.text}.name(...)`);
+        }
+      }
+      if (ts.isPropertyAccessExpression(node) && SQL_METHODS.has(node.name.text)) {
+        if ((checker.getTypeAtLocation(node.expression).flags & ts.TypeFlags.Any) !== 0) {
+          problems.push(`${rel}: .${node.name.text} on a value of type any (a database handle keeps its type)`);
+        } else if (isHandleMethod(checker.getSymbolAtLocation(node.name))) {
+          checkCall(node, node.name.text);
+        }
+      } else if (ts.isElementAccessExpression(node)) {
+        const type = checker.getTypeAtLocation(node.expression);
+        if ([...SQL_METHODS].some((m) => isHandleMethod(type.getProperty(m)))) {
+          problems.push(`${rel}: a database handle is used through its named methods only (no [] access)`);
+        }
+      } else if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)) {
+        const key = node.propertyName ?? node.name;
+        if ((ts.isIdentifier(key) || ts.isStringLiteralLike(key)) && SQL_METHODS.has(key.text) && isHandleMethod(destructured(node.parent)?.getProperty(key.text))) {
+          problems.push(`${rel}: do not take ${key.text} off a database handle`);
+        }
+      } else if ((ts.isShorthandPropertyAssignment(node) || ts.isPropertyAssignment(node)) && isAssignmentTarget(node.parent)) {
+        // ({ run } = tx) or ({ run: r } = tx): a destructuring assignment
+        const name = node.name;
+        if (ts.isIdentifier(name) && SQL_METHODS.has(name.text) && isHandleMethod(checker.getPropertySymbolOfDestructuringAssignment(name))) {
+          problems.push(`${rel}: do not take ${name.text} off a database handle`);
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+  }
+  return { problems, calls, writes, uses, restrictedCalls, auditCalls };
+}
+
+/** A program over virtual source files (for the canaries), checked with the project's options. */
+function virtualProgram(files: Readonly<Record<string, string>>): { readonly program: ts.Program; readonly srcRoot: string } {
+  const srcRoot = path.join(tmpdir(), 'fomo-sql-canary', 'src');
+  const options = { ...compilerOptions(), types: [] };
+  const host = ts.createCompilerHost(options);
+  const contents = new Map(Object.entries(files).map(([rel, text]) => [path.join(srcRoot, rel), text]));
+  const realGet = host.getSourceFile.bind(host);
+  const realExists = host.fileExists.bind(host);
+  const realRead = host.readFile.bind(host);
+  host.getSourceFile = (fileName, version, onError, create) => {
+    const text = contents.get(path.resolve(fileName));
+    return text === undefined ? realGet(fileName, version, onError, create) : ts.createSourceFile(fileName, text, version, true, ts.ScriptKind.TS);
+  };
+  const realDirectory = host.directoryExists?.bind(host);
+  host.fileExists = (fileName) => contents.has(path.resolve(fileName)) || realExists(fileName);
+  host.readFile = (fileName) => contents.get(path.resolve(fileName)) ?? realRead(fileName);
+  // the resolver looks for the folder first: without this every import between virtual files fails,
+  // the types become errors (which count as any), and a canary would be caught for the wrong reason
+  host.directoryExists = (dir) => [...contents.keys()].some((file) => file.startsWith(path.resolve(dir) + path.sep)) || (realDirectory?.(dir) ?? false);
+  const program = ts.createProgram([...contents.keys()], options, host);
+  const unresolved = ts.getPreEmitDiagnostics(program).filter((d) => d.code === 2307).map((d) => ts.flattenDiagnosticMessageText(d.messageText, ' '));
+  assert.deepEqual(unresolved, [], 'every import between the virtual files resolves');
+  return { program, srcRoot };
+}
+
 const flagged = (cases: readonly (readonly [string, string])[]): void => {
   for (const [rel, text] of cases) {
     assert.ok(checkSource(rel, text).length > 0, `should flag ${rel}: ${text}`);
+  }
+};
+
+/** Each case is caught for its own reason: one of its problems names the rule (review Q, security finding 5). */
+const flaggedFor = (cases: readonly (readonly [string, string, string])[]): void => {
+  for (const [rel, text, why] of cases) {
+    const problems = checkSource(rel, text);
+    assert.ok(
+      problems.some((p) => p.startsWith(`${rel}: `) && p.includes(why)),
+      `should flag ${rel} because "${why}": ${text}\n  got: ${problems.join('\n  got: ')}`,
+    );
+  }
+};
+
+/** The same for the typed rules: each file has a problem that names its rule. */
+const typedFlaggedFor = (problems: readonly string[], cases: Readonly<Record<string, readonly [string, ...string[]]>>): void => {
+  for (const [rel, [text, ...whys]] of Object.entries(cases)) {
+    for (const why of whys) {
+      assert.ok(
+        problems.some((p) => p.startsWith(`${rel}: `) && p.includes(why)),
+        `should flag ${rel} because "${why}": ${text}\n  got: ${problems.filter((p) => p.startsWith(`${rel}: `)).join('\n  got: ')}`,
+      );
+    }
   }
 };
 
@@ -882,16 +1592,25 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
     assert.deepEqual(checkSource('risk/x.ts', "import type { Db } from '../storage/db.ts'; export const x = (d: Db): Db => d;"), []);
   });
 
-  it('CANARY: app/ cannot hand risk/ values on, and only cli/ reaches app/ at runtime', () => {
+  it('CANARY: app/ cannot hand risk/ values on, only cli/ reaches app/ at runtime, and nothing outside cli/ reaches cli/ (review Q, security 1a)', () => {
     flagged([
       ['app/x.ts', "export { createApprovalAuthority } from '../risk/approval.ts';"],
       ['app/x.ts', "export * from '../risk/approval.ts';"],
       ['execution/y.ts', "import { build } from '../app/x.ts';"],
       ['signer/y.ts', "import { build } from '../app/x.ts';"],
     ]);
+    // app/ may import every folder, so only this rule stops the engine from picking up a command that wraps the server's writers
+    flaggedFor([
+      ['app/engine.ts', "import { reset } from '../cli/reset.ts'; export const r = reset;", 'may be imported at runtime only from cli'],
+      ['app/engine.ts', "export { reset } from '../cli/reset.ts';", 'may be imported at runtime only from cli'],
+      ['app/engine.ts', "export const load = async () => import('../cli/reset.ts');", 'may be imported at runtime only from cli'],
+      ['app/engine.ts', "import { reset } from '../CLI/reset.ts'; export const r = reset;", 'may be imported at runtime only from cli'], // case
+    ]);
     assert.deepEqual(checkSource('app/x.ts', "export type { ApprovalToken } from '../risk/approval.ts';"), []); // types are fine
     assert.deepEqual(checkSource('app/x.ts', "import { approveBuy } from '../risk/approve.ts'; export const build = () => approveBuy;"), []); // using it is the point of app/
     assert.deepEqual(checkSource('cli/y.ts', "import { build } from '../app/x.ts';"), []);
+    assert.deepEqual(checkSource('cli/main.ts', "import { reset } from './reset.ts'; export const r = reset;"), []);
+    assert.deepEqual(checkSource('app/x.ts', "import type { Reset } from '../cli/reset.ts'; export const f = (r: Reset): Reset => r;"), []); // types are fine
     assert.deepEqual(checkSource('risk/z.ts', "export { approveBuy } from './approve.ts';"), []); // risk/ itself may
   });
 
@@ -927,6 +1646,395 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
 
   it('there are no symbolic links under src/: a link could point a file in one folder at code in another', () => {
     assert.deepEqual(symlinksUnder(SRC), []);
+  });
+
+  it('CANARY: the audit writers reach only their callers: the chain only its three files, the owner\'s only app/owner.ts and cli/, the server\'s only cli/, app/owner.ts only its wiring file; none is re-exported or imported dynamically (reviews P, Q)', () => {
+    const only = 'may be imported at runtime only by';
+    flaggedFor([
+      ['storage/repo-flags.ts', "import { appendAuditRow } from './audit-chain.ts'; export function f(): number { return appendAuditRow(); }", only],
+      ['app/engine.ts', "import { appendAuditRow } from '../storage/audit-chain.ts'; export function f(): number { return appendAuditRow(); }", only],
+      ['app/engine.ts', "import { resumeHalt } from '../storage/repo-owner.ts'; export function f(): boolean { return resumeHalt(); }", only],
+      ['app/day-tx.ts', "import { appendOwnerAudit } from '../storage/repo-owner.ts'; export function f(): number { return appendOwnerAudit(); }", only],
+      ['app/owner.ts', "import { clearKill } from '../storage/repo-server.ts'; export function f(): void { clearKill(); }", only], // Telegram never clears KILL
+      // also outside telegram/'s folder edges: this proves the file rule, not the folder rule
+      ['telegram/x.ts', "import { clearKill } from '../storage/repo-server.ts'; export function f(): void { clearKill(); }", `${only} cli/`],
+      ['storage/repo-audit.ts', "export { appendAuditRow } from './audit-chain.ts';", only], // an allowed importer, but a re-export
+      ['storage/repo-owner.ts', "export * from './audit-chain.ts';", only],
+      ['cli/x.ts', "export { clearKill } from '../storage/repo-server.ts';", only],
+      ['app/engine.ts', "export const load = async () => import('../storage/repo-server.ts');", only],
+      ['cli/x.ts', "export const load = async () => import('../storage/repo-server.ts');", 'with a static import'], // an allowed importer, but the whole module as a value
+      ['app/engine.ts', "import { resumeHalt } from '../storage/Repo-Owner.ts'; export function f(): boolean { return resumeHalt(); }", only], // case
+      ['app/Owner.ts', "import { resumeHalt } from '../storage/repo-owner.ts'; export function f(): boolean { return resumeHalt(); }", only], // a look-alike importer
+      // app/owner.ts is restricted itself: only its Telegram wiring file (Phase 3) may reach it (review Q, security 1b)
+      ['app/engine.ts', "import { onOwnerUpdate } from './owner.ts'; export function f(): void { onOwnerUpdate(); }", `${only} its one Telegram wiring file`],
+      ['cli/x.ts', "import { onOwnerUpdate } from '../app/owner.ts'; export function f(): void { onOwnerUpdate(); }", `${only} its one Telegram wiring file`],
+    ]);
+    // the typed rule (below) checks that what is imported is only called; these are the import rules alone
+    const fine: [string, string][] = [
+      ['storage/repo-owner.ts', "import { appendAuditRow } from './audit-chain.ts'; export function f(): number { return appendAuditRow(); }"],
+      ['storage/repo-server.ts', "import { appendAuditRow } from './audit-chain.ts'; export function f(): number { return appendAuditRow(); }"],
+      ['app/owner.ts', "import { resumeHalt } from '../storage/repo-owner.ts'; export function onResume(): boolean { return resumeHalt(); }"],
+      ['cli/reset.ts', "import { clearKill } from '../storage/repo-server.ts'; import { unpause } from '../storage/repo-owner.ts'; export function reset(): void { clearKill(); unpause(); }"],
+      ['app/engine.ts', "import type { OwnerActor } from '../storage/repo-owner.ts'; export const x = (a: OwnerActor): OwnerActor => a;"],
+      ['app/engine.ts', "import type { OwnerHandler } from './owner.ts'; export const x = (h: OwnerHandler): OwnerHandler => h;"],
+    ];
+    for (const [rel, text] of fine) {
+      assert.deepEqual(checkSource(rel, text), [], rel);
+    }
+  });
+
+  it('CANARY: no conflict clause in SQL text, no "any", no directive that switches the type check off', () => {
+    const conflict = 'no OR REPLACE, OR IGNORE or other conflict clause';
+    flaggedFor([
+      ['storage/repo-x.ts', "export const Q = 'INSERT OR IGNORE INTO halt_reasons (reason) VALUES (?)';", conflict],
+      ['storage/repo-x.ts', "export const Q = 'insert or replace into t (a) values (?)';", conflict],
+      ['storage/repo-x.ts', "export const Q = 'UPDATE OR ROLLBACK t SET a = ?';", conflict],
+      ['storage/repo-x.ts', 'export const Q = `REPLACE INTO t (a) VALUES (?)`;', conflict],
+      ['storage/schema-v2.ts', 'export const S = `CREATE TABLE t (a TEXT UNIQUE ON CONFLICT REPLACE) STRICT`;', conflict],
+      ['app/x.ts', 'export const f = (x: any): number => x;', 'no "any"'],
+      ['app/x.ts', 'export const f = (x: unknown): number => x as any;', 'no "any"'],
+      ['app/x.ts', 'export type A = Array<any>;', 'no "any"'],
+      ['app/x.ts', '// @ts-ignore\nexport const n: number = "x";', 'no @ts-ignore, @ts-expect-error or @ts-nocheck'],
+      ['app/x.ts', '/* @ts-expect-error */\nexport const n: number = "x";', 'no @ts-ignore, @ts-expect-error or @ts-nocheck'],
+      ['app/x.ts', '// @ts-nocheck\nexport const n = 1;', 'no @ts-ignore, @ts-expect-error or @ts-nocheck'],
+    ]);
+    // the helpers check the reason, not only that something was flagged (review Q, security 5)
+    assert.throws(() => flaggedFor([['app/x.ts', 'export const f = (x: any): number => x;', conflict]]), assert.AssertionError);
+    assert.throws(() => typedFlaggedFor(['storage/repo-x.ts: another rule'], { 'storage/repo-x.ts': ['text', 'the rule it should name'] }), assert.AssertionError);
+    for (const text of [
+      "export const Q = 'INSERT INTO halt_reasons (reason) VALUES (?) ON CONFLICT (reason) DO NOTHING';",
+      "export const Q = 'SELECT replace(a, ?, ?) AS b FROM t WHERE a OR replace(b, ?, ?)';",
+      "export const S = 'an error or ignore it'.length;",
+      'export const f = (x: unknown): unknown => x;',
+    ]) {
+      assert.deepEqual(checkSource('storage/repo-x.ts', text), [], text);
+    }
+  });
+
+  it('every call to a database handle runs constant SQL, in a storage repository, writing only what its file may; handles keep their type; restricted functions are only called (reviews O, P, Q)', () => {
+    const files = sourceFiles().map((rel) => path.join(SRC, rel));
+    const { problems, calls, writes, uses, restrictedCalls, auditCalls } = sqlProblems(ts.createProgram(files, compilerOptions()), SRC);
+    assert.deepEqual(problems, []);
+    // non-vacuity: each rule saw the repositories and the runner
+    assert.ok(calls >= 30, `the rule saw ${calls} handle calls`);
+    assert.ok(writes >= 20, `the write rules read ${writes} writes`);
+    assert.ok(uses >= 60, `the handle rule checked ${uses} uses`);
+    assert.ok(restrictedCalls >= 4, `the restricted-function rule saw ${restrictedCalls} calls`);
+    assert.ok(auditCalls >= 3, `the actor rule saw ${auditCalls} calls of the chain's writer`); // the engine's, the owner's and the server's
+  });
+
+  it('CANARY: each table is written only by the file whose job it is: audit rows, halt lifts, KILL and pause clears, the halt-clear time, modes and gate starts (review Q, security 2; risk 1 and 2)', () => {
+    const bad: readonly (readonly [string, string, string])[] = [
+      ['storage/repo-x.ts', "INSERT INTO audit_log (id, at, actor, action, detail_json, prev_hash, hash) VALUES (?, ?, 'owner-server', 'server:clear-kill', '{}', ?, ?)", 'only storage/audit-chain.ts writes audit_log'],
+      ['storage/repo-owner.ts', 'INSERT INTO "audit_log" (id) VALUES (?)', 'only storage/audit-chain.ts writes audit_log'], // the owner's file calls the chain too
+      ['storage/repo-flags.ts', 'DELETE FROM halt_reasons WHERE reason = ?', 'only repo-owner.ts and repo-server.ts lift a halt'],
+      ['storage/repo-x.ts', 'WITH old AS (SELECT reason FROM halt_reasons) DELETE FROM main.halt_reasons WHERE reason IN (SELECT reason FROM old)', 'only repo-owner.ts and repo-server.ts lift a halt'],
+      ['storage/repo-x.ts', 'INSERT INTO halt_reasons (reason, set_at, set_audit_id) VALUES (?, ?, ?) ON CONFLICT (reason) DO UPDATE SET set_audit_id = excluded.set_audit_id', 'only repo-owner.ts and repo-server.ts lift a halt'],
+      ['storage/repo-flags.ts', 'UPDATE flags SET kill = 0, kill_at = NULL, kill_source = NULL, kill_audit_id = NULL, updated_at = ? WHERE id = 1', 'only repo-server.ts clears KILL'],
+      ['storage/repo-owner.ts', 'UPDATE flags SET kill = 0, kill_at = NULL, kill_source = NULL, kill_audit_id = NULL WHERE id = 1', 'only repo-server.ts clears KILL'], // Telegram never clears KILL
+      ['storage/repo-x.ts', 'update   "main"."flags"\nset "kill"=?', 'only repo-server.ts clears KILL'],
+      ['storage/repo-x.ts', 'UPDATE flags SET kill = 1 - kill WHERE id = 1', 'only repo-server.ts clears KILL'],
+      // SQLite accepts a column twice and takes the last: every assignment is read, and twice is refused
+      ['storage/repo-flags.ts', 'UPDATE flags SET kill = 1, kill = 0 WHERE id = 1', 'only repo-server.ts clears KILL'],
+      ['storage/repo-flags.ts', 'UPDATE flags SET kill = 1, kill = 0 WHERE id = 1', 'set each column of flags once'],
+      ['storage/repo-flags.ts', 'UPDATE flags SET paused = 1, paused = 0 WHERE id = 1', 'only repo-owner.ts clears the pause'],
+      ['storage/repo-flags.ts', 'UPDATE strategy_modes SET gate_since = max(gate_since, ?), gate_since = ? WHERE strategy = ?', 'a gate start only moves later'],
+      ['storage/repo-flags.ts', "UPDATE strategy_modes SET mode = 'paper', mode = 'live', changed_by = 'auto-demote', changed_at = ? WHERE strategy = ? AND mode = 'live'", "only repo-owner.ts sets a strategy's mode"],
+      ['storage/repo-owner.ts', 'UPDATE strategy_modes SET mode = ?, mode = ?, changed_by = ?, changed_at = ? WHERE strategy = ?', 'set each column of strategy_modes once'],
+      ['storage/repo-x.ts', 'UPDATE flags AS f SET kill = 0 WHERE f.id = 1', 'only repo-server.ts clears KILL'],
+      ['storage/repo-x.ts', 'UPDATE flags SET kill_audit_id = ? WHERE id = 1', 'kill_at, kill_source and kill_audit_id change only together with kill'],
+      ['storage/repo-x.ts', 'UPDATE flags SET (kill, kill_at) = (0, NULL) WHERE id = 1', 'set each column of flags on its own'],
+      ['storage/repo-flags.ts', 'UPDATE flags SET paused = 0, paused_at = NULL WHERE id = 1', 'only repo-owner.ts clears the pause'],
+      ['storage/repo-server.ts', 'UPDATE flags SET paused = ?, paused_at = NULL WHERE id = 1', 'only repo-owner.ts clears the pause'],
+      ['storage/repo-x.ts', 'UPDATE flags SET paused_at = ? WHERE id = 1', 'paused_at changes only together with paused'],
+      ['storage/repo-flags.ts', 'UPDATE flags SET halt_cleared_at = ?, updated_at = ? WHERE id = 1', 'only repo-owner.ts and repo-server.ts record when halts were lifted'],
+      ['storage/repo-x.ts', 'INSERT INTO flags (id, kill) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET kill = 0', "the flags row and the strategy modes are the migration's"],
+      ['storage/repo-x.ts', 'INSERT INTO flags (id, kill) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET kill = 0', 'only repo-server.ts clears KILL'], // the upsert's update is read too
+      ['storage/repo-x.ts', 'DELETE FROM strategy_modes WHERE strategy = ?', "the flags row and the strategy modes are the migration's"],
+      ['storage/repo-x.ts', "UPDATE strategy_modes SET mode = 'live', changed_by = 'owner-golive', changed_at = ? WHERE strategy = ?", "only repo-owner.ts sets a strategy's mode"],
+      ['storage/repo-flags.ts', "UPDATE strategy_modes SET mode = 'paper', changed_by = 'auto-demote', changed_at = ? WHERE strategy = ?", "only repo-owner.ts sets a strategy's mode"], // off to paper is no demotion
+      ['storage/repo-flags.ts', "UPDATE strategy_modes SET mode = 'paper', changed_by = 'auto-demote', changed_at = ? WHERE strategy = ? AND mode = 'live' OR 1 = 1", "only repo-owner.ts sets a strategy's mode"],
+      ['storage/repo-flags.ts', "UPDATE strategy_modes SET mode = ?, changed_by = 'auto-demote', changed_at = ? WHERE strategy = ? AND mode = 'live'", "only repo-owner.ts sets a strategy's mode"],
+      ['storage/repo-x.ts', "UPDATE strategy_modes SET changed_by = 'owner-golive' WHERE strategy = ?", 'changed_by and changed_at change only together with the mode'],
+      ['storage/repo-flags.ts', 'UPDATE strategy_modes SET gate_since = ? WHERE strategy = ?', 'a gate start only moves later'],
+      ['storage/repo-owner.ts', 'UPDATE strategy_modes SET mode = ?, changed_by = ?, changed_at = ?, gate_since = min(gate_since, ?) WHERE strategy = ?', 'a gate start only moves later'],
+      ['storage/repo-x.ts', 'UPDATE strategy_modes SET strategy = ? WHERE strategy = ?', "a strategy's row keeps its strategy"],
+      ['storage/repo-x.ts', "DELETE FROM entry_bans WHERE kind = 'mint-cooldown'", 'only repo-flags.ts deletes entry bans'],
+      ['storage/repo-x.ts', 'UPDATE (SELECT 1) SET x = 1', 'write to a table named plainly'],
+    ];
+    for (const [rel, sql, why] of bad) {
+      const problems = writeProblems(rel, sql);
+      assert.ok(problems.some((p) => p.startsWith(`${rel}: `) && p.includes(why)), `should flag ${rel} because "${why}": ${sql}\n  got: ${problems.join('\n  got: ')}`);
+    }
+    const fine: readonly (readonly [string, string])[] = [
+      ['storage/audit-chain.ts', 'INSERT INTO audit_log (id, at, actor, action, detail_json, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?)'],
+      ['storage/repo-flags.ts', 'UPDATE flags SET kill = 1, kill_at = ?, kill_source = ?, kill_audit_id = ?, updated_at = ? WHERE id = 1 AND kill = 0'], // the WHERE is not the SET
+      ['storage/repo-flags.ts', 'UPDATE flags SET paused = 1, paused_at = ?, updated_at = ? WHERE id = 1 AND paused = 0'],
+      ['storage/repo-flags.ts', 'UPDATE flags SET entries_stopped = ?, updated_at = ? WHERE id = 1'],
+      ['storage/repo-flags.ts', 'INSERT INTO halt_reasons (reason, set_at, set_audit_id) VALUES (?, ?, ?)'],
+      ['storage/repo-flags.ts', "UPDATE strategy_modes SET mode = 'paper', changed_by = 'auto-demote', changed_at = ?, gate_since = max(gate_since, ?) WHERE strategy = ? AND mode = 'live'"],
+      ['storage/repo-flags.ts', 'UPDATE strategy_modes SET gate_since = max(gate_since, ?) WHERE strategy = ?'],
+      ['storage/repo-flags.ts', "DELETE FROM entry_bans WHERE kind IN ('mint-cooldown', 'strategy-pause', 'strategy-off') AND until <= ?"],
+      ['storage/repo-x.ts', 'INSERT INTO entry_bans (kind, key, until, reason, set_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (kind, key) DO UPDATE SET until = max(until, excluded.until)'],
+      ['storage/repo-owner.ts', 'DELETE FROM halt_reasons WHERE reason = ?'],
+      ['storage/repo-owner.ts', 'UPDATE flags SET paused = 0, paused_at = NULL, updated_at = ? WHERE id = 1 AND paused = 1'],
+      ['storage/repo-owner.ts', 'UPDATE flags SET halt_cleared_at = ?, updated_at = ? WHERE id = 1'],
+      ['storage/repo-owner.ts', 'UPDATE strategy_modes SET mode = ?, changed_by = ?, changed_at = ? WHERE strategy = ?'],
+      ['storage/repo-server.ts', 'UPDATE flags SET kill = 0, kill_at = NULL, kill_source = NULL, kill_audit_id = NULL, updated_at = ? WHERE id = 1 AND kill = 1'],
+      ['storage/repo-server.ts', 'DELETE FROM halt_reasons'],
+      ['storage/repo-x.ts', "SELECT kill FROM flags WHERE kill = 0 AND paused = 0 AND halt_cleared_at IS NULL"],
+      ['storage/repo-x.ts', 'SELECT replace(a, ?, ?) AS b, "update" FROM t'], // a function and a column named like keywords
+    ];
+    for (const [rel, sql] of fine) {
+      assert.deepEqual(writeProblems(rel, sql), [], `${rel}: ${sql}`);
+    }
+  });
+
+  it('CANARY: the constant-SQL rule catches every way to put a value into SQL or to reach a handle around it', () => {
+    const STUB = [
+      'export type SqlParam = string | bigint | null;',
+      'export interface Reader { get(sql: string, ...p: SqlParam[]): unknown; all(sql: string, ...p: SqlParam[]): readonly unknown[]; }',
+      'export interface Tx extends Reader { run(sql: string, ...p: SqlParam[]): number; script(sql: string): void; }',
+      'export interface Db extends Reader { transaction<T>(fn: (tx: Tx) => T): T; }',
+    ].join('\n');
+    const HEAD = "import type { Db, Reader, Tx } from './sqlite.ts';\n";
+    const literal = 'must be a literal or a top-level const built from literals';
+    const conflict = 'no OR REPLACE, OR IGNORE or other conflict clause';
+    const bad: Record<string, readonly [string, string]> = {
+      'storage/repo-b1.ts': [`${HEAD}export const f = (tx: Tx, t: string): number => tx.run(\`DELETE FROM \${t}\`);`, literal],
+      'storage/repo-b2.ts': [`${HEAD}export const f = (r: Reader, id: string): unknown => r.get('SELECT a FROM t WHERE id = ' + id);`, literal],
+      'storage/repo-b3.ts': [`${HEAD}let Q = 'SELECT 1 AS x'; Q = Q + ''; export const f = (r: Reader): unknown => r.get(Q);`, literal],
+      'storage/repo-b4.ts': [`${HEAD}export const f = (r: Reader): unknown => { const Q = 'SELECT 1 AS x'; return r.get(Q); };`, literal],
+      'storage/repo-b5.ts': [`${HEAD}const A = 'SELECT 1 AS x'; const B = 'SELECT 2 AS x'; export const f = (r: Reader, k: boolean): unknown => r.get(k ? A : B);`, literal],
+      'storage/repo-b6.ts': [`${HEAD}export const f = (r: Reader): unknown => r.get(String(1));`, literal],
+      'storage/repo-b7.ts': [`${HEAD}export const f = (tx: Tx): number => { const run = tx.run; return run('DELETE FROM t'); };`, 'call run directly on the database handle'],
+      'storage/repo-b8.ts': [`${HEAD}export const f = (tx: Tx): number => { const { run } = tx; return run('DELETE FROM t'); };`, 'do not take run off a database handle'],
+      'storage/repo-b9.ts': [`${HEAD}export const f = (tx: Tx): number => tx['run']('DELETE FROM t');`, 'used through its named methods only (no [] access)'],
+      'storage/repo-b10.ts': [`${HEAD}export const f = (tx: Tx, args: [string]): number => tx.run(...args);`, literal],
+      'storage/repo-b11.ts': [`${HEAD}const Q = 'INSERT OR ' + 'REPLACE INTO t (a) VALUES (?)'; export const f = (tx: Tx): number => tx.run(Q, 1n);`, conflict],
+      'storage/repo-b11t.ts': [`${HEAD}const OR = 'OR'; const Q = \`INSERT \${OR} IGNORE INTO t (a) VALUES (?)\`; export const f = (tx: Tx): number => tx.run(Q, 1n);`, conflict], // split around a value: only the added-up text shows it
+      'storage/repo-b8p.ts': [`${HEAD}export const f = ({ run }: Tx): number => run('DELETE FROM t');`, 'do not take run off a database handle'],
+      'storage/repo-b8a.ts': [`${HEAD}export const f = (tx: Tx): number => { let run: Tx['run'] = (): number => 0; ({ run } = tx); return run('DELETE FROM t'); };`, 'do not take run off a database handle'],
+      'storage/repo-b12.ts': [`${HEAD}export const f = (s: string): unknown => JSON.parse(s).run('DELETE FROM t');`, 'of type any'],
+      'storage/repo-b13.ts': [`${HEAD}export const f = (tx: Tx): number => tx.run.call(tx, 'DELETE FROM t');`, 'call run directly on the database handle'],
+      'storage/repo-b13a.ts': [`${HEAD}export const f = (r: Reader, g: (q: string, fn: unknown) => unknown): unknown => g('SELECT 1 AS x', r.get);`, 'call get directly on the database handle'], // handed on as an argument
+      'storage/repo-b14.ts': [`${HEAD}export const f = (db: Db): unknown => db.transaction((tx) => tx.get(\`SELECT \${'a' + Math.random()} AS x\`));`, literal],
+      'storage/migrations.ts': [`${HEAD}export interface Migration { readonly sql: string }\nexport const f = (tx: Tx, n: string): void => tx.script(\`CREATE TABLE \${n} (a TEXT) STRICT\`);`, literal],
+      'app/b15.ts': ["import type { Reader } from '../storage/sqlite.ts';\nexport const f = (r: Reader): unknown => r.get('SELECT 1 AS x');", 'only the storage repositories run SQL'],
+      'risk/b16.ts': ["import type { Db } from '../storage/sqlite.ts';\nexport const f = (db: Db): unknown => db.all('SELECT 1 AS x');", 'only the storage repositories run SQL'],
+      // the write rules read the text a call adds up to, through a const, in get as in run (review Q, security 2)
+      'storage/repo-w1.ts': [`${HEAD}const LIFT = 'DELETE FROM ' + 'halt_reasons';\nexport const f = (tx: Tx): number => tx.run(LIFT);`, 'only repo-owner.ts and repo-server.ts lift a halt'],
+      'storage/repo-w2.ts': [`${HEAD}export const f = (tx: Tx): unknown => tx.get('UPDATE flags SET kill = 0 WHERE id = 1 RETURNING kill');`, 'only repo-server.ts clears KILL'],
+    };
+    const ok: Record<string, string> = {
+      'storage/repo-ok.ts': [
+        "import type { Reader, Tx } from './sqlite.ts';",
+        "import { SHARED } from './repo-shared.ts';",
+        "const COLUMNS = 'id, n';",
+        'const BY_ID = `SELECT ${COLUMNS} FROM t WHERE id = ?`;',
+        "const COUNT = 'SELECT count(*) AS n ' + 'FROM t';",
+        "export const a = (r: Reader): unknown => r.get('SELECT 1 AS x');",
+        "export const b = (r: Reader): unknown => r.get(BY_ID, 'x');",
+        'export const c = (r: Reader): unknown => r.all(COUNT);',
+        "export const d = (tx: Tx): number => tx.run(SHARED, 'x');",
+        'export const e = (tx: Tx): unknown => tx.get((BY_ID), null);',
+        'export const g = (k: string): number | undefined => new Map<string, number>().get(k);',
+        'export const h = (dyn: string): number => ({ run: (s: string): number => s.length }).run(dyn);',
+      ].join('\n'),
+      'storage/repo-shared.ts': "export const SHARED = 'DELETE FROM t WHERE id = ?';",
+      'storage/audit-x.ts': "import type { Tx } from './sqlite.ts';\nexport const f = (tx: Tx): number => tx.run('INSERT INTO t (id) VALUES (?)', 'x');",
+    };
+    const { program, srcRoot } = virtualProgram({ 'storage/sqlite.ts': STUB, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])), ...ok });
+    const { problems } = sqlProblems(program, srcRoot);
+    typedFlaggedFor(problems, bad);
+    // and only the JSON.parse value is untyped
+    const untyped = problems.filter((p) => p.includes('of type any')).map((p) => p.slice(0, p.indexOf(':')));
+    assert.deepEqual([...new Set(untyped)], ['storage/repo-b12.ts']);
+    for (const rel of Object.keys(ok)) {
+      assert.deepEqual(problems.filter((p) => p.startsWith(`${rel}:`)), [], rel);
+    }
+    // the runner may run a migration's own pinned sql, and constant scripts
+    const runner = virtualProgram({
+      'storage/sqlite.ts': STUB,
+      'storage/migrations.ts': `${HEAD}export interface Migration { readonly sql: string }\nconst V = 'CREATE TABLE v (a TEXT) STRICT;';\nexport const f = (tx: Tx, m: Migration): void => { tx.script(V); tx.script(m.sql); };`,
+    });
+    assert.deepEqual(sqlProblems(runner.program, runner.srcRoot).problems, []);
+  });
+
+  const HANDLE_STUB = [
+    'export type SqlParam = string | bigint | null;',
+    'export interface Reader { get(sql: string, ...p: SqlParam[]): unknown; all(sql: string, ...p: SqlParam[]): readonly unknown[]; }',
+    'export interface Tx extends Reader { run(sql: string, ...p: SqlParam[]): number; script(sql: string): void; }',
+    'export interface Db extends Reader { readonly file: string; transaction<T>(fn: (tx: Tx) => T): T; close(): void; }',
+  ].join('\n');
+
+  it('CANARY: a database handle keeps its type: no Reflect, Object.*, assertion, look-alike interface or structural slot carries it past the SQL rules (review Q, security 4)', () => {
+    const HEAD = "import type { Db, Reader, Tx } from './sqlite.ts';\n";
+    const param = 'a database handle goes only to a parameter typed Reader, Tx or Db';
+    const kept = 'a database handle is kept only where the type is Reader, Tx or Db';
+    const bad: Record<string, readonly [string, ...string[]]> = {
+      'storage/repo-f1.ts': [`${HEAD}export const f = (tx: Tx, q: string): unknown => Reflect.get(tx, 'run')(q);`, param],
+      'app/f2.ts': ["import type { Tx } from '../storage/sqlite.ts';\nexport const f = (tx: Tx): unknown => Reflect.apply(Reflect.get(tx, 'run'), tx, ['DELETE FROM t']);", param],
+      'storage/repo-f3.ts': [`${HEAD}export const f = (tx: Tx, q: string): void => { for (const m of Object.values(tx)) { m(q); } };`, param],
+      'storage/repo-f4.ts': [
+        `${HEAD}interface MyTx extends Tx { run(sql: string): number }\nconst g = (x: MyTx, q: string): number => x.run(q);\nexport const f = (tx: Tx, q: string): number => g(tx, q);`,
+        'only storage/sqlite.ts extends or implements Reader, Tx or Db',
+        param,
+      ],
+      'storage/repo-f5.ts': [`${HEAD}export const f = (tx: Tx, q: string): number => (tx as unknown as { run(s: string): number }).run(q);`, 'no type assertion on a database handle'],
+      'storage/repo-f6.ts': [`${HEAD}export const f = (tx: Tx, q: string): unknown => Object.getOwnPropertyDescriptor(tx, 'run')?.value(q);`, param],
+      'storage/repo-f7.ts': [`${HEAD}const kept: { m?: unknown } = {};\nexport const f = (tx: Tx): void => { kept.m = Reflect.get(tx, 'run'); };`, param],
+      // what the LIMIT of reviews P allowed: a helper with a hand-written structural parameter
+      'storage/repo-f8.ts': [`${HEAD}const g = (x: { run(sql: string): number }, t: string): number => x.run(t);\nexport const f = (tx: Tx, t: string): number => g(tx, t);`, param],
+      'storage/repo-f9.ts': [`${HEAD}export const f = (tx: Tx, q: string): number => { const x: { run(sql: string): number } = tx; return x.run(q); };`, kept],
+      'storage/repo-f10.ts': [`${HEAD}const g = (tx: Tx): { run(sql: string): number } => tx;\nexport const f = (tx: Tx, q: string): number => g(tx).run(q);`, kept],
+      'storage/repo-f11.ts': [`${HEAD}function sneak<T>(x: T, q: string): unknown { return Reflect.get(x as object, 'run')(q); }\nexport const f = (tx: Tx, q: string): unknown => sneak(tx, q);`, param], // generic, unconstrained
+      'storage/repo-f12.ts': [`${HEAD}export const f = (db: Db): unknown => db.transaction.bind(db);`, "call a database handle's methods directly"],
+      'storage/repo-f13.ts': [`${HEAD}export const f = (db: Db): unknown => { const { transaction } = db; return transaction; };`, 'do not destructure a database handle'],
+      'storage/repo-f14.ts': [`${HEAD}export const f = (tx: Tx): unknown => ({ ...tx });`, 'a database handle goes only to a parameter, variable or return value typed'],
+      'app/f15.ts': ["import type { Db } from '../storage/sqlite.ts';\nexport const f = (db: Db, log: (x: unknown) => void): void => log(db);", param],
+      'storage/repo-f16.ts': [
+        `${HEAD}export class LooseTx implements Tx { get(): undefined { return undefined; } all(): readonly unknown[] { return []; } run(): number { return 0; } script(): void {} }`,
+        'only storage/sqlite.ts extends or implements Reader, Tx or Db',
+      ],
+      'storage/repo-f17.ts': [`${HEAD}export const f = (tx: Tx): unknown[] => { const list: unknown[] = [tx]; return list; };`, kept],
+      'storage/repo-f18.ts': [`${HEAD}export const f = (r: Reader): string => \`\${String(r)}\`;`, param],
+      // the re-check's R2: `arguments` aliases the handle as any (checkSource bans the name too)
+      'storage/repo-f19.ts': [`${HEAD}export function viaArguments(tx: Tx, t: string): unknown { const f = Reflect.get(arguments[0], 'run'); return f('DELETE FROM ' + t); }`, 'a call of a value of type any'],
+    };
+    const ok: Record<string, string> = {
+      'storage/repo-ok.ts': [
+        HEAD,
+        "const ONE = 'SELECT 1 AS x';",
+        'const read = (r: Reader): unknown => r.get(ONE);',
+        'const inTx = <T extends Reader>(r: T): unknown => r.get(ONE);',
+        'export const a = (tx: Tx): unknown => read(tx);', // a Tx where a Reader is asked
+        'export const b = (tx: Tx): unknown => inTx(tx);',
+        'export const c = (db: Db): unknown => db.transaction((tx) => read(tx));',
+        'export const d = (tx: Tx): unknown => { const t = tx; const u: Reader = t; return read(u); };',
+        'export const e = (db: Db): string => db.file;', // a data property is only read
+        'export const g = (db: Db | undefined): void => { if (db !== undefined) { db.close(); } db?.close(); };',
+        'export const h = (db: Db): Db => db;',
+        'export const i = (db: Db): { readonly db: Db } => ({ db });',
+        'export const j = (db: Db): readonly Db[] => [db];',
+        'export const k = (db: Db, other: Db | null): Db => other ?? db;',
+        'export class Holder { readonly db: Db; constructor(db: Db) { this.db = db; } read(): unknown { return read(this.db); } }',
+        'export const l = (db: Db): Holder => new Holder(db);',
+      ].join('\n'),
+    };
+    const { program, srcRoot } = virtualProgram({ 'storage/sqlite.ts': HANDLE_STUB, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])), ...ok });
+    const { problems } = sqlProblems(program, srcRoot);
+    typedFlaggedFor(problems, bad);
+    assert.deepEqual(problems.filter((p) => p.startsWith('storage/repo-ok.ts:')), []);
+  });
+
+  it('CANARY: a restricted file\'s functions are only called where they are imported, never exported again, aliased, stored, bound or passed on (review Q, security 1c)', () => {
+    const HEAD = "import type { Tx } from './sqlite.ts';\n";
+    const handed = 'is only called where it is imported, never handed on';
+    const files: Record<string, string> = {
+      'storage/sqlite.ts': HANDLE_STUB,
+      'storage/repo-server.ts': `${HEAD}export const SERVER_AUDIT_ACTIONS = Object.freeze(['server:clear-kill'] as const);\nexport function clearKill(tx: Tx): number { return tx.run('DELETE FROM t'); }\nexport const again = clearKill; // its own file may`,
+      'storage/repo-owner.ts': `${HEAD}export function unpause(tx: Tx): number { return tx.run('DELETE FROM t'); }`,
+      'storage/audit-chain.ts': `${HEAD}export const AUDIT_GENESIS = '0'.repeat(64);\nexport function appendAuditRow(tx: Tx): number { return tx.run('DELETE FROM t'); }`,
+      'cli/ok.ts': [
+        "import type { Tx } from '../storage/sqlite.ts';",
+        "import { clearKill, SERVER_AUDIT_ACTIONS } from '../storage/repo-server.ts';",
+        "import * as owner from '../storage/repo-owner.ts';",
+        "import { AUDIT_GENESIS } from '../storage/audit-chain.ts';",
+        'export const reset = (tx: Tx): number => clearKill(tx) + owner.unpause(tx);',
+        'export const data = [SERVER_AUDIT_ACTIONS, AUDIT_GENESIS];', // data, not a capability
+        'export type Clear = typeof clearKill;',
+      ].join('\n'),
+    };
+    const SERVER = "import { clearKill } from '../storage/repo-server.ts';\n";
+    const bad: Record<string, readonly [string, ...string[]]> = {
+      'cli/b1.ts': [`${SERVER}export const k = clearKill;`, handed],
+      'cli/b2.ts': [`${SERVER}export default clearKill;`, handed],
+      'cli/b3.ts': ["import { clearKill as c } from '../storage/repo-server.ts';\nexport { c };", handed],
+      'cli/b4.ts': [`${SERVER}export const all = [clearKill];`, handed],
+      'cli/b5.ts': [`${SERVER}export const o = { clearKill };`, handed],
+      'cli/b6.ts': [`${SERVER}export const k = clearKill.bind(null);`, handed],
+      'cli/b7.ts': [`${SERVER}export const later = (f: (fn: unknown) => void): void => f(clearKill);`, handed],
+      'cli/b8.ts': ["import * as server from '../storage/repo-server.ts';\nexport const s = server;", "a restricted file's namespace is used only as server.name(...)"],
+      'cli/b9.ts': ["import * as server from '../storage/repo-server.ts';\nexport const k = server.clearKill;", handed],
+      'cli/b10.ts': ["import * as server from '../storage/repo-server.ts';\nexport const k = server['clearKill'];", "a restricted file's namespace is used only as server.name(...)"],
+      'cli/b11.ts': ["import { again } from '../storage/repo-server.ts';\nexport const k = again;", handed], // a const that holds a function
+      // the reviewer's reproduction: the owner's handler file handing an owner writer to whoever imports it
+      'app/owner.ts': ["import { unpause } from '../storage/repo-owner.ts';\nexport const u = unpause;", handed],
+      'storage/repo-b12.ts': ["import { appendAuditRow } from './audit-chain.ts';\nexport const a = appendAuditRow;", handed],
+    };
+    const { program, srcRoot } = virtualProgram({ ...files, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])) });
+    const { problems, restrictedCalls } = sqlProblems(program, srcRoot);
+    typedFlaggedFor(problems, bad);
+    for (const rel of ['cli/ok.ts', 'storage/repo-server.ts', 'storage/repo-owner.ts', 'storage/audit-chain.ts']) {
+      assert.deepEqual(problems.filter((p) => p.startsWith(`${rel}:`)), [], rel);
+    }
+    assert.equal(restrictedCalls, 2); // clearKill(tx) and owner.unpause(tx)
+  });
+
+  it('CANARY: each writer of the audit chain writes only as its own actors, never as a value it is handed (review Q re-check, security R1)', () => {
+    const HEAD = "import type { Tx } from './sqlite.ts';\nimport { appendAuditRow, type AuditActor } from './audit-chain.ts';\n";
+    const CHAIN = [
+      "import type { Tx } from './sqlite.ts';",
+      "export type AuditActor = 'owner-telegram' | 'owner-server' | 'engine' | 'ai';",
+      "export function appendAuditRow(tx: Tx, at: number, actor: AuditActor, action: string): number { return tx.run('INSERT INTO audit_log (id) VALUES (?)', String(at) + actor + action); }",
+    ].join('\n');
+    const actor = "appendAuditRow's actor here must be";
+    // one program per case, so each pins its file's exact set: one actor too many anywhere is caught
+    const bad: readonly (readonly [string, string, string])[] = [
+      // the re-check's reproduction: a wrapper that takes the actor as a value
+      ['storage/repo-audit.ts', `${HEAD}export const anyActor = (tx: Tx, who: AuditActor, action: string): number => appendAuditRow(tx, 0, who, action);`, `${actor} engine`],
+      ['storage/repo-audit.ts', `${HEAD}export const asServer = (tx: Tx): number => appendAuditRow(tx, 0, 'owner-server', 'server:clear-kill');`, `${actor} engine`],
+      ['storage/repo-server.ts', `${HEAD}export const asOwner = (tx: Tx): number => appendAuditRow(tx, 0, 'owner-telegram', 'owner:set');`, `${actor} owner-server`],
+      ['storage/repo-owner.ts', `${HEAD}export const asWho = (tx: Tx, who: string): number => appendAuditRow(tx, 0, who as AuditActor, 'owner:set');`, `${actor} owner-telegram or owner-server`],
+      ['storage/repo-owner.ts', `${HEAD}export const asEngine = (tx: Tx): number => appendAuditRow(tx, 0, 'engine', 'engine:kill-set');`, `${actor} owner-telegram or owner-server`],
+      ['storage/repo-config.ts', `${HEAD}export const asEngine = (tx: Tx): number => appendAuditRow(tx, 0, 'engine', 'engine:apply-due');`, `${actor} nobody`],
+    ];
+    for (const [rel, text, why] of bad) {
+      const wrong = virtualProgram({ 'storage/sqlite.ts': HANDLE_STUB, 'storage/audit-chain.ts': CHAIN, [rel]: text });
+      typedFlaggedFor(sqlProblems(wrong.program, wrong.srcRoot).problems, { [rel]: [text, why] });
+    }
+    const right = virtualProgram({
+      'storage/sqlite.ts': HANDLE_STUB,
+      'storage/audit-chain.ts': CHAIN,
+      'storage/repo-audit.ts': `${HEAD}export const asEngine = (tx: Tx, action: string): number => appendAuditRow(tx, 0, 'engine', action);`,
+      'storage/repo-owner.ts': `${HEAD}type OwnerActor = 'owner-telegram' | 'owner-server';\nexport const asOwner = (tx: Tx, who: OwnerActor): number => appendAuditRow(tx, 0, who, 'owner:set');`,
+      'storage/repo-server.ts': `${HEAD}export const asServer = (tx: Tx): number => appendAuditRow(tx, 0, 'owner-server', 'server:reset-halt');`,
+    });
+    const fine = sqlProblems(right.program, right.srcRoot);
+    assert.deepEqual(fine.problems, []);
+    assert.equal(fine.auditCalls, 3);
+  });
+
+  it('CANARY: no "arguments" in src/, which hands every argument on as any (review Q re-check, security R2)', () => {
+    flaggedFor([
+      ['storage/repo-x.ts', "export function f(tx: unknown): unknown { return Reflect.get(arguments[0], 'run'); }", 'no "arguments"'],
+      ['app/x.ts', 'export function n(): number { return arguments.length; }', 'no "arguments"'],
+    ]);
+    assert.deepEqual(checkSource('app/x.ts', 'export const o = { arguments: 1 }; export const n = o.arguments;'), []); // a key named so is fine
+  });
+
+  it('LIMIT, written down: a handle inside another value whose type is rewritten by hand, or a function looser than the signature it is called through, is not seen; review is the guard there', () => {
+    // The handle rule follows a value of a handle's own type, and checks a call against the signature
+    // it resolves to. Here (f) the handle sits in an object whose inferred type is { tx: Tx }, and that
+    // object goes to a parameter of a hand-written type, and (w) a list of handles is widened to a list
+    // of objects (the re-check's R3): only a deep comparison of the two types would see either. And (h)
+    // the call resolves to an overload that takes a Tx, while the body that runs takes unknown (a class
+    // method behind an interface, or a function kept in a variable of a function type, works the same
+    // way). All need deliberate code. If this starts to be flagged, update STORAGE_DESIGN s.13.
+    const { program, srcRoot } = virtualProgram({
+      'storage/sqlite.ts': HANDLE_STUB,
+      'storage/repo-limit.ts': [
+        "import type { Tx } from './sqlite.ts';",
+        'const g = (d: { tx: { run(sql: string): number } }, t: string): number => d.tx.run(t);',
+        'export const f = (tx: Tx, t: string): number => { const deps = { tx }; return g(deps, t); };',
+        'function pass(tx: Tx, t: string): unknown;',
+        "function pass(x: unknown, t: string): unknown { return (Reflect.get(x as object, 'run') as (s: string) => unknown)(t); }",
+        'export const h = (tx: Tx, t: string): unknown => pass(tx, t);',
+        "export const w = (tx: Tx, t: string): unknown => { const xs = [tx]; const ys: readonly object[] = xs; const y = ys[0]; return y === undefined ? 0 : (Reflect.get(y, 'run') as (s: string) => unknown)(t); };",
+      ].join('\n'),
+    });
+    assert.deepEqual(sqlProblems(program, srcRoot).problems, []);
   });
 
   it('CANARY: the link scan finds a link (skipped where the system does not let the test make one)', (t) => {

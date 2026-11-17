@@ -3,8 +3,9 @@
 Status: PROPOSED by the architect (2026-11-12); built in sub-steps 6a-6e (section 7), each
 reviewed by risk-guardian and security-auditor before its commit. 6a is done (REVIEWS.md N);
 6b is built (REVIEWS.md O), with the differences from sections 1.1-1.3 listed in section 11.
-6c is built in two parts: 6c-1, the schema with the secret filter and the JSON codec (REVIEWS.md
-P, differences from section 2 in section 12), then 6c-2, the repositories.
+6c is built in parts: 6c-1, the schema with the secret filter and the JSON codec (REVIEWS.md
+P, differences from section 2 in section 12); 6c-2a, the authorizer, the SQL rules, the audit log
+and the flags (REVIEWS.md Q, section 13); then 6c-2b, the book, orders, config and day state.
 The owner accepted the four decisions of section 8 on 2026-11-13 (DECISIONS.md D5). Where this
 file and ARCHITECTURE.md differ, ARCHITECTURE.md wins until a sub-step's review moves the
 change there.
@@ -1293,3 +1294,248 @@ For T3: a settlement record unique per order, so a replayed event cannot book tw
 
 For Phase 3: the BIP39 word check (any case, any separator), and an input cap on `assertNoSecrets`
 (for example 64 KiB) before it guards a log line, a Telegram message or an AI prompt.
+
+## 13. Step 6c-2a as built: the authorizer, the SQL rules, the audit log and the flags
+
+`storage/sqlite.ts`, the authorizer (security condition 8b; VERIFIED_FACTS, setAuthorizer row):
+
+- `authorize(scope, action, ...)` is a pure function, installed on the connection in the handle's
+  constructor, so nothing reaches SQLite around it. It decides by who prepares the statement:
+  - a statement may read and write the rows of the bot's tables and call functions;
+  - a migration script may also create and drop tables, indexes and triggers, and write the schema
+    table while it does (SQLite reports a REINDEX while it builds a partial index). Not ALTER TABLE
+    (review Q, security 3): every form of it is refused today, and a test runs each one through the
+    wrapper. ADD COLUMN on a STRICT table runs SQLite's own nested `PRAGMA quick_check`, RENAME
+    reads `temp.sqlite_temp_master`, and DROP COLUMN reports the column's name where the database
+    name goes (VERIFIED_FACTS, ALTER row). This fails closed; ALTER needs a reviewed change here
+    before migration 2 (s.13.1);
+  - only the wrapper's own fixed work may run PRAGMA, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, ATTACH
+    and DETACH: the settings reads, the health checks and the copy.
+- Nothing ever touches another database or the other system tables, makes a view, a virtual table
+  or a temporary object, runs ANALYZE or a recursive query. An action code the list does not know
+  is refused.
+- A denial is the error code `denied` (SQLite code 23). It means a text check missed something:
+  a bug to alert on.
+- The script checks of review P stay as the second line: the settings read back after a script,
+  and a script that ends the transaction, still poison the handle. Each is tested on a stand-in
+  without the authorizer.
+- A `pragma_*` table function is checked when the statement runs, not when it is prepared.
+
+The rules of the architecture test (review O, condition 4; reviews P, condition 8a):
+
+- With the type checker: every use of a handle's `get`, `all`, `run` or `script` is a direct call
+  with constant SQL. Constant means a literal, or a top-level const of a source file built from
+  literals, other such consts, templates and `+`. The text it adds up to must hold no conflict
+  clause. Only `storage/repo-*.ts`, `storage/audit-*.ts` and `storage/migrations.ts` make such
+  calls; everything else calls a repository.
+  - The runner may also pass a migration's `sql` and its own top-level consts (the version
+    table), whose texts are pinned by sha256.
+  - Aliases, references, `[]` access, destructuring (also in an assignment) and a handle typed
+    `any` are refused.
+  - Each canary must be caught for its own reason: every canary names the rule it expects, and a
+    self-check proves the helpers refuse a case caught for another reason (review Q, security
+    5). Every import between the canaries' virtual files must resolve. The first version of the
+    canary test had unresolved imports and caught the canaries only because the unresolved types
+    count as `any`.
+- Which file writes what (review Q, security 2), read from the text each call adds up to. The
+  database checks an audit row's id, link and actor but not its hash, so without this rule any
+  repository could forge the owner's row that a clear needs with a raw INSERT:
+  - `audit_log`: written only by `audit-chain.ts`;
+  - lifting a halt (DELETE or UPDATE on `halt_reasons`), the time halts were lifted
+    (`halt_cleared_at`): only `repo-owner.ts` and `repo-server.ts`;
+  - clearing KILL (`kill` set to anything but 1): only `repo-server.ts`; clearing the pause
+    (`paused` set to anything but 1): only `repo-owner.ts`; the KILL and pause details change only
+    together with the flag;
+  - a strategy's mode: only `repo-owner.ts`; `repo-flags.ts` may only demote, with exactly
+    `mode = 'paper'` and `WHERE strategy = ? AND mode = 'live'`; `changed_by` and `changed_at`
+    change only with the mode, and a row keeps its strategy;
+  - a gate start: only as `gate_since = max(gate_since, ?)`, anywhere;
+  - deleting entry bans: only `repo-flags.ts` (its prune);
+  - the flags row and the mode rows are the migration's (no INSERT or DELETE);
+  - an upsert's DO UPDATE counts as an UPDATE of its table; quoted names, a `main.` prefix, a
+    CTE and an alias are read; every assignment to a column is checked, and on these tables a
+    column set twice (SQLite takes the last), a SET of the form `(a, b) = (...)` and a write
+    whose table the rule cannot read are refused.
+- A database handle keeps its type (review Q, security 4): a value with a handle's methods has
+  them called directly (a data property such as `db.file` is only read), goes only to a parameter
+  typed `Reader`, `Tx` or `Db` of sqlite.ts (or a type parameter constrained to one), and is kept
+  only where the type is one of those. So `Reflect`, `Object.*`, an assertion, a destructuring, a
+  spread, a hand-written structural type or an unconstrained generic cannot carry it past the
+  SQL rules, and only sqlite.ts extends or implements the handle types. This closes the LIMIT of
+  the first version (a handle passed to a structural parameter).
+  - Nothing calls a value of type `any`, and the name `arguments` is refused (review Q re-check,
+    security R2): `arguments[0]` aliases a handle as `any`, and a call on an `any` value checks
+    none of its arguments.
+  - LIMIT, written down: two ways are not seen. A handle inside another value (an object, an
+    array, a closure) whose type is then rewritten by hand or widened (a list of handles taken as
+    a list of `object` or `unknown`; re-check, R3): that would need a deep comparison of the two
+    types. And a function whose own parameter is looser than the signature it is called through
+    (an overload's implementation, a class method behind an interface, a function kept in a
+    variable of a function type): the call is checked against the signature, not against the
+    body that runs. Both need deliberate code; review is the guard there.
+- Each writer of the audit chain writes only as its own actors (review Q re-check, security R1):
+  every call of `appendAuditRow` passes an actor whose type is one of the file's literals, or a
+  union of them, never a string: `repo-audit.ts` only `engine`, `repo-owner.ts` only
+  `owner-telegram` or `owner-server`, `repo-server.ts` only `owner-server`; any other file
+  writes as nobody. The database ties an action's prefix to its actor, so this decides which
+  rows each file can write at all: a wrapper in `repo-audit.ts` that took the actor as a value
+  would have handed the engine the owner's rows.
+- No `any`, and no `@ts-ignore`, `@ts-expect-error` or `@ts-nocheck`, in the source.
+- No conflict clause (INSERT or UPDATE OR REPLACE, IGNORE, ROLLBACK, ABORT or FAIL; REPLACE INTO;
+  a column's ON CONFLICT clause) in any SQL text.
+- Restricted files, imported at runtime only by the files named, only with a static import, and
+  re-exported by none:
+  - `storage/audit-chain.ts`: only by repo-audit.ts, repo-owner.ts and repo-server.ts;
+  - `storage/repo-owner.ts`: only by app/owner.ts (Telegram, after the owner check) and cli/;
+  - `storage/repo-server.ts`: only by cli/;
+  - `app/owner.ts`: only by its one Telegram wiring file, which Phase 3 names; nothing until then
+    (review Q, security 1b).
+  Their functions are only called where they are imported: never exported again, aliased,
+  stored, bound or passed on, and a namespace import is used only as `ns.name(...)` (security
+  1c; their data, such as the action lists, may be passed on). And nothing outside cli/ imports
+  cli/ (security 1a), so the engine cannot pick up a command that wraps the server's writers.
+  So the engine can never write an owner's or a server's audit row.
+
+The repositories (STORAGE_DESIGN s.1.4):
+
+- `repo-util.ts`: `expectChanges` (row-count), `required` (row-missing), `oneOf` (bad-param) and
+  `cellOneOf` (bad-cell). A repository checks a command's preconditions before its first write,
+  so a refusal leaves nothing written, even when a careless caller catches it inside the
+  transaction (tested).
+- `audit-chain.ts`: `appendAuditRow` takes the next id and names the hash of the row before it
+  (64 zeros for the first). Its own hash is the sha256 of `fomo-audit-v1`, prev_hash, id, at,
+  actor, action and detail_json, one per line. The detail is a plain object through `jsonParam`.
+- `repo-audit.ts`:
+  - the engine's actions only (`engine:kill-set`, `engine:halt-set`, `engine:apply-due`,
+    `engine:demote`);
+  - `newestAuditId`;
+  - `verifyAuditChain`, which reads every row from the first and names the row where ids, links
+    or hashes break, never a value. Step 6d calls it at start-up.
+- `repo-flags.ts`, the engine's reads and writes. Its writes make trading stricter, and none moves
+  a safety time back (review Q, risk 1 and 2). A test pins its exports, so a new write here is a
+  reviewed change. Two of them can loosen, each within its rule:
+  - the low-equity stop (`setEntriesStopped`) is the engine's own, set and lifted as equity moves:
+    6d derives it from equity on every tick, and sizing checks the minimum trade on its own (risk
+    4);
+  - `pruneBans` deletes cooldowns and pauses only a day after they ended (`PRUNE_MARGIN_MS`), so
+    a clock that jumps ahead by less than a day cannot erase one that is still running (risk 3).
+  The functions:
+  - `readFlags`, `readHalts` and `readModes`: typed, checked and frozen; a missing row throws.
+  - `setKill` and `setHalt` write their own engine audit row first and name its id. A KILL or
+    halt already set keeps its first time and link, and nothing is written. The halt insert
+    checks first, then makes a plain INSERT that must change one row. That is stricter than the
+    ON CONFLICT DO NOTHING of s.12.1, and never OR IGNORE.
+  - `setPaused` and `setEntriesStopped`.
+  - `demote`: live to paper only, with its own `engine:demote` audit row, and the go-live gate
+    starts again (RISK_POLICY s.10; risk 6 and 10).
+  - `restartGate`: `gate_since = max(gate_since, ?)`, so an earlier time (a clock that stepped
+    back, a stale `now`) keeps the later start and never throws (risk 2).
+  - Bans and the entry count:
+    - `addBan`: a cooldown or pause is lengthened to the later end, never shortened; a ban
+      already there stays as it is;
+    - `activeBans(now)`;
+    - `pruneBans(now)`, as above;
+    - `entriesOn` and `countEntry`, an upsert that the database stops at 12.
+  - The time halts were lifted is no longer written here (risk 1: the engine could have moved it
+    back and cut the recovery wait short). The owner's and the server's files write it.
+- `repo-owner.ts`:
+  - `appendOwnerAudit`, with the actor owner-telegram or owner-server;
+  - `resumeHalt`, which lifts only the paper peak or streak halt after the owner's row and records
+    when halts were lifted; the day-state rebase or reset goes in the same transaction in 6e;
+  - `unpause`;
+  - `setStrategyMode`: off and paper; live only as owner-golive, and only from paper (risk 6).
+    Leaving live starts the gate again, with the same `max` (an earlier time keeps the later
+    start).
+- `repo-server.ts`: `appendServerAudit`, `clearKill` (refused with nothing written when KILL is
+  not set) and `resetHalts`, which records when halts were lifted. Each writes the server's row
+  first, then the change.
+
+Tests: the authorizer's decision table, and denials on the real connection when the wrapper is
+skipped. Every repository function is tried at its boundary: the chain recomputed, tampering
+found, the owner's paths and a refused command that a caller catches. The rules have canaries,
+and the coverage gate covers the new files.
+
+Planted bugs (scratchpad `mut/run18.py`): 99, 98 caught. The one left is equivalent:
+`setStrategyMode`'s own mode check repeats what the action lookup already refuses, with the same
+bad-param before anything is written. The first run found four test gaps, each now tested:
+- the chain check's id order, its link and its actor list, each one alone, against a forger
+  who also recomputes the hash;
+- a handle method handed on as an argument.
+
+After review Q (`mut/run19.py`): 142, 141 caught; the one left is the same equivalent one. Every
+planted bug for a review Q fix is caught: each repository fix (the halt-clear time, the gate
+start, demote's audit row and gate, the prune margin, live only from paper, leaving live), ALTER
+in a script, and each part of the new rules (cli/ only from cli/, app/owner.ts restricted, static
+imports, every write rule, a column set twice, the handle rule, restricted functions only called,
+and the canary helpers' reason check). For the re-check's two rules (`mut/run21.py`): 9 of 9
+caught, among them one actor too many in each writer's set.
+
+### 13.1 What 6c-2a settles from s.12.1, and what is still open
+
+Settled:
+- the constant-SQL rule (with `script`);
+- `setAuthorizer`;
+- the conflict-clause ban;
+- change counts in these repositories;
+- the typed audit actions and the restricted writers, now also by table (the write rules), by
+  call (restricted functions are only called) and by folder (cli/ only from cli/);
+- KILL and halts naming their own audit row, with the owner's row last before the change;
+- the cooldown prune rule, with a day's margin;
+- the config audit action names (owner:set, owner:rollback, owner:ai-approve, engine:apply-due);
+- a gate start only moves later, every move out of live starts the gate again, and live is
+  reached only from paper.
+
+Open for 6c-2b:
+- 'stuck' throws until ledger.ts supports it;
+- the JSON conditions for intents, decisions and plans (only through `jsonParam`, with objects;
+  no signatures, hashes or `e.message`; the largest plans pass; no raw bps lists);
+- ids of at most 63 characters, `plan_hash` computed in the repository, pending paths from the
+  TunablePath list;
+- snapshot pruning past an hour;
+- change counts in the remaining repositories;
+- where the owner's config rows are written (review Q, security 2): owner:set, owner:rollback,
+  owner:cancel-pending and owner:ai-approve go in `repo-owner.ts`, or in a new file under the
+  same import restriction (added to RESTRICTED_FILES, and to the write rules for
+  `config_versions` and `pending_changes`). engine:apply-due goes through `repo-audit.ts`. The
+  config repository itself may not write `audit_log` (the write rules refuse it).
+
+New conditions from 6c-2a:
+- For 6d and 6e: an app/ transaction never catches a repository's error and carries on. A
+  precondition throws before any write, but a write that fails part-way is safe only because
+  the whole transaction rolls back. 6d adds an architecture rule against a try/catch inside a
+  transaction callback in app/.
+- For later: app/owner.ts is written with the Telegram owner check (Phase 3), and the cli/
+  commands that clear KILL and reset halts with the owner's terminal (Phase 7). Until then the
+  owner's and the server's writers have no callers outside the tests.
+
+New conditions from review Q:
+- 6d (risk 4): the low-equity stop is derived from equity on every tick, never left as it was.
+- 6d (risk 3): `pruneBans` runs only while the clock guard (contract 8, the CLOCK breaker) is
+  healthy.
+- 6d (risk 8): at start-up, besides `verifyAuditChain`, check that `flags.kill_audit_id` and
+  every halt's `set_audit_id` are at most the newest audit id and name an engine row of the
+  matching action (`engine:kill-set`, `engine:halt-set`); fail closed otherwise.
+- 6d (security 6): anchor the chain's tail. At start-up, log the newest id and hash, put them in
+  each backup, and compare with the last value seen: removing the newest rows cannot be seen by
+  the chain check alone.
+- Phase 3, and certainly Phase 8 (risk 5): lifting the pause and raising a mode (off to paper,
+  paper to live) get schema tripwires like KILL's, in migration 2: a trigger that requires the
+  newest audit row to be the owner's `owner:unpause`, `owner:paper` or `owner:golive`, newer
+  than the flag's state, mirroring `flags_kill_clear`. Until then the write rules and review
+  are the guard.
+- Phase 3 and 8 (risk 6): /golive checks the strategy's gate, the server's arm flag and the live
+  switch before it calls `setStrategyMode(..., 'live')`; storage already refuses live from
+  anything but paper.
+- Phase 8, the gate code (risk re-check N1): with a clock that stepped back, leaving live keeps
+  the old gate start (`max` never moves it back, which is right), so paper trades from before
+  that live period would still count. The gate counts only paper trades after the later of
+  `gateSince` and the last time the strategy left live (its `changedAt` when `changedBy` is
+  `auto-demote` or an owner's move out of live). A clock fault already alerts (contract 8).
+- Phase 3 (security 1b): app/owner.ts exports only the handler that takes the verified owner
+  update, and its one Telegram wiring file is named in RESTRICTED_FILES as its only importer.
+- Before migration 2 (security 3): ALTER TABLE needs a reviewed authorizer change (reading
+  `temp.sqlite_temp_master`, SQLite's own nested quick_check or integrity_check of a main table,
+  and ALTER decided on its first argument being `main`), with a test that runs each ALTER form
+  through the wrapper on a real connection. Until then no migration can alter a table.
+- Owner question (risk 9): should clearing KILL also start the 15-minute recovery wait, as lifting
+  a halt does? Recommended: yes (stricter, and costs nothing). Asked in the step summary.

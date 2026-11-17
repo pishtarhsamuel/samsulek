@@ -7,13 +7,15 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { closeSync, existsSync, openSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, constants } from 'node:sqlite';
 import {
   APPLICATION_ID,
   MAX_VALUE_BYTES,
   StorageError,
+  authorize,
   openDb,
   wrapConnection,
+  type AuthScope,
   type Connection,
   type Db,
   type Tx,
@@ -54,6 +56,7 @@ function fakeOver(real: DatabaseSync, overrides: Partial<Connection> = {}): Conn
     get isTransaction() {
       return real.isTransaction;
     },
+    setAuthorizer: (callback) => real.setAuthorizer(callback),
     close: () => real.close(),
   };
   return Object.defineProperties(base, Object.getOwnPropertyDescriptors(overrides));
@@ -517,6 +520,7 @@ describe('transaction(): all or nothing, synchronous, one at a time', () => {
         get isTransaction() {
           return lie ? false : real.isTransaction;
         },
+        setAuthorizer: () => undefined, // no authorizer: the test rolls back on the raw connection itself
       }),
       ':memory:',
       false,
@@ -675,24 +679,40 @@ describe('transaction(): all or nothing, synchronous, one at a time', () => {
     });
   });
 
-  it('a script that changes a safety setting past the text checks poisons the handle (review P)', () => {
-    const real = rawDb(':memory:');
-    real.exec(T_DDL);
-    real.exec('PRAGMA recursive_triggers = ON');
-    real.exec('PRAGMA trusted_schema = OFF');
+  it('a script that changes a safety setting past the text checks: the authorizer refuses it, and without the authorizer the handle is poisoned (review P)', () => {
     // a stand-in for a bypass of the text checks: the script also flips a setting
-    const db = wrapConnection(
-      fakeOver(real, {
-        exec: (sql) => {
-          real.exec(sql);
-          if (sql.startsWith('CREATE TABLE sneaky')) {
-            real.exec('PRAGMA ignore_check_constraints = 1');
-          }
-        },
-      }),
-      ':memory:',
-      false,
-    );
+    const sneaky = (real: DatabaseSync, overrides: Partial<Connection> = {}): Db =>
+      wrapConnection(
+        fakeOver(real, {
+          exec: (sql) => {
+            real.exec(sql);
+            if (sql.startsWith('CREATE TABLE sneaky')) {
+              real.exec('PRAGMA ignore_check_constraints = 1');
+            }
+          },
+          ...overrides,
+        }),
+        ':memory:',
+        false,
+      );
+    const setUpRaw = (): DatabaseSync => {
+      const real = rawDb(':memory:');
+      real.exec(T_DDL);
+      real.exec('PRAGMA recursive_triggers = ON');
+      real.exec('PRAGMA trusted_schema = OFF');
+      return real;
+    };
+    // the first line: SQLite's authorizer refuses the PRAGMA, nothing changes, the handle stays usable
+    const guarded = sneaky(setUpRaw());
+    try {
+      storageError(() => guarded.transaction((tx) => tx.script('CREATE TABLE sneaky (x TEXT) STRICT;')), 'denied');
+      assert.equal(setting(guarded, 'ignore_check_constraints'), 0n);
+      assert.equal(guarded.get("SELECT count(*) AS n FROM sqlite_schema WHERE name = 'sneaky'")?.['n'], 0n);
+    } finally {
+      guarded.close();
+    }
+    // the second line, with no authorizer at all: the settings read back after the script catch it
+    const db = sneaky(setUpRaw(), { setAuthorizer: () => undefined });
     try {
       db.transaction((tx) => tx.script('CREATE TABLE fine (x TEXT) STRICT;'));
       storageError(() => db.transaction((tx) => tx.script('CREATE TABLE sneaky (x TEXT) STRICT;')), 'poisoned');
@@ -702,22 +722,33 @@ describe('transaction(): all or nothing, synchronous, one at a time', () => {
     }
   });
 
-  it('a script that ends the transaction itself poisons the handle (the transaction boundary was broken), also when it fails after the END', () => {
-    for (const script of ["INSERT INTO t (id) VALUES ('b');\nEND;", "INSERT INTO t (id) VALUES ('b');\nEND;\nTHIS IS NOT SQL;"]) {
+  it('a script that ends the transaction itself: the authorizer refuses the END; without the authorizer the handle is poisoned, also when the script fails after the END', () => {
+    const scripts = ["INSERT INTO t (id) VALUES ('b');\nEND;", "INSERT INTO t (id) VALUES ('b');\nEND;\nTHIS IS NOT SQL;"];
+    const attempt = (db: Db, script: string): void => {
+      db.transaction((tx) => {
+        tx.run("INSERT INTO t (id) VALUES ('a')");
+        tx.script(script);
+        return tx.run("INSERT INTO t (id) VALUES ('c')");
+      });
+    };
+    for (const script of scripts) {
+      // the first line: the END is refused, the transaction stays whole and rolls back, the handle is fine
       const db = withTable(memDb());
       try {
-        storageError(
-          () =>
-            db.transaction((tx) => {
-              tx.run("INSERT INTO t (id) VALUES ('a')");
-              tx.script(script);
-              return tx.run("INSERT INTO t (id) VALUES ('c')");
-            }),
-          'poisoned',
-        );
-        storageError(() => db.get('SELECT 1 AS one'), 'poisoned');
+        storageError(() => attempt(db, script), 'denied');
+        assert.equal(count(db, 't'), 0n);
+        assert.equal(db.transaction((tx) => tx.run("INSERT INTO t (id) VALUES ('d')")), 1);
       } finally {
         db.close();
+      }
+      // the second line, with no authorizer: the wrapper sees the transaction gone and poisons the handle
+      const real = rawDb(':memory:');
+      const bare = withTable(wrapConnection(fakeOver(real, { setAuthorizer: () => undefined }), ':memory:', false));
+      try {
+        storageError(() => attempt(bare, script), 'poisoned');
+        storageError(() => bare.get('SELECT 1 AS one'), 'poisoned');
+      } finally {
+        bare.close();
       }
     }
     // a script that fails with the transaction still open keeps its own error, and the handle is fine
@@ -1328,5 +1359,161 @@ describe('vacuumInto, quickCheck, foreignKeyCheck and close', () => {
     storageError(() => db.close(), 'other');
     storageError(() => db.get('SELECT 1 AS one'), 'closed');
     db.close();
+  });
+});
+
+describe('the authorizer: SQLite itself refuses what the text checks are there to stop (security condition 8b)', () => {
+  const OK = constants.SQLITE_OK;
+  const DENY = constants.SQLITE_DENY;
+  type Case = readonly [AuthScope, number, string | null, string | null, string | null, number];
+
+  it('statements read and write the bot rows and call functions; migration scripts also change the schema; the wrapper alone does the rest', () => {
+    const c = constants;
+    const cases: Case[] = [
+      ['statement', c.SQLITE_SELECT, null, null, null, OK],
+      ['statement', c.SQLITE_READ, 'positions', 'mint', 'main', OK],
+      ['statement', c.SQLITE_READ, 'sqlite_master', 'name', 'main', OK], // the runner reads the schema
+      ['statement', c.SQLITE_INSERT, 'positions', null, 'main', OK],
+      ['statement', c.SQLITE_UPDATE, 'positions', 'status', 'main', OK],
+      ['statement', c.SQLITE_DELETE, 'halt_reasons', null, 'main', OK],
+      ['statement', c.SQLITE_FUNCTION, null, 'coalesce', null, OK],
+      ['script', c.SQLITE_CREATE_TABLE, 'x', null, 'main', OK],
+      ['script', c.SQLITE_CREATE_INDEX, 'x_i', 'x', 'main', OK],
+      ['script', c.SQLITE_CREATE_TRIGGER, 'x_t', 'x', 'main', OK],
+      ['script', c.SQLITE_DROP_TABLE, 'x', null, 'main', OK],
+      ['script', c.SQLITE_DROP_INDEX, 'x_i', 'x', 'main', OK],
+      ['script', c.SQLITE_DROP_TRIGGER, 'x_t', 'x', 'main', OK],
+      ['script', c.SQLITE_REINDEX, 'x_i', null, 'main', OK], // reported while a partial index is built
+      ['statement', c.SQLITE_REINDEX, 'x_i', null, 'main', DENY],
+      ['script', c.SQLITE_INSERT, 'sqlite_master', null, 'main', OK], // what DDL writes
+      ['script', c.SQLITE_UPDATE, 'sqlite_master', 'sql', 'main', OK],
+      ['script', c.SQLITE_INSERT, 'flags', null, 'main', OK], // a migration's starting rows
+      ['wrapper', c.SQLITE_TRANSACTION, 'BEGIN', null, null, OK],
+      ['wrapper', c.SQLITE_PRAGMA, 'journal_mode', null, null, OK],
+      ['wrapper', c.SQLITE_ATTACH, '/tmp/copy.sqlite', null, null, OK],
+      ['wrapper', 99, null, null, null, OK],
+      // never the schema outside a migration script
+      ['statement', c.SQLITE_CREATE_TABLE, 'x', null, 'main', DENY],
+      ['statement', c.SQLITE_CREATE_TRIGGER, 'x_t', 'x', 'main', DENY],
+      ['statement', c.SQLITE_DROP_TABLE, 'audit_log', null, 'main', DENY],
+      ['statement', c.SQLITE_ALTER_TABLE, 'main', 'flags', null, DENY],
+      ['script', c.SQLITE_ALTER_TABLE, 'main', 'x', null, DENY], // a migration that needs ALTER brings a reviewed change first
+      ['script', c.SQLITE_ALTER_TABLE, 'main', 't', 'b', DENY], // DROP COLUMN as SQLite really sends it
+      // never the system tables, never another database
+      ['statement', c.SQLITE_INSERT, 'sqlite_master', null, 'main', DENY],
+      ['statement', c.SQLITE_UPDATE, 'sqlite_stat1', 'stat', 'main', DENY],
+      ['statement', c.SQLITE_DELETE, 'SQLITE_MASTER', null, 'main', DENY],
+      ['script', c.SQLITE_INSERT, 'sqlite_stat1', null, 'main', DENY],
+      ['statement', c.SQLITE_READ, 'x', 'a', 'temp', DENY],
+      ['statement', c.SQLITE_INSERT, 'x', null, 'other', DENY],
+      ['script', c.SQLITE_CREATE_TABLE, 'x', null, 'temp', DENY],
+      // the wrapper's own work only: settings, transactions, files
+      ['statement', c.SQLITE_PRAGMA, 'ignore_check_constraints', '1', null, DENY],
+      ['script', c.SQLITE_PRAGMA, 'recursive_triggers', 'OFF', null, DENY],
+      ['statement', c.SQLITE_PRAGMA, 'optimize', '65538', null, DENY], // 'pragma_optimize'(65538)
+      ['statement', c.SQLITE_TRANSACTION, 'COMMIT', null, null, DENY],
+      ['script', c.SQLITE_TRANSACTION, 'BEGIN', null, null, DENY],
+      ['statement', c.SQLITE_SAVEPOINT, 'BEGIN', 's1', null, DENY],
+      ['statement', c.SQLITE_ATTACH, '/tmp/other.sqlite', null, null, DENY],
+      ['script', c.SQLITE_DETACH, 'other', null, null, DENY],
+      // what the bot never uses, even in a migration
+      ['script', c.SQLITE_CREATE_TEMP_TABLE, 'x', null, 'temp', DENY],
+      ['script', c.SQLITE_CREATE_TEMP_TRIGGER, 'x_t', 'x', 'temp', DENY],
+      ['script', c.SQLITE_CREATE_VIEW, 'v', null, 'main', DENY],
+      ['script', c.SQLITE_CREATE_VTABLE, 'v', 'fts5', 'main', DENY],
+      ['statement', c.SQLITE_ANALYZE, 'positions', null, 'main', DENY],
+      ['statement', c.SQLITE_RECURSIVE, null, null, null, DENY],
+      ['statement', 99, null, null, null, DENY], // an action SQLite might add later
+      ['script', 0, null, null, null, DENY],
+    ];
+    for (const [scope, action, a, b, dbName, want] of cases) {
+      assert.equal(authorize(scope, action, a, b, dbName), want, `${scope} ${action} ${String(a)} ${String(b)} ${String(dbName)}`);
+    }
+  });
+
+  it('is installed on the connection itself: a statement that skips the wrapper and its text checks is still refused', () => {
+    const real = rawDb(':memory:');
+    const db = wrapConnection(real, ':memory:', false);
+    try {
+      const refusedRaw = (run: () => unknown, what: string): void => {
+        assert.throws(run, (e: unknown) => (e as { errcode?: unknown }).errcode === 23, what);
+      };
+      const before = db.settings();
+      for (const sql of [
+        'PRAGMA ignore_check_constraints = 1',
+        'PRAGMA recursive_triggers = OFF',
+        'PRAGMA journal_mode',
+        'BEGIN',
+        'SAVEPOINT s1',
+        'ATTACH DATABASE ? AS other',
+        'CREATE TABLE x (a INTEGER) STRICT',
+        'CREATE TEMP TABLE y (a INTEGER)',
+        'ANALYZE',
+      ]) {
+        refusedRaw(() => real.prepare(sql), sql);
+      }
+      // a pragma_ table function is checked when it runs, not when it is prepared (VERIFIED_FACTS)
+      refusedRaw(() => real.prepare("SELECT 1 FROM 'pragma_optimize'(65538)").all(), 'pragma_optimize');
+      refusedRaw(() => real.prepare('SELECT cid FROM pragma_table_info(?)').all('t'), 'pragma_table_info');
+      assert.equal(real.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE name = 'sqlite_stat1'").get()?.['n'], 0n); // ANALYZE never ran
+      refusedRaw(() => real.exec('PRAGMA ignore_check_constraints = 1'), 'exec');
+      inDir((dir) => refusedRaw(() => real.prepare('VACUUM INTO ?').run(path.join(dir, 'copy.sqlite')), 'VACUUM INTO'));
+      assert.equal(real.isTransaction, false);
+      // nothing the refused statements tried took effect; the wrapper's own work still runs, and each time the scope goes back
+      assert.deepEqual(db.settings(), before);
+      assert.equal(setting(db, 'ignore_check_constraints'), 0n);
+      withTable(db);
+      db.transaction((tx) => tx.run("INSERT INTO t (id, n) VALUES ('a', 1)"));
+      assert.deepEqual(db.quickCheck(), []);
+      assert.deepEqual(db.foreignKeyCheck(), []);
+      inDir((dir) => db.vacuumInto(path.join(dir, 'copy.sqlite')));
+      storageError(() => db.transaction(() => { throw new StorageError('other', 'a failing callback'); }), 'other'); // its ROLLBACK runs as the wrapper
+      storageError(() => db.transaction((tx) => tx.script('CREATE TABLE w (a INTEGER) STRICT;\nCREATE TABLE w (a INTEGER) STRICT;')), 'other'); // a script that fails
+      for (const sql of ['PRAGMA ignore_check_constraints = 1', 'CREATE TABLE z (a INTEGER) STRICT', 'BEGIN']) {
+        refusedRaw(() => real.prepare(sql), `${sql} (after the wrapper ran)`);
+      }
+      assert.equal(count(db, 't'), 1n);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('a denial through the wrapper is the code "denied" with SQLite code 23: temporary tables, views, virtual tables, recursive queries and other databases', () => {
+    const db = memDb();
+    try {
+      withTable(db);
+      for (const script of ['CREATE TEMP TABLE x (a INTEGER)', 'CREATE VIEW v AS SELECT 1 AS one', 'CREATE VIRTUAL TABLE f USING fts5(a)', 'CREATE TEMP TRIGGER tt AFTER INSERT ON t BEGIN SELECT 1; END']) {
+        const e = storageError(() => db.transaction((tx) => tx.script(script)), 'denied');
+        assert.equal(e.sqliteCode, 23, script);
+      }
+      // every ALTER TABLE form, as SQLite really runs it (review Q, security 3): refused, the table unchanged
+      for (const script of ['ALTER TABLE t ADD COLUMN c TEXT', 'ALTER TABLE t RENAME TO t2', 'ALTER TABLE t RENAME COLUMN n TO n2', 'ALTER TABLE t DROP COLUMN n']) {
+        storageError(() => db.transaction((tx) => tx.script(script)), 'denied');
+      }
+      assert.equal(db.get("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 't'")?.['sql'], T_DDL);
+      assert.equal(db.get("SELECT count(*) AS n FROM sqlite_master WHERE name = 't2'")?.['n'], 0n);
+      const recursive = 'SELECT x FROM (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 3) SELECT x FROM c)';
+      storageError(() => db.all(recursive), 'denied');
+      storageError(() => db.all('SELECT name FROM temp.sqlite_master'), 'denied');
+      storageError(() => db.transaction((tx) => tx.get(recursive)), 'denied');
+      assert.equal(db.get("SELECT count(*) AS n FROM sqlite_schema WHERE name IN ('x', 'v', 'f', 'tt')")?.['n'], 0n);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('a trigger that writes works under it; a statement that writes the schema table does not', () => {
+    // the schema tests apply migration 1 under the authorizer on every run
+    const db = memDb();
+    try {
+      db.transaction((tx) =>
+        tx.script('CREATE TABLE a (n INTEGER NOT NULL) STRICT;\nCREATE TABLE b (n INTEGER NOT NULL) STRICT;\nCREATE TRIGGER a_copy AFTER INSERT ON a BEGIN INSERT INTO b (n) VALUES (NEW.n); END;'),
+      );
+      db.transaction((tx) => tx.run('INSERT INTO a (n) VALUES (?)', 5n));
+      assert.equal(db.get('SELECT n FROM b')?.['n'], 5n);
+      storageError(() => db.transaction((tx) => tx.run('INSERT INTO sqlite_master (type) VALUES (?)', 'x')), 'denied');
+    } finally {
+      db.close();
+    }
   });
 });

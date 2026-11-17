@@ -90,6 +90,51 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      settings change it then catches.
    Planted bugs: 159 of 161 caught. The two left are equivalent by design: the audit CHECK
    already does what they remove.
+   Done in step 6c-2a:
+   - The authorizer: a decision table over every action code and scope, and denials on the real
+     connection when the wrapper and its text checks are skipped. The wrapper's own work still
+     runs and the scope always comes back. A denial through the wrapper is `denied`.
+   - The second-line script checks, tested on a stand-in without the authorizer.
+   - The audit chain: ids, links and hashes recomputed in the test, and tampering with a detail,
+     an action, an actor, a time, a hash, a link or a row found by the chain check, naming the
+     row, never a value.
+   - The flags: required rows, bad stored values, KILL and halts with their own audit rows and
+     no second write, the pause and the low-equity stop, modes (demote, the gate), bans
+     (lengthened, never shortened; only ended ones pruned) and the entry count up to 12.
+   - The owner's and the server's writers: their actions and actors only, each command's own
+     audit row, and a refused command that leaves nothing even when its caller catches it.
+   - The architecture rules: constant SQL with the type checker, no conflict clauses, no `any`,
+     no check-off directives, and the restricted writers. Each has canaries, and each canary is
+     caught for its own reason.
+   - Planted bugs: 98 of 99 caught. The one left repeats a refusal another check already makes.
+   Added after review Q:
+   - No write in the engine's file moves a safety time back: a test pins that file's exports; an
+     earlier gate restart keeps the later start; demote writes its own audit row and starts the
+     gate again; pruning keeps ended cooldowns and pauses a day (a clock a few hours ahead erases
+     nothing); live only from paper, with nothing written when refused, and leaving live starts
+     the gate again, even with a clock that stepped back.
+   - Every ALTER TABLE form is refused through the wrapper, and leaves the table as it was.
+   - The architecture rules: cli/ only from cli/; app/owner.ts reached by nothing yet; restricted
+     files only through static imports, and their functions only called; which file writes which
+     table and column, read from each call's SQL text (upserts, quoted names, prefixes, CTEs,
+     aliases and a column set twice included); a database handle keeps its type (Reflect, Object.*, assertions,
+     look-alike interfaces, structural parameters, unconstrained generics, spreads and
+     destructuring are flagged). Every canary names the rule it expects, and the helpers are
+     shown to refuse a case caught for another reason.
+   - The flaky property test (rollbacks over random sequences) has a floor of 200: ten measured
+     runs gave 303 to 388, and the old floor of 300 failed now and then.
+   - A second flaky check, found in the full run (once in 31 runs): the plan re-check property's
+     `inFlightSell` fault put a fixed 10,000,000 tokens in flight, which caused a refusal only
+     when a sale nearly emptied the holding, so in a rare run it never did and the "every fault
+     causes a refusal" check failed. The fault now puts exactly one token more in flight than
+     the sale leaves room for (any for an account close), so it always refuses where it applies:
+     0 failures in 40 runs, and a sale or a close that ignores the sells in flight is caught
+     (`mut/run20.py`).
+   - Planted bugs: 141 of 142 caught (the same equivalent one is left), every one added for a
+     review Q fix among the caught.
+   - After the re-check: each writer of the audit chain writes only as its own actors (one
+     program per case, so one actor too many in any writer's set is caught); no `arguments` and
+     no call of a value of type `any`. Planted bugs for these two rules: 9 of 9 caught.
 
 ## 4. Property-based tests (fast-check)
 

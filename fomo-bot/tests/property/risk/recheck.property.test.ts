@@ -112,7 +112,17 @@ const FAULTS: Readonly<Record<string, (c: Case) => Case>> = {
   budgetLow: onExit((e) => ({ origin: e.origin.kind === 'automatic' ? { ...e.origin, budgetLeft: lamports(e.origin.budgetLeft > 0n ? e.origin.budgetLeft - 1n : 0n) } : e.origin })),
   ownerOrdered: onExit(() => ({ origin: { kind: 'owner' } })),
   inFlightExit: onExit(() => ({ inFlightExits: 1 })),
-  inFlightSell: onExit(() => ({ inFlightSellTokens: tokenUnits(10_000_000n) })),
+  // one token more in flight than the sale leaves room for (a close needs none in flight). A fixed
+  // 10,000,000 bit only when the sale nearly emptied the holding, so in a rare run it never caused a
+  // refusal and the coverage check below failed (review Q: a flaky gate teaches reruns)
+  inFlightSell: ([p, c]) => {
+    if (c.exit === null) {
+      return [p, c];
+    }
+    const held = c.ledgerTokens < c.chainTokens ? c.ledgerTokens : c.chainTokens;
+    const tooMany = p.kind === 'sell' ? held - p.inAmount + 1n : 1n;
+    return [p, { ...c, exit: { ...c.exit, inFlightSellTokens: tokenUnits(tooMany > 0n ? tooMany : 1n) } }];
+  },
   fewAttempts: onExit(() => ({ attemptsAllowed: 1 })),
   fewBuyAttempts: onBuy(() => ({ attemptsAllowed: 1 })),
   sizedFeesLow: onBuy((b) => ({ sizedAttemptFees: lamports(b.sizedAttemptFees - 1n) })),

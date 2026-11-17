@@ -10,8 +10,11 @@
 //   the next statement would then run and be saved on its own, so every statement first checks
 //   that the transaction is still open;
 // - INSERT OR REPLACE deletes a conflicting row without firing delete triggers unless
-//   recursive_triggers is on, so it is on (the append-only tables rely on their delete triggers).
-import { DatabaseSync } from 'node:sqlite';
+//   recursive_triggers is on, so it is on (the append-only tables rely on their delete triggers);
+// - behind every text check, SQLite's own authorizer refuses whatever a statement may not do (see
+//   authorize below): it is asked about every part of a statement while it is prepared, trigger
+//   bodies included, so a check that missed something is still not the last line.
+import { DatabaseSync, constants } from 'node:sqlite';
 import { chmodSync, closeSync, existsSync, fsyncSync, openSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
@@ -39,6 +42,7 @@ export type StorageErrorCode =
   | 'bad-param'
   | 'bad-cell'
   | 'bad-sql'
+  | 'denied'
   | 'bad-option'
   | 'pragma'
   | 'foreign-file'
@@ -46,6 +50,9 @@ export type StorageErrorCode =
   | 'schema-edited'
   | 'schema-newer'
   | 'schema-broken'
+  | 'row-missing' // a required row is absent: never replaced by a default (repositories, contract 1)
+  | 'row-count' // a write changed another number of rows than it must
+  | 'audit-broken' // the audit log's ids, links or hashes do not add up
   | 'other';
 
 const MAX_DETAIL = 200;
@@ -101,6 +108,7 @@ const PRIMARY: Readonly<Record<number, StorageErrorCode>> = {
   14: 'io', // SQLITE_CANTOPEN
   19: 'constraint',
   18: 'bad-param', // SQLITE_TOOBIG: a value above the size limit
+  23: 'denied', // SQLITE_AUTH: the authorizer refused a part of the statement (a text check missed it: a bug)
   26: 'not-a-database',
 };
 
@@ -244,6 +252,68 @@ function scriptText(sql: unknown): string {
   return text;
 }
 
+// ---------------------------------------------------------------- the authorizer
+
+/**
+ * Who is preparing a statement: a statement of a transaction or a read (`statement`), a migration
+ * script (`script`), or the wrapper's own fixed work: BEGIN, COMMIT and ROLLBACK, the settings
+ * reads, the health checks and the copy (`wrapper`).
+ */
+export type AuthScope = 'statement' | 'script' | 'wrapper';
+
+const ROW_ACTIONS: ReadonlySet<number> = new Set([constants.SQLITE_SELECT, constants.SQLITE_READ, constants.SQLITE_FUNCTION]);
+const WRITE_ACTIONS: ReadonlySet<number> = new Set([constants.SQLITE_INSERT, constants.SQLITE_UPDATE, constants.SQLITE_DELETE]);
+/**
+ * The schema changes a reviewed migration may make: create and drop tables, indexes and triggers of
+ * the main database (SQLite reports a REINDEX while it builds a partial index, as migration 1's four
+ * do). Not ALTER TABLE: SQLite runs steps of its own for it that this policy refuses (a quick_check
+ * PRAGMA for ADD COLUMN on a STRICT table, the temp schema for RENAME, and DROP COLUMN passes the
+ * column where the database belongs; VERIFIED_FACTS, review Q), so a migration that needs it comes
+ * with a reviewed change here first.
+ */
+const SCHEMA_ACTIONS: ReadonlySet<number> = new Set([
+  constants.SQLITE_CREATE_TABLE,
+  constants.SQLITE_CREATE_INDEX,
+  constants.SQLITE_CREATE_TRIGGER,
+  constants.SQLITE_DROP_TABLE,
+  constants.SQLITE_DROP_INDEX,
+  constants.SQLITE_DROP_TRIGGER,
+  constants.SQLITE_REINDEX,
+]);
+
+/**
+ * SQLite's authorizer (security-auditor, review P, condition 8b; VERIFIED_FACTS, setAuthorizer row):
+ * - a statement may read and write the rows of the bot's own tables and call functions;
+ * - a migration script may also create and drop tables, indexes and triggers (not ALTER TABLE: see
+ *   SCHEMA_ACTIONS), and write the schema table while it does;
+ * - only the wrapper's own work may run PRAGMA, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, ATTACH and
+ *   DETACH (the copy);
+ * - nothing ever touches another database (temp, attached) or the other system tables, makes a view,
+ *   a virtual table or a temporary object, runs ANALYZE, or a recursive query; and an action code
+ *   this list does not know is refused (fail closed).
+ * Pure; exported for its test.
+ */
+export function authorize(scope: AuthScope, action: number, arg1: string | null, _arg2: string | null, dbName: string | null): number {
+  if (scope === 'wrapper') {
+    return constants.SQLITE_OK;
+  }
+  if (dbName !== null && dbName !== 'main') {
+    return constants.SQLITE_DENY;
+  }
+  if (ROW_ACTIONS.has(action)) {
+    return constants.SQLITE_OK;
+  }
+  if (WRITE_ACTIONS.has(action)) {
+    const table = (arg1 ?? '').toLowerCase();
+    const allowed = !table.startsWith('sqlite_') || (scope === 'script' && table === 'sqlite_master');
+    return allowed ? constants.SQLITE_OK : constants.SQLITE_DENY;
+  }
+  if (SCHEMA_ACTIONS.has(action) && scope === 'script') {
+    return constants.SQLITE_OK;
+  }
+  return constants.SQLITE_DENY;
+}
+
 const I64_MIN = -(2n ** 63n);
 const I64_MAX = 2n ** 63n - 1n;
 
@@ -325,11 +395,15 @@ export interface Statement {
   columns(): readonly { readonly name: string }[];
 }
 
+/** SQLite's authorizer callback: the action, its two arguments, the database and the trigger or view. */
+export type Authorizer = (action: number, arg1: string | null, arg2: string | null, dbName: string | null, trigger: string | null) => number;
+
 /** The calls the wrapper makes on a connection: node:sqlite's, or a test's stand-in. */
 export interface Connection {
   exec(sql: string): void;
   prepare(sql: string): Statement;
   readonly isTransaction: boolean;
+  setAuthorizer(callback: Authorizer | null): void;
   close(): void;
 }
 
@@ -375,11 +449,31 @@ class SqliteDb implements Db {
   #active = false;
   #poisoned = false;
   #closed = false;
+  /** Who prepares the next statement: the authorizer decides by it (see authorize). */
+  #scope: AuthScope = 'statement';
 
   constructor(conn: Connection, file: string, readOnly: boolean) {
     this.#conn = conn;
     this.file = file;
     this.readOnly = readOnly;
+    // installed before the handle is used, on the connection itself, so nothing reaches SQLite around it
+    mapped(() => conn.setAuthorizer((action, arg1, arg2, dbName) => authorize(this.#scope, action, arg1, arg2, dbName)));
+  }
+
+  /** Runs fn with the authorizer in `scope`, and always goes back to the scope before. */
+  #as<R>(scope: AuthScope, fn: () => R): R {
+    const before = this.#scope;
+    this.#scope = scope;
+    try {
+      return fn();
+    } finally {
+      this.#scope = before;
+    }
+  }
+
+  /** The wrapper's own fixed SQL: BEGIN, COMMIT, ROLLBACK, the settings and the health checks. */
+  #own<R>(fn: () => R): R {
+    return this.#as('wrapper', fn);
   }
 
   #usable(): void {
@@ -491,10 +585,10 @@ class SqliteDb implements Db {
     });
     const script = guarded((sql: string): void => {
       const text = scriptText(sql);
-      const before = mapped(() => readSettings(this.#conn));
+      const before = mapped(() => this.#own(() => readSettings(this.#conn)));
       let failure: StorageError | null = null;
       try {
-        this.#conn.exec(text);
+        this.#as('script', () => this.#conn.exec(text));
       } catch (e) {
         failure = storageErrorOf(e);
       }
@@ -505,7 +599,7 @@ class SqliteDb implements Db {
         throw new StorageError('poisoned', 'a script ended the transaction itself: part of it may be saved');
       }
       // a script that changed a safety setting got past the text checks: nothing on this handle is trusted
-      const after = mapped(() => readSettings(this.#conn));
+      const after = mapped(() => this.#own(() => readSettings(this.#conn)));
       if (SETTINGS.some((name) => after[name] !== before[name])) {
         this.#poisoned = true;
         throw new StorageError('poisoned', 'a script changed a safety setting of the database');
@@ -520,7 +614,7 @@ class SqliteDb implements Db {
   #rollback(): void {
     try {
       if (this.#conn.isTransaction) {
-        this.#conn.exec('ROLLBACK');
+        this.#own(() => this.#conn.exec('ROLLBACK'));
       }
     } catch {
       this.#poisoned = true; // every later call throws: the app latches entries off, alerts and exits
@@ -532,7 +626,7 @@ class SqliteDb implements Db {
     if (this.readOnly) {
       throw new StorageError('readonly', 'this handle was opened read-only');
     }
-    mapped(() => this.#conn.exec('BEGIN IMMEDIATE')); // waits up to the busy timeout, then 'busy'
+    mapped(() => this.#own(() => this.#conn.exec('BEGIN IMMEDIATE'))); // waits up to the busy timeout, then 'busy'
     this.#active = true;
     const state: TxState = { open: true, failed: null };
     let committed = false;
@@ -544,7 +638,7 @@ class SqliteDb implements Db {
       }
       this.#live(state);
       try {
-        this.#conn.exec('COMMIT');
+        this.#own(() => this.#conn.exec('COMMIT'));
       } catch (e) {
         // A deferred foreign key or a busy lock keeps the transaction open: rolled back below. If SQLite no
         // longer holds it (an I/O error during the commit), whether it reached the disk is unknown: the
@@ -567,12 +661,12 @@ class SqliteDb implements Db {
 
   settings(): Readonly<Record<string, SqlCell>> {
     this.#outside('settings');
-    return mapped(() => readSettings(this.#conn));
+    return mapped(() => this.#own(() => readSettings(this.#conn)));
   }
 
   quickCheck(): readonly string[] {
     this.#outside('quickCheck');
-    const rows = mapped(() => this.#conn.prepare('PRAGMA quick_check').all());
+    const rows = mapped(() => this.#own(() => this.#conn.prepare('PRAGMA quick_check').all()));
     const lines = rows
       .flatMap((r) => String(r['quick_check']).split('\n'))
       .map(cleanDetail)
@@ -582,7 +676,7 @@ class SqliteDb implements Db {
 
   foreignKeyCheck(): readonly string[] {
     this.#outside('foreignKeyCheck');
-    const rows = mapped(() => this.#conn.prepare('PRAGMA foreign_key_check').all());
+    const rows = mapped(() => this.#own(() => this.#conn.prepare('PRAGMA foreign_key_check').all()));
     return Object.freeze(
       rows.map((r) => cleanDetail(`${String(r['table'])}: row ${String(r['rowid'])} has no parent in ${String(r['parent'])} (constraint ${String(r['fkid'])})`)),
     );
@@ -599,7 +693,7 @@ class SqliteDb implements Db {
     }
     closeSync(fd);
     try {
-      mapped(() => this.#conn.prepare('VACUUM INTO ?').run(file)); // SQLite fills an empty existing file
+      mapped(() => this.#own(() => this.#conn.prepare('VACUUM INTO ?').run(file))); // SQLite fills an empty existing file
       syncFile(file); // on disk before anyone relies on it (risk-guardian, review O)
     } catch (e) {
       rmSync(file, { force: true }); // no partial copy that could pass for a good one

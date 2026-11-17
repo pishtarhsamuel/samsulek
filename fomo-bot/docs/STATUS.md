@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-11-14
+Updated: 2026-11-17
 
 **Phase 2 (foundations, tests first): in progress.** Paper-only building blocks; nothing
 can trade, and no key or account exists anywhere.
@@ -114,6 +114,27 @@ can trade, and no key or account exists anywhere.
   left are harmless by design, because another rule already does what they remove. After the
   fixes both Opus reviewers approved, with notes for the next parts (REVIEWS.md P; the list is
   in STORAGE_DESIGN.md s.12.1).
+- Part 6c-2a is built (tests first). It adds the code that reads and writes the flags, halts,
+  strategy modes, bans, the daily entry count and the audit log:
+  - The database checks every statement before it runs, as a second line behind the code's
+    own checks. A normal statement can only read and write the bot's rows; settings changes,
+    other files and new tables are refused.
+  - SQL is always fixed text, written only in the storage files (a test enforces it).
+  - Every audit record is chained to the one before it, so a changed or removed record is found.
+  - Only your own commands can lift a halt or clear KILL: the engine's code cannot even reach
+    the files that write your records.
+  Both Opus reviewers checked it (REVIEWS.md Q). The risk reviewer blocked it over two small
+  gaps in what the engine's code was allowed to do: it could have shortened the 15-minute wait
+  after you lift a halt, and moved a strategy's go-live count back in time. Both are fixed:
+  only your commands record when a halt was lifted, and a count's start can only move later.
+  Also fixed: a strategy goes live only from paper; leaving live, by you or automatically,
+  restarts its go-live count; ended cooldowns are deleted only a day later, so a clock jump
+  cannot erase a running one. The security reviewer approved with notes, and the ones due now
+  are done: a test now checks which code file may write which part of the database, and that
+  the database connection cannot be passed around in disguise. I also fixed two tests that
+  failed now and then by chance. 852 tests pass. 141 of 142 planted bugs are caught; the one
+  left repeats a refusal another check already makes. After the fixes both reviewers approved,
+  with notes for later steps (REVIEWS.md Q; the list is in STORAGE_DESIGN.md s.13.1).
 - For you to know before live: at 5% per trade, live trading needs at least 0.4 SOL in the
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
@@ -124,5 +145,10 @@ can trade, and no key or account exists anywhere.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
-  before Phase 7, turn on GitHub 2FA.
+  before Phase 7, turn on GitHub 2FA. One question for you (asked 2026-11-17): when you clear
+  KILL at the server, should new trades also wait the same 15 minutes as after a lifted halt?
+  Recommended: yes (stricter, and it costs nothing).
+- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 40% (settings,
+  accounting, risk engine and most of storage done); the whole build about 20-25%. Proving an
+  edge on paper takes weeks on top of that.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.

@@ -344,7 +344,8 @@ describe('config change properties', () => {
     assert.ok(stats.pendingMade >= 200, `only ${stats.pendingMade} pending rows`);
     assert.ok(stats.pendingApplied >= 40, `only ${stats.pendingApplied} pending rows applied`);
     assert.ok(stats.aiValid >= 300 && stats.aiApplied >= 200, `AI: ${stats.aiValid} valid, ${stats.aiApplied} applied`);
-    assert.ok(stats.rollbacks >= 300, `only ${stats.rollbacks} rollbacks`);
+    // over ten measured runs 303 to 388 rollbacks; 300 failed now and then (review Q, risk 7), 200 never should
+    assert.ok(stats.rollbacks >= 200, `only ${stats.rollbacks} rollbacks`);
     assert.ok(stats.demotions >= 50, `only ${stats.demotions} demotions`);
     assert.ok(stats.kept >= 10, `only ${stats.kept} paper-model values kept by a rollback`);
   });

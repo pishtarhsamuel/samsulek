@@ -27,7 +27,7 @@ enums, namespaces or parameter properties); `tsc --noEmit` type-checks; no build
 |---|---|---|
 | core/ | branded bigint units, checked integer math (caps round down, costs round up), ids, clock (UTC + Athens day), Result, redactor | nothing |
 | config/ | `caps.ts` (`HARD_CAPS`, `TUNABLE_BOUNDS`, `LIVE_CAPS`); `tunables.ts` (the tunables: rules, defaults, strict checks, stored form; no modes); `changes.ts` (/set, AI proposals and approval, /rollback, versions, the 24 h live loosenings: pure plans); the server-file schema and layered loading later | core, storage |
-| storage/ | `sqlite.ts` (only importer of `node:sqlite`, types included: one checked statement per call, one synchronous transaction as the only way to write); `codec.ts` (the only TEXT<->bigint place: readers, writers and the SQL CHECK fragments); `migrations.ts` (forward-only runner, the only caller of `tx.script`); repositories, backup | core |
+| storage/ | `sqlite.ts` (only importer of `node:sqlite`, types included: one checked statement per call, one synchronous transaction as the only way to write, SQLite's authorizer behind every text check); `codec.ts` (the only TEXT<->bigint place: readers, writers and the SQL CHECK fragments); `migrations.ts` (forward-only runner, the only caller of `tx.script`); the repositories `repo-*.ts`, the only files that run SQL, always constant text, each writing only the tables and columns its job allows (`repo-owner.ts` for app/owner.ts and cli/ only, `repo-server.ts` for cli/ only, the audit chain's writer for the three audit files only; their functions are only called, never handed on, and a database handle never leaves its own type); backup | core |
 | chain/ | ProviderClient (JSON-RPC over fetch, WebSocket), BudgetGovernor, v1-only reads, block height, clock drift | core, config |
 | venues/ | pump curve, PumpSwap, Raydium CPMM: decoders hand-written from the official IDLs, fee-config readers, exact quote math rounded in the venue's favour, PDAs; Phase 8 instruction builders | core |
 | ingest/ | provider data to `MarketEvent`s, dedupe, slot watermark | core, chain, venues, fomo |
@@ -45,7 +45,10 @@ enums, namespaces or parameter properties); `tsc --noEmit` type-checks; no build
 
 Import rules are enforced by a node:test test that parses every source file with the
 TypeScript compiler API (`tests/architecture/import-graph.test.ts`; eslint deferred, its own
-review first). Loops: exit marks 5 s (mint re-read 60 s, P0); strategy
+review first). One rule uses the type checker: every call to a database handle's `get`,
+`all`, `run` or `script` passes constant SQL, and only the storage repositories make such
+calls. Source files use no `any` and no directive that switches the type check off, and no SQL
+text holds a conflict clause (OR REPLACE, OR IGNORE). Loops: exit marks 5 s (mint re-read 60 s, P0); strategy
 ticks crowdflow 5 s, launch 15 s (P2), momentum 30 s (P4); health 10 s (anchors 2 min,
 drift 5 min); reconciliation 5 min and after every trade; equity 1 min; backup 03:30, AI
 review 08:30, daily summary 09:00 Athens.
@@ -118,7 +121,7 @@ type ApprovalToken = { readonly [approved]: true; id: string; intentId: string; 
 // snapshot is the token as verified, the slot it was judged at and the frozen plan, which T2 records the order from, and
 // redeem returns that frozen plan for the executor to build its transaction from.
 // Only risk/ and app/ may import anything in risk/ at runtime (architecture test); everyone else imports types. app/ may not
-// re-export risk/ values and is reached at runtime only from cli/; pure folders (core, venues, portfolio, risk, strategies,
+// re-export risk/ values and is reached at runtime only from cli/, and cli/ only from cli/ itself; pure folders (core, venues, portfolio, risk, strategies,
 // exits) import only pure folders at runtime, so purity holds across imports, with one exception: config/caps.ts, held to
 // the pure rules itself, which imports and re-exports nothing at runtime and which any folder may import under its exact
 // name; no two source files differ only in case, and there are no symlinks under src/.
