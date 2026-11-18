@@ -135,6 +135,47 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    - After the re-check: each writer of the audit chain writes only as its own actors (one
      program per case, so one actor too many in any writer's set is caught); no `arguments` and
      no call of a value of type `any`. Planted bugs for these two rules: 9 of 9 caught.
+   Done in step 6c-2b-1 (the config and the day state):
+   - Version 1 only from the setup at the server, once; the history read back exactly as written
+     (round trip through `nextVersion`, `withValue` and `decodeTunables`); a gap, an unknown author,
+     text `jsonParam` never writes and a changed list that is no list of names refused on read.
+   - The owner's config commands: each refusal alone, with nothing written even when a careless
+     caller catches it (the author, the id, the undo, a version that changes nothing, drops a
+     tunable or lists more or less than it changed, a waiting row from another value or source, for
+     less than a day, twice, a cancel of nothing). Review R: a waiting row asked for before or
+     after the command; a version dated before the active one or after the command, and dated as
+     the active one while the clock is behind it; a set that leaves the waiting row of a tunable it
+     sets, a tunable applied and queued at once, a rollback that leaves a waiting row.
+   - The engine's due step: only the queued change, once due (a moment early refused), each wrong
+     field alone; dated before the active version or after now refused, and as the active version
+     when the clock is behind it; a stale row refused and dropped instead; the engine's own audit
+     rows.
+   - The day state: a full state round trip, walked one step at a time; the engine cannot lift the
+     two-day halt; a row changed behind the bot's back refused; the resume and the reset restart
+     the peak and the streak exactly as risk/daystate.ts does, and are refused while a jump is held
+     or the equity is zero (the refusal names the mode).
+   - Review R, the day-state guard, each refusal alone with nothing written: the day or stop day
+     moved back or cleared; a streak below the stop days' count (the same stop day, the next one, a
+     gap, after the owner's resume) or two days without the halt; a hold cleared without its
+     confirmation, before the hold, over 5 minutes after it (risk/daystate.ts's own window, pinned)
+     or above it; an acknowledgement moved, raised or cleared at any other time; the peak lowered,
+     cleared, below the last equity, or in a withdrawal's shape; a new day's baseline below the
+     higher of the last equity and the observation, or without a peak; the same day's baseline
+     lower, or set again below that after a reset. A property test (200 random runs of 20 to 80
+     steps) puts the risk module's own steps through the write: none refused, each read back.
+   - risk/daystate.ts: a deposit leaves a reset baseline reset (review R).
+   - Snapshots: one per millisecond, the nearest known one (older on a tie), kept a day.
+   - Clearing KILL starts the recovery wait (decision D6).
+   - The write rules for the four new tables, with canaries (review R: a waiting change deleted one
+     at a time by its path; an INSERT into day_state; a snapshot DELETE from another file); the
+     engine files' exports pinned.
+   - Planted bugs: 66 of 68 caught; the two left repeat a check another one already makes.
+     Review R: 61 of 62 caught; the one left is equivalent (a waiting row's day counted from its
+     own time, which must already equal the command's). The re-check's notes: 9 of 11 caught; the
+     two left only narrow a type.
+   - Re-check of review R: a new day at zero equity; a day moved past the write's own day (one
+     day early, far ahead), a new stop day that is not the state's own day, or while the clock is
+     behind it; a day the clock is behind may stay.
 
 ## 4. Property-based tests (fast-check)
 

@@ -7,8 +7,8 @@ import { codeCell, hex64Cell, intCell, jsonCell, jsonParam, msCell } from './cod
 import { MAX_AUDIT_ID, cellOneOf, oneOf, required } from './repo-util.ts';
 import { StorageError, type Reader, type Tx } from './sqlite.ts';
 
-/** What the engine records: KILL and halts it sets, and the config steps it applies on its own. */
-export const ENGINE_AUDIT_ACTIONS = Object.freeze(['engine:kill-set', 'engine:halt-set', 'engine:apply-due', 'engine:demote'] as const);
+/** What the engine records: KILL and halts it sets, the due config steps it applies or drops on its own, and a demotion. */
+export const ENGINE_AUDIT_ACTIONS = Object.freeze(['engine:kill-set', 'engine:halt-set', 'engine:apply-due', 'engine:drop-pending', 'engine:demote'] as const);
 export type EngineAuditAction = (typeof ENGINE_AUDIT_ACTIONS)[number];
 
 export function appendEngineAudit(tx: Tx, at: number, action: EngineAuditAction, detail: AuditDetail = {}): number {

@@ -5,7 +5,8 @@ reviewed by risk-guardian and security-auditor before its commit. 6a is done (RE
 6b is built (REVIEWS.md O), with the differences from sections 1.1-1.3 listed in section 11.
 6c is built in parts: 6c-1, the schema with the secret filter and the JSON codec (REVIEWS.md
 P, differences from section 2 in section 12); 6c-2a, the authorizer, the SQL rules, the audit log
-and the flags (REVIEWS.md Q, section 13); then 6c-2b, the book, orders, config and day state.
+and the flags (REVIEWS.md Q, section 13); then 6c-2b in two parts: 6c-2b-1, the config and the
+day state (REVIEWS.md R, section 14), and 6c-2b-2, the book and orders.
 The owner accepted the four decisions of section 8 on 2026-11-13 (DECISIONS.md D5). Where this
 file and ARCHITECTURE.md differ, ARCHITECTURE.md wins until a sub-step's review moves the
 change there.
@@ -1491,13 +1492,15 @@ Open for 6c-2b:
   no signatures, hashes or `e.message`; the largest plans pass; no raw bps lists);
 - ids of at most 63 characters, `plan_hash` computed in the repository, pending paths from the
   TunablePath list;
-- snapshot pruning past an hour;
+- snapshot pruning past an hour (done in 6c-2b-1: kept a day, s.14);
 - change counts in the remaining repositories;
 - where the owner's config rows are written (review Q, security 2): owner:set, owner:rollback,
   owner:cancel-pending and owner:ai-approve go in `repo-owner.ts`, or in a new file under the
   same import restriction (added to RESTRICTED_FILES, and to the write rules for
   `config_versions` and `pending_changes`). engine:apply-due goes through `repo-audit.ts`. The
-  config repository itself may not write `audit_log` (the write rules refuse it).
+  config repository itself may not write `audit_log` (the write rules refuse it). Done in
+  6c-2b-1: `writeOwnerConfig` in repo-owner.ts; the engine's `applyDueStep` and
+  `dropDuePending` write through `appendEngineAudit` (s.14).
 
 New conditions from 6c-2a:
 - For 6d and 6e: an app/ transaction never catches a repository's error and carries on. A
@@ -1538,4 +1541,178 @@ New conditions from review Q:
   and ALTER decided on its first argument being `main`), with a test that runs each ALTER form
   through the wrapper on a real connection. Until then no migration can alter a table.
 - Owner question (risk 9): should clearing KILL also start the 15-minute recovery wait, as lifting
-  a halt does? Recommended: yes (stricter, and costs nothing). Asked in the step summary.
+  a halt does? Recommended: yes (stricter, and costs nothing). Answered yes (decision D6); built
+  in 6c-2b-1.
+
+## 14. Step 6c-2b-1 as built: the config and the day state
+
+The first half of 6c-2b (the second, the book and orders, follows as 6c-2b-2). Storage cannot import
+the config module at runtime (types only), so the repositories return the stored form, for
+config/changes.ts to check (`checkHistory`) and decode (`decodeTunables`), and they re-check what
+they can see on the stored form itself (`storage/config-tree.ts`: the tunables as groups of named
+whole numbers or decimal text, compared value by value, kind included, in the stored order).
+
+`storage/repo-config.ts`, which the engine may import (its exports are pinned by a test):
+
+- `readConfigHistory`: every version, oldest first, ids 1, 2, 3 without a gap; version 1 is
+  required (`row-missing`, never the defaults: contract 1). The values come back as the exact
+  stored text, which is the config module's own encoding (`encodeTunables`), tested.
+- `readPendingChanges`: the waiting loosenings, by name, amounts as bigints for the config module
+  to convert by kind.
+- `applyDueStep(tx, now, version)`, the only way the engine adds a version: the version after the
+  active one, differing from it only at the pending row's tunable, by exactly the queued value,
+  written by the row's source and undoing to the active version, once the row is due, dated no
+  earlier than the active version and no later than now (`max(now, active.createdAt)` when the clock
+  is behind the active version; review R, risk 3 and security 2: a far date would make every later
+  version, a tightening included, "older than the active one"). A row whose tunable no longer holds
+  the value it was made from is stale and refused. The engine's `engine:apply-due` audit row comes
+  first, then the version, then the row is deleted. So a bug in the engine can never write a
+  version the owner did not queue, nor apply one early.
+- `dropDuePending(tx, now, path)`: a due row that can no longer apply is dropped, with the
+  engine's `engine:drop-pending` row first. Dropping a waiting loosening keeps the config as strict
+  as it is; a row that is not due yet stays (the owner's /cancel removes it).
+
+`storage/repo-owner.ts`, `writeOwnerConfig(tx, at, actor, action, { version, pending, cancelled })`
+for /set (`owner:set`), /rollback (`owner:rollback`), an approved AI proposal (`owner:ai-approve`)
+and /cancel (`owner:cancel-pending`), the security condition of review Q on where the owner's config
+rows go. The owner's row first, then the cancelled rows deleted, the version that applies now and
+the new waiting rows. Before any write it re-checks: the command's own author; the next version id,
+undoing only to an earlier one; a version dated no earlier than the active one and no later than
+the command (as the active one when the clock is behind it); a version that keeps every tunable,
+changes something and lists exactly what it changed; each new waiting row made by the command's
+source from the tunable's current value, asked for by this command at its own time and due at
+least the schema's day after it (review R, risk 2 and security 1: a row dated in the past would
+apply at once, one dated ahead would make every later config command refuse), one per tunable;
+every cancelled row present. And RISK_POLICY s.12 (review R, risk 4): a command replaces the
+waiting row of every tunable it sets now or queues (it must be among the cancelled ones), a
+tunable is applied now or queued, never both, and /rollback replaces every waiting row. Storage
+cannot see a /set to the current value (it changes nothing), so cancelling a waiting loosening
+that way stays the planner's (s.14.1).
+
+`storage/repo-server.ts`:
+
+- `setUpConfig(tx, at, version)`: the owner's one-time setup writes version 1 (id 1, the default
+  author, nothing changed or undone), after the `server:setup` row; refused once a version exists.
+- `clearKill` also records the clear time, which starts the 15-minute recovery wait (decision D6).
+- `resetHalts` also restarts the day state of each mode whose peak or streak halt it lifts, as
+  risk/daystate.ts `resumePeak` and `resumeStreak` do: otherwise the halt would come straight back
+  on the next observation. It is refused, with nothing written, while such a mode holds an equity
+  jump or has no known equity above zero (the peak could not restart).
+
+`storage/repo-day.ts`, which the engine may import (exports pinned):
+
+- `readDayState(r, mode)`: the EquityState of risk/daystate.ts, typed, checked and frozen. A
+  missing row, an unknown shape, a hold without its flag, or half of an equity-and-time pair
+  throws.
+- `writeDayState(tx, mode, state, at)`: the engine's whole-state write after one observation, one
+  confirmed jump or one deposit (one write per step), each field read once. The daily stop and the
+  jump hold live only in this row, not in halt_reasons (s.3.1 step 3, s.3.5 step 6), so the write
+  compares the new state with the stored one and refuses, with nothing written, anything looser
+  than the one step of risk/daystate.ts that could have made it (review R, risk 1 and security 3):
+  - the two-day halt lifted (also refused in SQL outside the owner's files: a written
+    `streak_halt` other than a parameter or 1); the day or the stop day moved back or cleared (the
+    daily stop lifted early); a day moved past the write's own Athens day, or a new stop day that
+    is not the state's own day or is past the write's (re-check, security N2: a day far ahead
+    could never move back, and the mode would stay halted for good; a day the clock is behind may
+    stay as it is);
+  - a stop streak below what the stop days give: one more on the day after a stop day, 1 after a
+    quiet day, 0 only by the owner's resume; or a streak of two or more without the two-day halt
+    (the halt cannot be headed off);
+  - a held jump cleared other than by its confirmation (at most 5 minutes after the held
+    observation, never above it: risk/daystate.ts `confirmEquityJump`, pinned by a test), or the
+    acknowledgement changed at any other time (a higher or later one would weaken the jump test for
+    an hour);
+  - a new day at an equity of zero (re-check, risk 1 and security N1: risk/daystate.ts never
+    accepts zero, and a zero baseline would switch the daily stop off for the day; with it a reset
+    baseline cannot come from this write at all);
+  - a lower or cleared peak, a peak below the last equity, or a new day without a peak;
+  - a new day's baseline below the higher of the last equity and the day's first observation (the
+    first ever: that observation); the same day's baseline lower; after a reset (0), one set again
+    below that higher value.
+
+  Stricter than review R asked: a withdrawal is not written here at all, since a loss observation
+  that a bug also took off the peak and the baseline would look exactly like one. Withdrawals move
+  the day state with the ledger's transfer record in 6c-2b-2 (s.14.1). Storage cannot see the
+  observations themselves: an equity the engine made up looks like a real one. A property test
+  runs random days of the risk module's own steps (observations from the stored hour-ago base,
+  held and confirmed jumps, deposits, the owner's resumes, the halt rows of the trips) through this
+  write: none is ever refused, and each reads back unchanged.
+- `checkPeakRestart(state, mode)`: the peak restarts only at a known equity above zero and with no
+  held jump, as `resumePeak` requires; the refusal names the mode (review R, security 6). The
+  owner's resume and the server's reset use it.
+- Snapshots: `insertSnapshot` (one per mode and millisecond: the first stays; the stops' equity
+  never above the full equity when both are known), `snapshotNear(r, mode, target)` (the known
+  equity nearest the target, the older one on a tie: the jump test's base comes from the database,
+  contract 6), `pruneSnapshots(tx, now)` (only rows older than a day, `SNAPSHOT_KEEP_MS`: the jump
+  test reads the hour before now, and a clock that jumps ahead by less than a day cannot erase it).
+
+`storage/repo-owner.ts` `resumeHalt` now also restarts the paper day state in the same transaction
+(s.12.1): the peak resume rebases the peak at the last equity, the streak resume restarts the
+streak, each exactly as risk/daystate.ts does (tested against `resumePeak` and `resumeStreak`).
+The peak resume is refused, with nothing written, while a jump is held or the equity is not known
+above zero.
+
+risk/daystate.ts `applyTransfer` (review R, found while building the guard): a deposit now leaves a
+reset baseline (0) reset, so the next accepted observation sets it again from the last equity.
+Before, a withdrawal larger than the day's baseline followed by a small deposit made the deposit
+alone the day's baseline, and the daily stop was measured from that small amount for the rest of
+the day. A baseline above zero still moves by exactly the amount.
+
+The write rules of the architecture test now also cover these tables: config versions are only
+added, by repo-owner.ts, repo-server.ts and repo-config.ts; only repo-owner.ts queues a loosening,
+and only it and repo-config.ts delete one, one at a time by its path (`WHERE path = ?`, the row the
+code checked first: review R, security 5); none is changed; the day state is written only by
+repo-day.ts, repo-owner.ts and repo-server.ts, its rows are the migration's, and a written
+`streak_halt` other than 1 only in the owner's files; only repo-day.ts adds and prunes snapshots.
+Canaries now include an INSERT into day_state and a DELETE of snapshots from another file.
+
+Tests: every function at its boundary, each refusal alone with nothing written even when a careless
+caller catches it inside the transaction, rows changed behind the bot's back refused, and the
+config round trip through `nextVersion`, `withValue` and `decodeTunables`. Planted bugs (scratchpad
+`mut/run22.py`): 68, 66 caught. The two left are equivalent: the day-state write's change count
+(the write reads the row first, so a missing row is already refused), and the config command's
+own actor check (the owner's audit writer checks it again, as the command's first write). The
+first run found one test gap, now tested: a /cancel that also queues a malformed row, which only
+the /cancel's own refusal stops. The fixes of review R (scratchpad `mut/run23.py`): 62 planted, 61
+caught; the one left is equivalent (a waiting row's day counted from its own time, which must
+already equal the command's). The re-check's two notes (`mut/run24.py`): 11 planted, 9 caught;
+the two left only narrow a type (a day or stop day moved to null is refused two checks earlier).
+
+### 14.1 Conditions for the next steps
+
+- 6e (the config transactions): `setTx`, `rollbackTx`, `cancelPendingTx` and the AI approval call
+  `writeOwnerConfig` with the planner's own plan: versions dated `max(now, active.createdAt)`, rows
+  asked for at `now`, and its cancelled rows include every waiting row of a tunable the command
+  addressed, a /set to the current value included (storage checks the rest, s.14). `applyDueTx`
+  calls `applyDueStep` for each step (dated the same way) and `dropDuePending` for each stale row,
+  then `demote` and `restartGate`, in one transaction.
+- 6e (review R, security 4): every version and row goes through `checkTunables` or `nextVersion`
+  before `writeOwnerConfig`, and a test decodes what was stored. Storage cannot see the bounds (a
+  value `decodeTunables` will refuse forever can be stored) nor tell a loosening from a tightening,
+  so the 24-hour wait of a version written now rests on config/changes.ts alone.
+- 6d and 6e (the day state): `observeDayTx` reads the hour-ago base with `snapshotNear`, writes the
+  state with `writeDayState`, adds a snapshot and prunes, in one transaction, one write per step
+  (a write that combines an observation with another step can be refused, which fails closed),
+  with the write's `at` the same clock reading the observation used (an earlier one would refuse a
+  correct new day: fail closed, but needless; re-check, risk follow-up); the owner's /resume is
+  `resumeHalt` (its day-state restart is built in).
+- 6c-2b-2 (review R): a withdrawal moves the day state only through a new repo-day.ts writer tied
+  to the transfer the ledger records in the same transaction, checked to be exactly
+  `applyTransfer`'s move for that amount (deposits included); `writeDayState` keeps refusing any
+  fall of the peak or the same day's baseline. That writer leaves a baseline reset (0) only as
+  `applyTransfer` does (re-check, risk note 2), and 6d tests that the next accepted observation
+  sets it again: this guard alone cannot force that.
+- 6d (re-check, risk note 3): a refusal by `writeDayState` is handled like a RiskError in
+  `observeDayTx` (s.3.5): the transaction rolls back, a separate one sets `day-state-error:<mode>`,
+  and the owner is alerted. The engine never retries with an edited state.
+- 6d (review R, risk 6): a held jump blocks the server's whole reset and the paper peak resume
+  (fail closed). Jump verification must keep running while halted, or the server gets the owner's
+  confirm command (contract 3), so the owner cannot be stuck.
+- 6d (review R, risk 7 and security 5): `snapshotNear` takes only rows at or before now, and the
+  engine alerts when the nearest base is far from an hour ago (contract 6's alert when the check
+  is in effect off); `insertSnapshot` refuses an `at` beyond the run's now.
+- Phase 8 (review R, risk 5): `resetHalts` rebases the live peak at once; RISK_POLICY s.4 contract
+  4 restarts it only after the 24 h wait with notice (s.12). That rebase moves with the wait's
+  migration.
+- Open for 6c-2b-2: the book and orders (ledger accounts, positions, intents, decisions,
+  approvals, orders), with the conditions of s.12.1 and s.13.1 that name them.

@@ -405,7 +405,10 @@ export function confirmEquityJump(stateInput: EquityState, verifiedEquity: Lampo
  * A confirmed deposit (positive) or withdrawal (negative): baseline, peak and last equity move by
  * exactly that amount (RISK_POLICY.md s.4). A withdrawal larger than the last known equity cannot
  * be real and would wipe the baseline, so it fails closed; so does a result beyond 2^64 - 1. A
- * baseline or peak a withdrawal takes to zero is reset; a peak at zero is no peak.
+ * baseline or peak a withdrawal takes to zero is reset; a peak at zero is no peak. A reset stays
+ * reset through a deposit, so the next accepted observation sets it again from the last equity
+ * (review R: a deposit onto a reset baseline made the deposit alone the day's baseline, and the
+ * daily stop was then measured from that small amount for the rest of the day).
  */
 export function applyTransfer(stateInput: EquityState, delta: SignedLamports): EquityState {
   const state = checkState(stateInput);
@@ -425,7 +428,7 @@ export function applyTransfer(stateInput: EquityState, delta: SignedLamports): E
   const peak = state.peak === null ? null : move(state.peak);
   return Object.freeze({
     ...state,
-    dayStart: move(state.dayStart) as Lamports,
+    dayStart: (state.dayStart > 0n ? move(state.dayStart) : 0n) as Lamports,
     lastEquity: move(state.lastEquity) as Lamports,
     peak: (peak === null || peak === 0n ? null : peak) as Lamports | null,
   });

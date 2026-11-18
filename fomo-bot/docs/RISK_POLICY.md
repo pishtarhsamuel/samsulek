@@ -110,7 +110,9 @@ the other way round; counting per mode needs the owner's OK).
 - Start-of-day baseline = the higher of the last equity seen and the first observation of
   the day (root rule: an overnight gap down counts against today).
 - A withdrawal lowers the day baseline, the peak and the last equity by its amount; a
-  confirmed deposit raises all three by its amount. A withdrawal larger than the last known
+  confirmed deposit raises all three by its amount. A baseline or peak a withdrawal takes to
+  zero is reset, and a deposit leaves it reset: the next accepted observation sets it again
+  (review R), so a small deposit never becomes the day's whole baseline. A withdrawal larger than the last known
   equity cannot be real and would wipe the baseline (and with it the daily stop and the peak
   halt), so it fails closed: the engine halts and the owner reconciles. A deposit that would
   pass 2^64 - 1 is refused too. Any other unmatched increase is UNEXPECTED_BALANCE (HALT); the
@@ -293,8 +295,8 @@ Honest note: pump.fun and PumpSwap trades start at about 2.5% in venue fees alon
 
 3 losing trades in a row pause that strategy 2 h; 6 losing trades in a day switch it off
 until 00:00 Athens. No re-entry into a token for 6 h after any exit; never after an
-emergency or rug exit (its creator is blocklisted too). After a halt clears: 15 min of clean
-data before entries; after a breaker closes: 5 min.
+emergency or rug exit (its creator is blocklisted too). After a halt clears, or KILL is cleared
+(decision D6): 15 min of clean data before entries; after a breaker closes: 5 min.
 
 ## 8. Circuit breakers and flags
 

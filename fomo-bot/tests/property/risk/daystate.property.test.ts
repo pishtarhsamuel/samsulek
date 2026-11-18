@@ -128,7 +128,8 @@ describe('equity and day state properties', () => {
             const moved = (value: bigint): bigint => (value + t > 0n ? value + t : 0n);
             state = applyTransfer(before, signedLamports(t));
             transfers += 1;
-            assert.equal(state.dayStart, moved(before.dayStart), 'a transfer moves the baseline by exactly its amount');
+            // a reset baseline (0) stays reset, so the next observation sets it again (review R)
+            assert.equal(state.dayStart, before.dayStart > 0n ? moved(before.dayStart) : 0n, 'a transfer moves the baseline by exactly its amount');
             assert.equal(state.lastEquity, moved(before.lastEquity));
             assert.equal(state.peak, before.peak === null || moved(before.peak) === 0n ? null : moved(before.peak));
             assert.deepEqual({ ...state, dayStart: before.dayStart, lastEquity: before.lastEquity, peak: before.peak }, before, 'and nothing else');

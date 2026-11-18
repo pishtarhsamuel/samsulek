@@ -788,7 +788,9 @@ function sqlWrites(tokens: readonly SqlToken[]): SqlWrite[] {
       const where = isWordToken(tokens[end], 'where') ? tokens.slice(end + 1, stopAt(end + 1, ['returning', 'order', 'limit', 'on'])) : [];
       writes.push({ table, kind: 'update', sets: setItems(tokens.slice(set + 1, end)), where });
     } else if (isWordToken(t, 'delete') && isWordToken(tokens[i + 1], 'from')) {
-      writes.push({ table: tableAt(i + 2), kind: 'delete', sets: [], where: [] });
+      const end = stopAt(i + 2, ['where', 'returning', 'order', 'limit']); // past an alias or INDEXED BY
+      const where = isWordToken(tokens[end], 'where') ? tokens.slice(end + 1, stopAt(end + 1, ['returning', 'order', 'limit'])) : [];
+      writes.push({ table: tableAt(i + 2), kind: 'delete', sets: [], where });
     }
   }
   return writes;
@@ -796,6 +798,10 @@ function sqlWrites(tokens: readonly SqlToken[]): SqlWrite[] {
 
 /** The files that lift what only the owner lifts (STORAGE_DESIGN s.12.1): the owner's commands and the owner at the server. */
 const OWNER_WRITERS: readonly string[] = ['storage/repo-owner.ts', 'storage/repo-server.ts'];
+/** Config versions: the owner's commands, the setup at the server, and the engine's checked due step (STORAGE_DESIGN s.14). */
+const CONFIG_VERSION_WRITERS: readonly string[] = [...OWNER_WRITERS, 'storage/repo-config.ts'];
+/** The day state: the engine's own writer, and the owner's resume and the server's reset with their restarts. */
+const DAY_STATE_WRITERS: readonly string[] = ['storage/repo-day.ts', ...OWNER_WRITERS];
 
 /**
  * What a statement writes that its file may not (review Q, security finding 2). The database checks
@@ -827,9 +833,31 @@ function writeProblems(rel: string, sql: string): string[] {
       if (w.kind === 'delete' && rel !== 'storage/repo-flags.ts') {
         out.push(`${rel}: only repo-flags.ts deletes entry bans (its prune keeps them a day after they end)`);
       }
-    } else if (w.table === 'flags' || w.table === 'strategy_modes') {
+    } else if (w.table === 'config_versions') {
+      if (w.kind !== 'insert' || !CONFIG_VERSION_WRITERS.includes(rel)) {
+        out.push(`${rel}: config versions are only added, by repo-owner.ts (the owner's commands), repo-server.ts (the setup) and repo-config.ts (the engine's checked due step)`);
+      }
+    } else if (w.table === 'pending_changes') {
+      const queues = w.kind === 'insert' && rel === 'storage/repo-owner.ts';
+      const removes = w.kind === 'delete' && (rel === 'storage/repo-owner.ts' || rel === 'storage/repo-config.ts');
+      if (!queues && !removes) {
+        out.push(`${rel}: only repo-owner.ts queues a loosening, and only it and repo-config.ts (a due row) delete one; none is changed`);
+      }
+      // each deleted row is one the code checked first (review R, security 5)
+      if (removes && !sameTokens(w.where, sqlTokens('path = ?'))) {
+        out.push(`${rel}: a waiting change is deleted one at a time, by its path (WHERE path = ?)`);
+      }
+    } else if (w.table === 'equity_snapshots') {
+      if (w.kind === 'update' || rel !== 'storage/repo-day.ts') {
+        out.push(`${rel}: only repo-day.ts adds and prunes equity snapshots; none is changed`);
+      }
+    } else if (w.table === 'flags' || w.table === 'strategy_modes' || w.table === 'day_state') {
       if (w.kind !== 'update') {
-        out.push(`${rel}: the flags row and the strategy modes are the migration's (no INSERT or DELETE)`);
+        out.push(
+          w.table === 'day_state'
+            ? `${rel}: the day state rows are the migration's (no INSERT or DELETE)`
+            : `${rel}: the flags row and the strategy modes are the migration's (no INSERT or DELETE)`,
+        );
         continue;
       }
       if (w.sets.some((s) => s.column === null)) {
@@ -855,6 +883,15 @@ function writeProblems(rel: string, sql: string): string[] {
         }
         if (has('halt_cleared_at') && !OWNER_WRITERS.includes(rel)) {
           out.push(`${rel}: only repo-owner.ts and repo-server.ts record when halts were lifted (it starts the recovery wait)`);
+        }
+      } else if (w.table === 'day_state') {
+        if (!DAY_STATE_WRITERS.includes(rel)) {
+          out.push(`${rel}: only repo-day.ts, repo-owner.ts and repo-server.ts write the day state`);
+        }
+        // the engine's writer sets it from a parameter and refuses a lift in its code (repo-day.ts); a written 0 is a lift
+        const lifts = items('streak_halt').some((s) => !sameTokens(s.value, one) && !sameTokens(s.value, sqlTokens('?')));
+        if (lifts && !OWNER_WRITERS.includes(rel)) {
+          out.push(`${rel}: only repo-owner.ts and repo-server.ts lift the two-day halt (streak_halt set to anything but 1)`);
         }
       } else {
         const mode = items('mode');
@@ -1761,6 +1798,27 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['storage/repo-x.ts', 'UPDATE strategy_modes SET strategy = ? WHERE strategy = ?', "a strategy's row keeps its strategy"],
       ['storage/repo-x.ts', "DELETE FROM entry_bans WHERE kind = 'mint-cooldown'", 'only repo-flags.ts deletes entry bans'],
       ['storage/repo-x.ts', 'UPDATE (SELECT 1) SET x = 1', 'write to a table named plainly'],
+      // the config, the day state and the snapshots (6c-2b-1, STORAGE_DESIGN s.14)
+      ['storage/repo-flags.ts', 'INSERT INTO config_versions (id) VALUES (?)', 'config versions are only added, by repo-owner.ts'], // the engine's own file
+      ['storage/repo-owner.ts', "UPDATE config_versions SET author = 'owner' WHERE id = ?", 'config versions are only added'],
+      ['storage/repo-config.ts', 'DELETE FROM config_versions WHERE id = ?', 'config versions are only added'],
+      ['storage/repo-config.ts', 'INSERT INTO pending_changes (path) VALUES (?)', 'only repo-owner.ts queues a loosening'], // the engine never queues one
+      ['storage/repo-flags.ts', 'DELETE FROM pending_changes WHERE path = ?', 'only repo-owner.ts queues a loosening'],
+      ['storage/repo-owner.ts', 'UPDATE pending_changes SET apply_at = ? WHERE path = ?', 'only repo-owner.ts queues a loosening'],
+      ['storage/repo-config.ts', 'DELETE FROM pending_changes', 'a waiting change is deleted one at a time, by its path'],
+      ['storage/repo-config.ts', 'DELETE FROM pending_changes WHERE apply_at <= ?', 'a waiting change is deleted one at a time, by its path'],
+      ['storage/repo-owner.ts', 'DELETE FROM pending_changes WHERE path = ? OR 1 = 1', 'a waiting change is deleted one at a time, by its path'],
+      ['storage/repo-owner.ts', 'DELETE FROM pending_changes AS p WHERE p.path = ? RETURNING path', 'a waiting change is deleted one at a time, by its path'],
+      ['storage/repo-flags.ts', 'UPDATE day_state SET peak = ? WHERE mode = ?', 'only repo-day.ts, repo-owner.ts and repo-server.ts write the day state'],
+      ['storage/repo-day.ts', 'UPDATE day_state SET daily_stop_streak = 0, streak_halt = 0 WHERE mode = ?', 'only repo-owner.ts and repo-server.ts lift the two-day halt'],
+      ['storage/repo-day.ts', 'UPDATE day_state SET streak_halt = ?, streak_halt = 0 WHERE mode = ?', 'set each column of day_state once'],
+      ['storage/repo-day.ts', 'UPDATE day_state SET (streak_halt, peak) = (0, NULL) WHERE mode = ?', 'set each column of day_state on its own'],
+      ['storage/repo-day.ts', "DELETE FROM day_state WHERE mode = 'paper'", "the day state rows are the migration's"],
+      ['storage/repo-day.ts', "INSERT INTO day_state (mode, shape) VALUES ('paper', 1)", "the day state rows are the migration's"],
+      ['storage/repo-flags.ts', 'INSERT INTO day_state (mode) VALUES (?)', "the day state rows are the migration's"],
+      ['storage/repo-flags.ts', 'INSERT INTO equity_snapshots (mode, at) VALUES (?, ?)', 'only repo-day.ts adds and prunes equity snapshots'],
+      ['storage/repo-flags.ts', 'DELETE FROM equity_snapshots WHERE at < ?', 'only repo-day.ts adds and prunes equity snapshots'],
+      ['storage/repo-day.ts', 'UPDATE equity_snapshots SET equity = ? WHERE at = ?', 'only repo-day.ts adds and prunes equity snapshots; none is changed'],
     ];
     for (const [rel, sql, why] of bad) {
       const problems = writeProblems(rel, sql);
@@ -1784,6 +1842,17 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['storage/repo-server.ts', 'DELETE FROM halt_reasons'],
       ['storage/repo-x.ts', "SELECT kill FROM flags WHERE kill = 0 AND paused = 0 AND halt_cleared_at IS NULL"],
       ['storage/repo-x.ts', 'SELECT replace(a, ?, ?) AS b, "update" FROM t'], // a function and a column named like keywords
+      ['storage/repo-owner.ts', 'INSERT INTO config_versions (id, created_at, author, values_json, changed_json, undo_to) VALUES (?, ?, ?, ?, ?, ?)'],
+      ['storage/repo-server.ts', "INSERT INTO config_versions (id, created_at, author, values_json, changed_json, undo_to) VALUES (1, ?, 'default', ?, ?, NULL)"],
+      ['storage/repo-config.ts', 'INSERT INTO config_versions (id, created_at, author, values_json, changed_json, undo_to) VALUES (?, ?, ?, ?, ?, ?)'],
+      ['storage/repo-config.ts', 'DELETE FROM pending_changes WHERE path = ?'],
+      ['storage/repo-owner.ts', 'INSERT INTO pending_changes (path, from_value, to_value, source, requested_at, apply_at) VALUES (?, ?, ?, ?, ?, ?)'],
+      ['storage/repo-owner.ts', 'DELETE FROM pending_changes WHERE path = ?'],
+      ['storage/repo-day.ts', 'UPDATE day_state SET day = ?, peak = ?, daily_stop_streak = ?, streak_halt = ?, updated_at = ? WHERE mode = ?'],
+      ['storage/repo-owner.ts', 'UPDATE day_state SET daily_stop_streak = 0, streak_halt = 0, updated_at = ? WHERE mode = ?'],
+      ['storage/repo-server.ts', "UPDATE day_state SET peak = last_equity, updated_at = ? WHERE mode = ? AND jump_pending = 0 AND last_equity <> '0'"],
+      ['storage/repo-day.ts', 'INSERT INTO equity_snapshots (mode, at, equity, stop_equity) VALUES (?, ?, ?, ?) ON CONFLICT (mode, at) DO NOTHING'],
+      ['storage/repo-day.ts', 'DELETE FROM equity_snapshots WHERE at < ?'],
     ];
     for (const [rel, sql] of fine) {
       assert.deepEqual(writeProblems(rel, sql), [], `${rel}: ${sql}`);

@@ -135,20 +135,41 @@ can trade, and no key or account exists anywhere.
   failed now and then by chance. 852 tests pass. 141 of 142 planted bugs are caught; the one
   left repeats a refusal another check already makes. After the fixes both reviewers approved,
   with notes for later steps (REVIEWS.md Q; the list is in STORAGE_DESIGN.md s.13.1).
+- Part 6c-2b-1 is built (tests first): storing the settings and each day's totals.
+  - Settings: version 1 is written once at the server; your /set, /rollback, /cancel and AI
+    approvals each record your audit entry first, in files the engine cannot reach. The engine
+    can only apply a loosening you queued, exactly as queued, once its 24 hours are up; storage
+    checks this itself, so a bug in the engine cannot change a setting you did not ask for.
+  - Day totals: your /resume and the server reset restart the peak or the streak in the same
+    step, as the risk rules require.
+  - Your decision D6 is in: clearing KILL now also starts the 15-minute wait.
+  Both Opus reviewers checked it (REVIEWS.md R). The risk reviewer blocked it: the engine's code
+  could still have cleared today's daily stop or a held equity jump, or kept the "two bad days"
+  halt from ever firing, because those live only in the day totals. Fixed: every write of the
+  day totals is compared with the stored ones and refused if it is looser than the risk rules
+  could make it in one step. A test runs thousands of random days of the risk rules through it
+  and shows it never refuses a real step. Also fixed: a waiting setting change must be asked for
+  now and wait a full day; a new settings version is dated sensibly; your /set and /rollback
+  replace the waiting changes they should. Building this I found and fixed a small gap in the
+  risk rules: a deposit right after a large withdrawal could have shrunk the day's loss limit.
+  On the re-check both reviewers approved with notes. Two small gaps they found are fixed too: a
+  day's totals can no longer start at zero (that would have switched the daily stop off for the
+  day), and no date can be written past today (that would have frozen the bot for good). 899
+  tests pass. 70 of 73 new planted bugs are caught; the three left repeat a check another line
+  already makes. Both reviewers then approved the final version (REVIEWS.md R); their notes for
+  later steps are in STORAGE_DESIGN.md s.14.1.
 - For you to know before live: at 5% per trade, live trading needs at least 0.4 SOL in the
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: the rest of step 6 (6c-2 the code that reads and writes the tables, 6d the approval
+- Next: the rest of step 6 (6c-2b-2 the code that stores positions and orders, 6d the approval
   transaction, 6e settings and day-state transactions); then chain clients, the paper engine,
   Telegram and logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
-  before Phase 7, turn on GitHub 2FA. One question for you (asked 2026-11-17): when you clear
-  KILL at the server, should new trades also wait the same 15 minutes as after a lifted halt?
-  Recommended: yes (stricter, and it costs nothing).
-- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 40% (settings,
-  accounting, risk engine and most of storage done); the whole build about 20-25%. Proving an
+  before Phase 7, turn on GitHub 2FA.
+- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 45% (settings,
+  accounting, risk engine and most of storage done); the whole build about 22-27%. Proving an
   edge on paper takes weeks on top of that.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.

@@ -6,6 +6,9 @@
 // and src/storage/repo-server.ts.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { LAMPORTS_PER_SOL as SOL, lamports } from '../../../src/core/units.ts';
+import { emptyEquityState, resumePeak, resumeStreak, type EquityState } from '../../../src/risk/daystate.ts';
+import { readDayState, writeDayState } from '../../../src/storage/repo-day.ts';
 import { readFlags, readHalts, readModes, setHalt, setKill, setPaused } from '../../../src/storage/repo-flags.ts';
 import { OWNER_AUDIT_ACTIONS, appendOwnerAudit, resumeHalt, setStrategyMode, unpause, type OwnerAuditAction } from '../../../src/storage/repo-owner.ts';
 import { SERVER_AUDIT_ACTIONS, appendServerAudit, clearKill, resetHalts, type ServerAuditAction } from '../../../src/storage/repo-server.ts';
@@ -14,6 +17,25 @@ import type { Db } from '../../../src/storage/sqlite.ts';
 import { TEST_NOW, count, migratedDb, storageError } from './helpers.ts';
 
 const T = TEST_NOW;
+
+/** A day after losses: half the peak, and two daily stops in a row (the two-day halt is set). */
+const DOWN: EquityState = Object.freeze({
+  ...emptyEquityState(),
+  day: '2026-11-16',
+  dayStart: lamports(SOL),
+  lastEquity: lamports(SOL / 2n),
+  peak: lamports(2n * SOL),
+  dailyStopDay: '2026-11-16',
+  dailyStopStreak: 2,
+  streakHalt: true,
+});
+
+function downBoth(db: Db): void {
+  db.transaction((tx) => {
+    writeDayState(tx, 'paper', DOWN, T);
+    writeDayState(tx, 'live', DOWN, T);
+  });
+}
 
 function withDb(fn: (db: Db) => void): void {
   const db = migratedDb();
@@ -52,6 +74,7 @@ describe('the owner\'s writer: owner actions only, by the owner from Telegram or
 
   it('resumeHalt lifts the paper peak halt or the paper streak halt right after the owner\'s row, and records when halts were cleared', () => {
     withDb((db) => {
+      downBoth(db);
       for (const reason of ['peak-halt:paper', 'peak-halt:live', 'daily-stop-twice:paper', 'daily-stop-twice:live']) {
         db.transaction((tx) => setHalt(tx, reason, T));
       }
@@ -66,6 +89,44 @@ describe('the owner\'s writer: owner actions only, by the owner from Telegram or
       assert.equal(count(db, 'audit_log'), 6n);
       storageError(() => db.transaction((tx) => resumeHalt(tx, T, 'owner-telegram', 'all' as unknown as 'peak')), 'bad-param');
     });
+  });
+
+  it('the resume also restarts the paper day state, in the same transaction, exactly as risk/daystate.ts does: the peak at the last equity, the streak at zero (s.12.1)', () => {
+    withDb((db) => {
+      downBoth(db);
+      for (const reason of ['peak-halt:paper', 'daily-stop-twice:paper']) {
+        db.transaction((tx) => setHalt(tx, reason, T));
+      }
+      db.transaction((tx) => resumeHalt(tx, T + 1, 'owner-telegram', 'peak'));
+      assert.deepEqual(readDayState(db, 'paper'), resumePeak(DOWN));
+      db.transaction((tx) => resumeHalt(tx, T + 2, 'owner-telegram', 'streak'));
+      assert.deepEqual(readDayState(db, 'paper'), resumeStreak(resumePeak(DOWN)));
+      assert.deepEqual(readDayState(db, 'live'), DOWN); // the live day state only at the server (D4)
+    });
+  });
+
+  it('the peak resume is refused, with nothing written, while an equity jump is held or the equity is not known above zero (as resumePeak)', () => {
+    const held: EquityState = { ...DOWN, jumpPending: true, jumpHeld: { equity: lamports(SOL), at: T - 1_000 } };
+    const broke: EquityState = { ...DOWN, lastEquity: lamports(0n) };
+    for (const [state, message] of [
+      [held, /held equity jump of paper/],
+      [broke, /paper restarts only at a known equity above zero/],
+    ] as const) {
+      withDb((db) => {
+        db.transaction((tx) => setHalt(tx, 'peak-halt:paper', T));
+        db.transaction((tx) => writeDayState(tx, 'paper', state === broke ? DOWN : state, T));
+        if (state === broke) {
+          // what a withdrawal of everything leaves (the ledger's transfer write, 6c-2b-2): not a step the engine's own write may make
+          db.transaction((tx) => tx.run("UPDATE day_state SET last_equity = '0' WHERE mode = 'paper'"));
+        }
+        db.transaction((tx) => {
+          assert.match(storageError(() => resumeHalt(tx, T + 1, 'owner-telegram', 'peak'), 'row-count').detail, message);
+        });
+        assert.deepEqual(readHalts(db).map((h) => h.reason), ['peak-halt:paper']);
+        assert.equal(count(db, 'audit_log'), 1n);
+        assert.deepEqual(readDayState(db, 'paper'), state);
+      });
+    }
   });
 
   it('unpause clears the owner\'s pause with the owner\'s row; with no pause it writes nothing', () => {
@@ -125,6 +186,7 @@ describe('the server\'s writer: what only the owner at the server may do', () =>
       db.transaction((tx) => setKill(tx, T, 'telegram'));
       db.transaction((tx) => clearKill(tx, T + 1));
       assert.equal(readFlags(db).kill, null);
+      assert.equal(readFlags(db).haltClearedAt, T + 1); // clearing KILL starts the recovery wait too (owner decision D6)
       assert.deepEqual(audits(db), ['engine engine:kill-set', 'owner-server server:clear-kill']);
       // a new KILL needs a new clear
       db.transaction((tx) => setKill(tx, T + 2, 'sentinel'));
@@ -163,6 +225,7 @@ describe('the server\'s writer: what only the owner at the server may do', () =>
     withDb((db) => {
       assert.equal(db.transaction((tx) => resetHalts(tx, T)), 0);
       assert.equal(count(db, 'audit_log'), 0n);
+      downBoth(db);
       for (const reason of ['peak-halt:live', 'disk-db', 'daily-stop-twice:live']) {
         db.transaction((tx) => setHalt(tx, reason, T));
       }
@@ -171,6 +234,32 @@ describe('the server\'s writer: what only the owner at the server may do', () =>
       assert.equal(readFlags(db).haltClearedAt, T + 1);
       assert.deepEqual(audits(db).at(-1), 'owner-server server:reset-halt');
       assert.equal(verifyAuditChain(db).rows, 4);
+      // the live peak and streak restarted with their halts; the paper day state had none lifted
+      assert.deepEqual(readDayState(db, 'live'), resumeStreak(resumePeak(DOWN)));
+      assert.deepEqual(readDayState(db, 'paper'), DOWN);
+    });
+  });
+
+  it('the reset restarts the day state of each mode whose peak or streak halt it lifts, and is refused, with nothing written, while that mode holds an equity jump', () => {
+    withDb((db) => {
+      downBoth(db);
+      db.transaction((tx) => setHalt(tx, 'peak-halt:paper', T));
+      db.transaction((tx) => setHalt(tx, 'daily-stop-twice:live', T));
+      db.transaction((tx) => resetHalts(tx, T + 1));
+      assert.deepEqual(readDayState(db, 'paper'), resumePeak(DOWN)); // the paper streak halt was not among them
+      assert.deepEqual(readDayState(db, 'live'), resumeStreak(DOWN));
+      const held: EquityState = { ...resumeStreak(DOWN), jumpPending: true, jumpHeld: { equity: lamports(SOL), at: T } };
+      db.transaction((tx) => writeDayState(tx, 'live', held, T + 2));
+      db.transaction((tx) => setHalt(tx, 'peak-halt:live', T + 2));
+      db.transaction((tx) => setHalt(tx, 'disk-db', T + 2));
+      const before = count(db, 'audit_log');
+      // a careless caller that catches the refusal and commits still writes nothing: the check comes before the first write
+      db.transaction((tx) => {
+        assert.match(storageError(() => resetHalts(tx, T + 3), 'row-count').detail, /held equity jump/);
+      });
+      assert.equal(count(db, 'audit_log'), before);
+      assert.deepEqual(readHalts(db).map((h) => h.reason), ['disk-db', 'peak-halt:live']);
+      assert.deepEqual(readDayState(db, 'live'), held);
     });
   });
 

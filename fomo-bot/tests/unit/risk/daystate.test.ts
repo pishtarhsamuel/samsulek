@@ -502,6 +502,20 @@ describe('deposits, withdrawals and the owner\'s /resume (invariant 22)', () => 
     assert.deepEqual(applyTransfer(state(), signedLamports(0n)), state());
   });
 
+  it('a deposit leaves a reset baseline reset, so the next observation sets it from the last equity: the deposit alone is never the baseline (review R)', () => {
+    // the equity rose above the day's baseline, then a withdrawal larger than the baseline reset it
+    const reset = applyTransfer(state({ dayStart: L(100_000_000n), lastEquity: L(500_000_000n), peak: L(500_000_000n) }), signedLamports(-300_000_000n));
+    assert.equal(reset.dayStart, L(0n));
+    const topped = applyTransfer(reset, signedLamports(1_000_000n));
+    assert.deepEqual([topped.dayStart, topped.lastEquity, topped.peak], [L(0n), L(201_000_000n), L(201_000_000n)]);
+    // the same day's next observation sets the baseline from the last equity, so the daily stop is measured from there
+    const r = run(topped, obs(201_000_000n, DAY1 + HOUR));
+    assert.equal(r.state.dayStart, L(201_000_000n));
+    assert.deepEqual(run(r.state, obs(140_000_000n, DAY1 + 2 * HOUR)).trips, ['daily-stop']); // -30% from 0.201 SOL, not from 0.001 SOL
+    // a baseline above zero still moves by exactly the deposit
+    assert.equal(applyTransfer(state(), signedLamports(1_000_000n)).dayStart, L(501_000_000n));
+  });
+
   it('a withdrawal larger than the last known equity is refused: it would wipe the daily-stop baseline and the peak', () => {
     const lost = state({ dayStart: L(500_000_000n), lastEquity: L(340_000_000n), peak: L(500_000_000n) });
     assert.throws(() => applyTransfer(lost, signedLamports(-340_000_001n)), /larger than the last known equity/);
