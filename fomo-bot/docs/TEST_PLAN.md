@@ -177,6 +177,52 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      day early, far ahead), a new stop day that is not the state's own day, or while the clock is
      behind it; a day the clock is behind may stay.
 
+   Done in step 6c-2b-2 (the book and the money path, STORAGE_DESIGN s.15):
+   - The plan text: buy, sell and close round-trip to risk's own text and hash; the largest plans
+     (about 1,030 characters) pass the secret filter; any other text of the same plan is refused
+     (spaces, unsorted keys or tip keys, an amount as a number, a missing, extra or renamed key);
+     a withdraw, a bad mode, amount or slot, an id of 64 characters or with a credential word. A
+     property test (1,000 random valid plans) ties the record to canonicalPlan and planHash.
+   - The book: the setup once (the server's row first, paper's one deposit, live at zero, the day
+     state untouched); accounts and positions changed behind the bot's back refused by column; a
+     stuck row refused on every read, never mapped; the opening at its boundaries (the held-back
+     spend 0, 1, 0.07 SOL and one more; ids of 63 and 64; a mode without its account; an existing
+     id; a second position on a mint; a fifth active one); the exit number (stale, the last one,
+     opening and closed positions); abandoning exactly as ledger.ts, with a failed fee in the
+     basis, before it opened, holding rent, and against each status of the buy.
+   - Intents and decisions: each field and each optional column; inputs that nest, list, hold a
+     fraction, an address, a getter, a symbol or another kind of record, or 33 names; the largest
+     intent; an entry onto an existing position; an exit's mode and mint from its position and its
+     number used up; each outcome against each intent kind, a null slot, an old config version,
+     reasons empty, repeated or no codes.
+   - Approvals: risk's own tokens; each token field against the text, the hash (also for a text
+     that differs only where storage binds nothing), a buy's held-back spend, a refused or missing
+     decision, a position in another mode or that cannot take the order; the MAC in no cell.
+   - T2 through risk's own verifier: the order from the text; once only; each snapshot field, the
+     slot edges and one past them, a clock behind the issue, an abandoned position, a buy above
+     its token's spend (a tampered row), a snapshot whose plan object disagrees (the text wins).
+   - Each write of the setup, a buy's T1, an exit intent and T2 failing in turn: nothing left.
+   - A property test of random T1 and T2 sequences on SQLite: invariant 1 and the book's
+     conservation after every step.
+   - The write rules for the six tables and the restricted files (only the bound token store uses
+     a token; only app/ writes the money path), with canaries.
+   - Planted bugs: 78 of 81 caught; the three left repeat a check another line already makes.
+   - Review S, each refusal alone with nothing written: reason lists that are not plain lists
+     (their own map or toJSON, a proxy, a subclass, another prototype, a getter or hidden element,
+     an extra or symbol property, a hole, a list-like object) for entry intents, exit intents and
+     refused decisions; a decision whose outcome answers one way and then another is read once and
+     stored as checked; a buy, sell or close plan for another mint than its position's, at the
+     approval and at T2 (an approval row written by hand), also through risk's verifier; the paper
+     bankroll at 1 lamport and at the 2.0 SOL sanity limit, one lamport more refused, the limit
+     pinned to config/caps.ts; the token store's one importer, upserts and DELETEs on the money
+     tables, a position closed from any status but opening (or with an OR, or with a comparison
+     that continues the pinned start: `= 0`, `IS 0`, `IN (0)`, `<> 1`, `IS NOT 1`), and a
+     position's amounts moved by any update but the abandon (canaries); a known slot of 0 for any
+     decision (a stored 0 means unknown); an exit intent with an inputs time and an exit token for
+     an exiting position (both had been reached only by some random runs). Planted bugs: run25's
+     81 again on the fixed code plus 28 for the fixes, 105 of 109 caught; the four left repeat a
+     check another line makes (or, for the order's values after the consume, cannot throw there).
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

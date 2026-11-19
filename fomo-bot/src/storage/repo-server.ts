@@ -3,15 +3,16 @@
 // row first, as the newest row of all, then the change. Only cli/ may import this file at runtime
 // (architecture rule): never the engine, never Telegram.
 import type { ConfigVersion } from '../config/changes.ts';
+import type { Lamports } from '../core/units.ts';
 import { appendAuditRow, type AuditDetail } from './audit-chain.ts';
 import { treeOf } from './config-tree.ts';
-import { intCell, jsonParam, msParam } from './codec.ts';
+import { amountParam, intCell, jsonParam, msParam } from './codec.ts';
 import { checkPeakRestart, readDayState } from './repo-day.ts';
 import { readFlags, readHalts } from './repo-flags.ts';
 import { expectChanges, oneOf, required } from './repo-util.ts';
 import { StorageError, type Tx } from './sqlite.ts';
 
-export const SERVER_AUDIT_ACTIONS = Object.freeze(['server:clear-kill', 'server:reset-halt', 'server:setup'] as const);
+export const SERVER_AUDIT_ACTIONS = Object.freeze(['server:clear-kill', 'server:reset-halt', 'server:setup', 'server:setup-ledger'] as const);
 export type ServerAuditAction = (typeof SERVER_AUDIT_ACTIONS)[number];
 
 export function appendServerAudit(tx: Tx, at: number, action: ServerAuditAction, detail: AuditDetail = {}): number {
@@ -96,4 +97,33 @@ export function setUpConfig(tx: Tx, at: number, version: ConfigVersion): void {
   }
   appendServerAudit(tx, at, 'server:setup');
   expectChanges(tx.run(INSERT_FIRST_VERSION, created, jsonParam(tree), jsonParam([])), 1, 'config version 1');
+}
+
+/**
+ * config/caps.ts HARD_CAPS.equitySanityLamports: no equity above 2.0 SOL is ever accepted, so no
+ * paper bankroll may start above it (review S, risk 4; a test pins the two together).
+ */
+const MAX_PAPER_BANKROLL = 2_000_000_000n;
+const ACCOUNT_COUNT = 'SELECT count(*) AS n FROM ledger_accounts';
+const INSERT_ACCOUNT = 'INSERT INTO ledger_accounts (mode, sol, total_deposits, total_withdrawals, updated_at) VALUES (?, ?, ?, ?, ?)';
+
+/**
+ * The owner's one-time setup writes both ledger accounts (s.12.1: never a default, never a
+ * migration): the server's row, then paper with its starting bankroll as its one deposit, and live at
+ * zero. The day state stays as the migration made it: the first accepted observation sets it from
+ * the equity. Nothing moves the totals afterwards until the transfers of Phase 8 (STORAGE_DESIGN
+ * s.15.9). Refused, with nothing written, once an account exists.
+ */
+export function setUpLedger(tx: Tx, at: number, paperStart: Lamports): void {
+  const atParam = msParam(at);
+  const start = amountParam(paperStart);
+  if (paperStart < 1n || paperStart > MAX_PAPER_BANKROLL) {
+    throw new StorageError('bad-param', 'expected a paper bankroll from 1 lamport to the 2.0 SOL sanity limit');
+  }
+  if (intCell(required(tx.get(ACCOUNT_COUNT), 'the account count'), 'n', 0, 2) !== 0) {
+    throw new StorageError('row-count', 'the ledger is set up already');
+  }
+  appendServerAudit(tx, at, 'server:setup-ledger', { paper: paperStart });
+  expectChanges(tx.run(INSERT_ACCOUNT, 'paper', start, start, '0', atParam), 1, 'the paper ledger account');
+  expectChanges(tx.run(INSERT_ACCOUNT, 'live', '0', '0', '0', atParam), 1, 'the live ledger account');
 }

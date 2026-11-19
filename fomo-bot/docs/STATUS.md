@@ -158,18 +158,36 @@ can trade, and no key or account exists anywhere.
   tests pass. 70 of 73 new planted bugs are caught; the three left repeat a check another line
   already makes. Both reviewers then approved the final version (REVIEWS.md R); their notes for
   later steps are in STORAGE_DESIGN.md s.14.1.
+- Part 6c-2b-2 is built (tests first): storing the money and the money path.
+  - Your setup at the server writes the paper bankroll once, and live at zero. Nothing can change
+    either account afterwards yet: deposits and withdrawals arrive with live trading in Phase 8,
+    with their own record so one transfer is never counted twice.
+  - Positions, what a strategy asked for, what the risk engine decided, the one-time approval and
+    the order are stored. Only the token store inside the risk engine's own check can use an
+    approval and create an order, and storage checks the plan's fingerprint itself.
+  - What the bot records about why it wanted a trade holds only numbers and short labels, never
+    another person's wallet address, so no FOMO user's wallet can end up in the database (the
+    orders hold the bot's own public addresses, which explain a trade).
+  - 968 tests pass, and every line and branch of the five new storage files is tested. Both Opus
+    reviewers checked it (REVIEWS.md S) and approved with notes; the fixes they asked for went in
+    first: a strategy's reasons could have slipped free text (an error message or an address)
+    into the database; a decision could have been read two ways; an approval for a different
+    token than its position's would have been accepted; the paper bankroll had no upper limit
+    (now at most 2 SOL, the hard sanity limit); and the rule on who may close a position is
+    tighter. 105 of 109 planted bugs are caught; the four left repeat a check another line
+    already makes. Their notes for the code that will record trade results are conditions in
+    STORAGE_DESIGN.md s.15.18.
 - For you to know before live: at 5% per trade, live trading needs at least 0.4 SOL in the
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: the rest of step 6 (6c-2b-2 the code that stores positions and orders, 6d the approval
-  transaction, 6e settings and day-state transactions); then chain clients, the paper engine,
-  Telegram and logging.
+- Next: the rest of step 6 (6d the approval transactions, 6e the settings and day-state
+  transactions); then chain clients, the paper engine, Telegram and logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
-- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 45% (settings,
-  accounting, risk engine and most of storage done); the whole build about 22-27%. Proving an
-  edge on paper takes weeks on top of that.
+- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 50% (settings,
+  accounting, risk engine and the storage files done; the transactions that use them next); the
+  whole build about 24-28%. Proving an edge on paper takes weeks on top of that.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.

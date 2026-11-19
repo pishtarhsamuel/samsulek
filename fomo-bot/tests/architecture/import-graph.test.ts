@@ -104,6 +104,17 @@ const RESTRICTED_FILES: Readonly<Record<string, { readonly allows: (rel: string)
   'storage/repo-owner.ts': { allows: (rel) => rel === 'app/owner.ts' || rel.startsWith('cli/'), who: 'app/owner.ts (Telegram, after the owner check) and cli/' },
   'storage/repo-server.ts': { allows: (rel) => rel.startsWith('cli/'), who: 'cli/ (the owner at the server)' },
   'app/owner.ts': { allows: () => false, who: 'its one Telegram wiring file (Phase 3 names it; none until then)' },
+  // the money path (6c-2b-2, STORAGE_DESIGN s.15.11): T1 lives in app/; only the token store bound into
+  // the verifier uses a token, so nothing else can consume one with a slot of its own choosing (K finding 3)
+  'storage/repo-redeem.ts': { allows: (rel) => rel === 'app/token-store.ts', who: 'app/token-store.ts (the token store bound into the verifier)' },
+  // and the token store itself only where it is bound into the authority: anything else could call
+  // its consume directly, past the verifier's MAC and its slot (review S, security 4)
+  'app/token-store.ts': { allows: (rel) => rel === 'app/authority.ts', who: 'app/authority.ts (where the store is bound into the verifier)' },
+  'storage/repo-orders.ts': { allows: (rel) => rel.startsWith('app/'), who: 'app/ (T1)' },
+  'storage/repo-book.ts': {
+    allows: (rel) => rel.startsWith('app/') || rel === 'storage/repo-orders.ts' || rel === 'storage/repo-redeem.ts',
+    who: 'app/, storage/repo-orders.ts and storage/repo-redeem.ts',
+  },
 };
 /**
  * Who each writer of the audit chain may write as (review Q re-check, security R1): its every call
@@ -802,6 +813,27 @@ const OWNER_WRITERS: readonly string[] = ['storage/repo-owner.ts', 'storage/repo
 const CONFIG_VERSION_WRITERS: readonly string[] = [...OWNER_WRITERS, 'storage/repo-config.ts'];
 /** The day state: the engine's own writer, and the owner's resume and the server's reset with their restarts. */
 const DAY_STATE_WRITERS: readonly string[] = ['storage/repo-day.ts', ...OWNER_WRITERS];
+/** The start of the one WHERE that may close a position in this step (the abandon's). */
+const OPENING_WHERE = sqlTokens("id = ? AND status = 'opening'");
+/** A position's amounts: in this step only the abandon moves them (review S, risk 5). */
+const POSITION_MONEY: readonly string[] = [
+  'token_units',
+  'cost_basis',
+  'rent_locked',
+  'realized',
+  'bought',
+  'sold',
+  'venue_fees',
+  'network_fees',
+  'failed_fees',
+  'tips',
+  'rent_paid',
+  'rent_refunded',
+  'tokens_bought',
+  'tokens_sold',
+  'exit_fees',
+  'basis_released',
+];
 
 /**
  * What a statement writes that its file may not (review Q, security finding 2). The database checks
@@ -850,6 +882,67 @@ function writeProblems(rel: string, sql: string): string[] {
     } else if (w.table === 'equity_snapshots') {
       if (w.kind === 'update' || rel !== 'storage/repo-day.ts') {
         out.push(`${rel}: only repo-day.ts adds and prunes equity snapshots; none is changed`);
+      }
+    } else if (w.table === 'ledger_accounts') {
+      // the setup writes both accounts once; T3's settlement and Phase 8's transfers get their own reviewed rules (6c-2b-2)
+      if (w.kind !== 'insert' || rel !== 'storage/repo-server.ts') {
+        out.push(`${rel}: only repo-server.ts writes the ledger accounts, once, at the setup (no UPDATE or DELETE until T3 and the transfers of Phase 8)`);
+      }
+    } else if (w.table === 'positions') {
+      if (rel !== 'storage/repo-book.ts' || w.kind === 'delete') {
+        out.push(`${rel}: only repo-book.ts writes positions, and none is deleted`);
+        continue;
+      }
+      if (w.kind === 'update') {
+        if (w.sets.some((s) => s.column === null)) {
+          out.push(`${rel}: set each column of positions on its own (no (a, b) = (...))`);
+        }
+        if (new Set(named).size !== named.length) {
+          out.push(`${rel}: set each column of positions once (SQLite takes the last of two)`);
+        }
+        if (items('status').some((s) => !sameTokens(s.value, sqlTokens("'closed'")))) {
+          out.push(`${rel}: a position's status is written only as 'closed' in this step (never 'stuck', 'opening' or a parameter; T3 adds its own)`);
+        }
+        // until T3: only an opening position is closed (the abandon), and only the abandon moves its money (review S, risk 5).
+        // The pinned start is a whole clause: the WHERE ends there or goes on with AND, so nothing continues its last
+        // comparison (`status = 'opening' = 0` reads as `(status = 'opening') = 0`; review S confirmation, security S8)
+        const fromOpening =
+          sameTokens(w.where.slice(0, OPENING_WHERE.length), OPENING_WHERE) &&
+          (w.where.length === OPENING_WHERE.length || isWordToken(w.where[OPENING_WHERE.length], 'and')) &&
+          !w.where.some((t) => isWordToken(t, 'or'));
+        if (has('status') && !fromOpening) {
+          out.push(`${rel}: a position is closed here only from opening (WHERE id = ? AND status = 'opening' ..., no OR), the abandon`);
+        }
+        if (has(...POSITION_MONEY) && !has('status')) {
+          out.push(`${rel}: a position's amounts move here only with its abandon (T3 adds its own reviewed writes)`);
+        }
+        if (items('exit_seq').some((s) => !sameTokens(s.value, sqlTokens('exit_seq + 1')))) {
+          out.push(`${rel}: a position's exit number only moves up by one (exit_seq + 1)`);
+        }
+        if (has('id', 'mint', 'strategy', 'mode', 'opened_at', 'max_spend', 'p95_exit_cost')) {
+          out.push(`${rel}: a position keeps its id, mint, strategy, mode, opening time, held-back spend and p95 exit cost`);
+        }
+      }
+    } else if (w.table === 'intents' || w.table === 'risk_decisions') {
+      if (w.kind !== 'insert' || rel !== 'storage/repo-orders.ts') {
+        out.push(`${rel}: only repo-orders.ts adds intents and decisions; none is changed or deleted`);
+      }
+    } else if (w.table === 'approvals') {
+      const issues = w.kind === 'insert' && rel === 'storage/repo-orders.ts';
+      const consumes =
+        w.kind === 'update' &&
+        rel === 'storage/repo-redeem.ts' &&
+        w.sets.length === 2 &&
+        items('consumed_at').length === 1 &&
+        items('consumed_slot').length === 1 &&
+        w.sets.every((s) => sameTokens(s.value, sqlTokens('?'))) &&
+        sameTokens(w.where, sqlTokens('token_id = ? AND consumed_at IS NULL'));
+      if (!issues && !consumes) {
+        out.push(`${rel}: only repo-orders.ts adds approvals, and only repo-redeem.ts uses one (consumed_at = ?, consumed_slot = ? WHERE token_id = ? AND consumed_at IS NULL)`);
+      }
+    } else if (w.table === 'orders') {
+      if (w.kind !== 'insert' || rel !== 'storage/repo-redeem.ts') {
+        out.push(`${rel}: only repo-redeem.ts adds orders; no status moves in this step, and none is deleted`);
       }
     } else if (w.table === 'flags' || w.table === 'strategy_modes' || w.table === 'day_state') {
       if (w.kind !== 'update') {
@@ -1705,6 +1798,16 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       // app/owner.ts is restricted itself: only its Telegram wiring file (Phase 3) may reach it (review Q, security 1b)
       ['app/engine.ts', "import { onOwnerUpdate } from './owner.ts'; export function f(): void { onOwnerUpdate(); }", `${only} its one Telegram wiring file`],
       ['cli/x.ts', "import { onOwnerUpdate } from '../app/owner.ts'; export function f(): void { onOwnerUpdate(); }", `${only} its one Telegram wiring file`],
+      // the money path (6c-2b-2): only the bound token store uses a token; only app/ writes intents, decisions, approvals and positions
+      ['app/approve-tx.ts', "import { redeemApproval } from '../storage/repo-redeem.ts'; export function f(): boolean { return redeemApproval(); }", `${only} app/token-store.ts`],
+      ['execution/x.ts', "import { redeemApproval } from '../storage/repo-redeem.ts'; export function f(): boolean { return redeemApproval(); }", `${only} app/token-store.ts`],
+      ['app/token-store.ts', "export { redeemApproval } from '../storage/repo-redeem.ts';", only],
+      ['execution/x.ts', "import { insertApproval } from '../storage/repo-orders.ts'; export function f(): void { insertApproval(); }", `${only} app/`],
+      ['storage/repo-book.ts', "import { insertDecision } from './repo-orders.ts'; export function f(): void { insertDecision(); }", `${only} app/`],
+      ['execution/x.ts', "import { abandonOpening } from '../storage/repo-book.ts'; export function f(): void { abandonOpening(); }", only],
+      ['storage/repo-day.ts', "import { readPosition } from './repo-book.ts'; export function f(): void { readPosition(); }", only],
+      ['app/engine.ts', "import { createSqliteTokenStore } from './token-store.ts'; export function f(): void { createSqliteTokenStore(); }", `${only} app/authority.ts`],
+      ['cli/x.ts', "import { createSqliteTokenStore } from '../app/token-store.ts'; export function f(): void { createSqliteTokenStore(); }", `${only} app/authority.ts`],
     ]);
     // the typed rule (below) checks that what is imported is only called; these are the import rules alone
     const fine: [string, string][] = [
@@ -1714,6 +1817,12 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['cli/reset.ts', "import { clearKill } from '../storage/repo-server.ts'; import { unpause } from '../storage/repo-owner.ts'; export function reset(): void { clearKill(); unpause(); }"],
       ['app/engine.ts', "import type { OwnerActor } from '../storage/repo-owner.ts'; export const x = (a: OwnerActor): OwnerActor => a;"],
       ['app/engine.ts', "import type { OwnerHandler } from './owner.ts'; export const x = (h: OwnerHandler): OwnerHandler => h;"],
+      ['app/token-store.ts', "import { redeemApproval } from '../storage/repo-redeem.ts'; export function consume(): boolean { return redeemApproval(); }"],
+      ['app/authority.ts', "import { createSqliteTokenStore } from './token-store.ts'; export function f(): void { createSqliteTokenStore(); }"],
+      ['app/approve-tx.ts', "import { insertApproval } from '../storage/repo-orders.ts'; import { insertOpening } from '../storage/repo-book.ts'; export function f(): void { insertOpening(); insertApproval(); }"],
+      ['storage/repo-orders.ts', "import { readPosition } from './repo-book.ts'; export function f(): void { readPosition(); }"],
+      ['storage/repo-redeem.ts', "import { readPosition } from './repo-book.ts'; export function f(): void { readPosition(); }"],
+      ['execution/x.ts', "import type { StoredOrder } from '../storage/repo-orders.ts'; export const x = (o: StoredOrder): StoredOrder => o;"],
     ];
     for (const [rel, text] of fine) {
       assert.deepEqual(checkSource(rel, text), [], rel);
@@ -1819,6 +1928,50 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['storage/repo-flags.ts', 'INSERT INTO equity_snapshots (mode, at) VALUES (?, ?)', 'only repo-day.ts adds and prunes equity snapshots'],
       ['storage/repo-flags.ts', 'DELETE FROM equity_snapshots WHERE at < ?', 'only repo-day.ts adds and prunes equity snapshots'],
       ['storage/repo-day.ts', 'UPDATE equity_snapshots SET equity = ? WHERE at = ?', 'only repo-day.ts adds and prunes equity snapshots; none is changed'],
+      // the book and the money path (6c-2b-2, STORAGE_DESIGN s.15.11)
+      ['storage/repo-day.ts', 'INSERT INTO ledger_accounts (mode) VALUES (?)', 'only repo-server.ts writes the ledger accounts'],
+      ['storage/repo-book.ts', 'UPDATE ledger_accounts SET total_deposits = ? WHERE mode = ?', 'only repo-server.ts writes the ledger accounts'],
+      ['storage/repo-server.ts', 'UPDATE ledger_accounts SET sol = ? WHERE mode = ?', 'only repo-server.ts writes the ledger accounts, once'],
+      ['storage/repo-orders.ts', 'INSERT INTO positions (id) VALUES (?)', 'only repo-book.ts writes positions'],
+      ['storage/repo-book.ts', 'DELETE FROM positions WHERE id = ?', 'only repo-book.ts writes positions, and none is deleted'],
+      ['storage/repo-book.ts', "UPDATE positions SET status = 'stuck' WHERE id = ?", "a position's status is written only as 'closed'"],
+      ['storage/repo-book.ts', 'UPDATE positions SET status = ? WHERE id = ?', "a position's status is written only as 'closed'"],
+      ['storage/repo-book.ts', "UPDATE positions SET status = 'opening' WHERE id = ?", "a position's status is written only as 'closed'"],
+      ['storage/repo-book.ts', 'UPDATE positions SET exit_seq = ? WHERE id = ?', "a position's exit number only moves up by one"],
+      ['storage/repo-book.ts', 'UPDATE positions SET exit_seq = exit_seq - 1 WHERE id = ?', "a position's exit number only moves up by one"],
+      ['storage/repo-book.ts', 'UPDATE positions SET mint = ? WHERE id = ?', 'a position keeps its id, mint'],
+      ['storage/repo-book.ts', 'UPDATE positions SET max_spend = NULL WHERE id = ?', 'a position keeps its id, mint'],
+      ['storage/repo-book.ts', "UPDATE positions SET status = 'closed', status = 'closed' WHERE id = ?", 'set each column of positions once'],
+      ['storage/repo-book.ts', "UPDATE positions SET (status, closed_at) = ('closed', ?) WHERE id = ?", 'set each column of positions on its own'],
+      ['storage/repo-book.ts', 'INSERT INTO intents (id) VALUES (?)', 'only repo-orders.ts adds intents and decisions'],
+      ['storage/repo-orders.ts', 'DELETE FROM intents WHERE id = ?', 'only repo-orders.ts adds intents and decisions; none is changed'],
+      ['storage/repo-orders.ts', 'UPDATE risk_decisions SET approved = 1 WHERE intent_id = ?', 'only repo-orders.ts adds intents and decisions; none is changed'],
+      ['storage/repo-redeem.ts', 'INSERT INTO approvals (token_id) VALUES (?)', 'only repo-orders.ts adds approvals'],
+      ['storage/repo-redeem.ts', 'UPDATE approvals SET consumed_at = NULL, consumed_slot = NULL WHERE token_id = ? AND consumed_at IS NULL', 'only repo-redeem.ts uses one'],
+      ['storage/repo-redeem.ts', 'UPDATE approvals SET consumed_at = ?, consumed_slot = ? WHERE token_id = ?', 'only repo-redeem.ts uses one'],
+      ['storage/repo-redeem.ts', 'UPDATE approvals SET consumed_at = ?, consumed_slot = ?, max_spend = ? WHERE token_id = ? AND consumed_at IS NULL', 'only repo-redeem.ts uses one'],
+      ['storage/repo-orders.ts', 'UPDATE approvals SET consumed_at = ?, consumed_slot = ? WHERE token_id = ? AND consumed_at IS NULL', 'only repo-redeem.ts uses one'],
+      ['storage/repo-orders.ts', 'INSERT INTO orders (id) VALUES (?)', 'only repo-redeem.ts adds orders'],
+      ['storage/repo-redeem.ts', 'UPDATE orders SET status = ? WHERE id = ?', 'only repo-redeem.ts adds orders; no status moves'],
+      ['storage/repo-x.ts', "UPDATE orders SET status = 'landed' WHERE id = ?", 'only repo-redeem.ts adds orders; no status moves'],
+      ['storage/repo-redeem.ts', 'DELETE FROM orders WHERE id = ?', 'only repo-redeem.ts adds orders; no status moves in this step, and none is deleted'],
+      // review S: a close only from opening, the amounts only with it; upserts and deletes on the money path
+      ['storage/repo-book.ts', "UPDATE positions SET status = 'closed', closed_at = ? WHERE id = ?", 'a position is closed here only from opening'],
+      ['storage/repo-book.ts', "UPDATE positions SET status = 'closed', closed_at = ? WHERE id = ? AND status = 'opening' OR 1 = 1", 'a position is closed here only from opening'],
+      ['storage/repo-book.ts', "UPDATE positions SET status = 'closed', closed_at = ? WHERE status = 'opening'", 'a position is closed here only from opening'],
+      // a comparison that continues the pinned start turns it round (review S confirmation, security S8)
+      ['storage/repo-book.ts', "UPDATE positions SET status = 'closed', closed_at = ? WHERE id = ? AND status = 'opening' = 0", 'a position is closed here only from opening'],
+      ['storage/repo-book.ts', "UPDATE positions SET status = 'closed', closed_at = ? WHERE id = ? AND status = 'opening' IS 0", 'a position is closed here only from opening'],
+      ['storage/repo-book.ts', "UPDATE positions SET status = 'closed', closed_at = ? WHERE id = ? AND status = 'opening' IN (0)", 'a position is closed here only from opening'],
+      ['storage/repo-book.ts', "UPDATE positions SET status = 'closed', closed_at = ? WHERE id = ? AND status = 'opening' <> 1 AND closed_at IS NULL", 'a position is closed here only from opening'],
+      ['storage/repo-book.ts', "UPDATE positions SET status = 'closed', cost_basis = '0' WHERE id = ? AND status = 'opening' IS NOT 1", 'a position is closed here only from opening'],
+      ['storage/repo-book.ts', 'UPDATE positions SET cost_basis = ? WHERE id = ?', "a position's amounts move here only with its abandon"],
+      ['storage/repo-book.ts', "UPDATE positions SET token_units = '0', updated_at = ? WHERE id = ? AND status = 'opening'", "a position's amounts move here only with its abandon"],
+      ['storage/repo-orders.ts', 'INSERT INTO approvals (token_id) VALUES (?) ON CONFLICT (token_id) DO UPDATE SET consumed_at = ?', 'only repo-redeem.ts uses one'],
+      ['storage/repo-redeem.ts', "INSERT INTO orders (id) VALUES (?) ON CONFLICT (id) DO UPDATE SET status = 'landed'", 'no status moves in this step'],
+      ['storage/repo-orders.ts', 'DELETE FROM approvals WHERE token_id = ?', 'only repo-orders.ts adds approvals'],
+      ['storage/repo-orders.ts', 'DELETE FROM risk_decisions WHERE intent_id = ?', 'none is changed or deleted'],
+      ['storage/repo-server.ts', "DELETE FROM ledger_accounts WHERE mode = 'live'", 'only repo-server.ts writes the ledger accounts, once'],
     ];
     for (const [rel, sql, why] of bad) {
       const problems = writeProblems(rel, sql);
@@ -1853,6 +2006,19 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['storage/repo-server.ts', "UPDATE day_state SET peak = last_equity, updated_at = ? WHERE mode = ? AND jump_pending = 0 AND last_equity <> '0'"],
       ['storage/repo-day.ts', 'INSERT INTO equity_snapshots (mode, at, equity, stop_equity) VALUES (?, ?, ?, ?) ON CONFLICT (mode, at) DO NOTHING'],
       ['storage/repo-day.ts', 'DELETE FROM equity_snapshots WHERE at < ?'],
+      ['storage/repo-server.ts', 'INSERT INTO ledger_accounts (mode, sol, total_deposits, total_withdrawals, updated_at) VALUES (?, ?, ?, ?, ?)'],
+      ['storage/repo-book.ts', "INSERT INTO positions (id, mint, strategy, mode, status, opened_at, max_spend, p95_exit_cost, updated_at) VALUES (?, ?, ?, ?, 'opening', ?, ?, ?, ?)"],
+      ['storage/repo-book.ts', "UPDATE positions SET exit_seq = exit_seq + 1, updated_at = ? WHERE id = ? AND exit_seq = ? AND status IN ('open', 'exiting')"],
+      [
+        'storage/repo-book.ts',
+        "UPDATE positions SET status = 'closed', closed_at = ?, cost_basis = '0', realized = ?, basis_released = ?, updated_at = ? WHERE id = ? AND status = 'opening' AND cost_basis = ? AND realized = ? AND basis_released = ?",
+      ],
+      ['storage/repo-book.ts', "UPDATE positions SET status = 'closed', closed_at = ?, updated_at = ? WHERE id = ? AND status = 'opening'"],
+      ['storage/repo-orders.ts', "INSERT INTO intents (id, kind, mode, strategy, mint, position_id, size_hint, confidence_bps, created_at, inputs_as_of, reasons_json, inputs_json) VALUES (?, 'entry', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"],
+      ['storage/repo-orders.ts', 'INSERT INTO risk_decisions (intent_id, at, approved, stage, reasons_json, size, limited_by, binding, slot, config_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'],
+      ['storage/repo-orders.ts', 'INSERT INTO approvals (token_id, intent_id, position_id, mode, kind, reduce_only, plan_hash, max_spend, min_out, quote_slot, expires_at_slot, issued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'],
+      ['storage/repo-redeem.ts', 'UPDATE approvals SET consumed_at = ?, consumed_slot = ? WHERE token_id = ? AND consumed_at IS NULL'],
+      ['storage/repo-redeem.ts', "INSERT INTO orders (id, intent_id, token_id, position_id, mode, kind, status, plan_hash, plan_json, in_amount, min_out, max_spend, quote_slot, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?)"],
     ];
     for (const [rel, sql] of fine) {
       assert.deepEqual(writeProblems(rel, sql), [], `${rel}: ${sql}`);
@@ -2005,6 +2171,7 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       'storage/repo-server.ts': `${HEAD}export const SERVER_AUDIT_ACTIONS = Object.freeze(['server:clear-kill'] as const);\nexport function clearKill(tx: Tx): number { return tx.run('DELETE FROM t'); }\nexport const again = clearKill; // its own file may`,
       'storage/repo-owner.ts': `${HEAD}export function unpause(tx: Tx): number { return tx.run('DELETE FROM t'); }`,
       'storage/audit-chain.ts': `${HEAD}export const AUDIT_GENESIS = '0'.repeat(64);\nexport function appendAuditRow(tx: Tx): number { return tx.run('DELETE FROM t'); }`,
+      'storage/repo-redeem.ts': `${HEAD}export function redeemApproval(tx: Tx): number { return tx.run('DELETE FROM t'); }`,
       'cli/ok.ts': [
         "import type { Tx } from '../storage/sqlite.ts';",
         "import { clearKill, SERVER_AUDIT_ACTIONS } from '../storage/repo-server.ts';",
@@ -2031,6 +2198,8 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       // the reviewer's reproduction: the owner's handler file handing an owner writer to whoever imports it
       'app/owner.ts': ["import { unpause } from '../storage/repo-owner.ts';\nexport const u = unpause;", handed],
       'storage/repo-b12.ts': ["import { appendAuditRow } from './audit-chain.ts';\nexport const a = appendAuditRow;", handed],
+      // the token store handing T2 on to whoever imports it (s.15.11; review S, security 6)
+      'app/token-store.ts': ["import { redeemApproval } from '../storage/repo-redeem.ts';\nexport const r = redeemApproval;", handed],
     };
     const { program, srcRoot } = virtualProgram({ ...files, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])) });
     const { problems, restrictedCalls } = sqlProblems(program, srcRoot);

@@ -565,7 +565,7 @@ Everything the transaction reads, it reads inside the transaction. Inputs from o
 
 ```ts
 export interface BuyRequest {
-  readonly intent: TradeIntent;   // strategy output; its id is the deterministic hash
+  readonly intent: BuyIntent;     // risk/approve.ts BuyIntent (strategy output); its id is the deterministic hash
   readonly positionId: string;    // engine-made (core/rng)
   readonly plan: OrderPlan;       // untrusted
   readonly market: BuyMarket;     // risk's own read (safety, quote, fee config, rent, p95)
@@ -1696,7 +1696,8 @@ the two left only narrow a type (a day or stop day moved to null is refused two 
   with the write's `at` the same clock reading the observation used (an earlier one would refuse a
   correct new day: fail closed, but needless; re-check, risk follow-up); the owner's /resume is
   `resumeHalt` (its day-state restart is built in).
-- 6c-2b-2 (review R): a withdrawal moves the day state only through a new repo-day.ts writer tied
+- Phase 8 (review R; moved from 6c-2b-2, s.15.18 M1: until then no code moves a ledger account
+  after the setup): a withdrawal moves the day state only through a new repo-day.ts writer tied
   to the transfer the ledger records in the same transaction, checked to be exactly
   `applyTransfer`'s move for that amount (deposits included); `writeDayState` keeps refusing any
   fall of the peak or the same day's baseline. That writer leaves a baseline reset (0) only as
@@ -1716,3 +1717,1146 @@ the two left only narrow a type (a day or stop day moved to null is refused two 
   migration.
 - Open for 6c-2b-2: the book and orders (ledger accounts, positions, intents, decisions,
   approvals, orders), with the conditions of s.12.1 and s.13.1 that name them.
+
+## 15. Step 6c-2b-2 design: the book and the money path
+
+Status: designed by the architect (2026-11-18), accepted by the main session with the changes of
+s.15.18 (transfers wait for Phase 8), and built in step 6c-2b-2, tests first. The reviewers read
+this design and the code together (review S). Nothing in migration 1 changes.
+
+Files read: fomo-bot/CLAUDE.md, docs/STATUS.md, this file (s.1, s.2, s.3.1-3.3, s.11-14.1),
+src/storage/{schema-v1,sqlite,codec,repo-util,repo-day,repo-config,repo-flags,repo-owner,repo-server,
+repo-audit,audit-chain}.ts, src/portfolio/ledger.ts, src/risk/{plan,approval,approve,daystate}.ts,
+src/risk/{recheck,sizing}.ts (types only), src/core/{ids,redact}.ts,
+tests/architecture/import-graph.test.ts (ALLOWED, PURE, RESTRICTED_FILES, writeProblems).
+
+### 15.0 In plain English
+
+- Two new files store the book and the money path:
+  - the book: each mode's SOL balance and its positions;
+  - the money path: what a strategy asked for, what risk decided, the one-time approval, and the
+    order.
+- A third, small file is the only code that can use an approval and create an order. Only the
+  token store may import it, and only risk's token check calls the token store. So no order can
+  exist without risk's check of the token, its slot and its expiry.
+- Storage computes the plan's fingerprint itself, from the exact text risk fingerprinted. It must
+  equal the fingerprint inside the token. The risk code does not change.
+- A deposit or a withdrawal moves the ledger and the day's equity numbers in one step. Storage
+  checks that the day-state move is exactly what the risk rules make.
+- Your setup command at the server writes the paper bankroll, once.
+
+### 15.1 Facts from the code
+
+risk/plan.ts:
+- `planHash(plan)` is the lower-case hex sha256 of `canonicalPlan(plan)` in UTF-8, and
+  `canonicalPlan(plan) = canonicalJson(validatePlan(plan))` (plan.ts:254-261).
+- `canonicalJson` (plan.ts:220-251) does the following:
+  - bigints become decimal strings;
+  - strings, booleans, null and finite numbers stay as they are;
+  - plain objects get their keys sorted with the default `sort()`;
+  - arrays, undefined, functions, symbols, non-finite numbers and class instances are refused
+    with a RiskError;
+  - the output is `JSON.stringify` with no spaces.
+- An OrderPlan has 26 fields (`PLAN_FIELDS`, sorted).
+  - One field is nested: `tip: { lamports, path }`.
+  - No field is a list.
+  - Ids are `isIdText` (1-128 characters of A-Za-z0-9_-).
+- `canonicalJson` also builds the token's MAC text (approval.ts:314-315).
+
+risk/approval.ts and risk/approve.ts:
+- The issuer puts `planHash(plan)` into the token (approval.ts:350), and verify checks it again
+  (approval.ts:410). The MAC covers it.
+- `token.maxSpendLamports = planMaxSpend(plan)`. For a buy, `approveBuy` also sets
+  `opening.maxSpend = planMaxSpend(checked.plan)` (approve.ts:610). The two are equal.
+- `RedeemSnapshot` carries intentId, positionId, mode, kind, reduceOnly, planHash,
+  maxSpendLamports, minOut, expiresAtSlot, slot and the frozen plan (approval.ts:79-93).
+- No `TradeIntent` type exists in src/, although s.3.1 names one. Risk's input is `BuyIntent`
+  (approve.ts:99): strategy, mode, mint, creator, sizeHint, positionId, intentId. The strategies'
+  own intent type comes in Phase 4. So storage defines its own row types (s.15.6).
+- No `exitIntentId` exists yet. It comes in 6d, in app/ (s.3.2).
+
+portfolio/ledger.ts:
+- `PositionStatus` is opening, open, exiting or closed. There is no 'stuck' (ledger.ts:45).
+- `deposit` and `withdraw` need a positive amount. `withdraw` refuses paper and needs the SOL
+  (ledger.ts:251-282).
+- `abandonOpening` (ledger.ts:456-474):
+  - it closes an opening position that holds no tokens and no rent;
+  - the cost basis goes to 0, `realized` drops by the basis and `basisReleased` rises by it;
+  - `closedAt` is `at`, which must be at or after `openedAt`;
+  - SOL does not change.
+- `checkConservation` is exported. Its identities do not use the settled-order list.
+
+risk/daystate.ts `applyTransfer(state, delta)` (daystate.ts:413-435):
+- It refuses a delta beyond +-(2^64-1), a withdrawal above `lastEquity`, and a result above
+  2^64-1.
+- `lastEquity` and `peak` move by delta, with 0 as the floor. A peak that reaches 0 becomes null.
+- A baseline above 0 moves the same way. A baseline of 0 stays 0.
+- No other field changes. A delta of 0 is accepted (the ledger refuses it).
+
+storage/:
+- A throw from a statement (`tx.run`, `tx.get`, `tx.all`) marks the whole transaction failed, and
+  the commit is refused (s.11). A throw from repository code that runs no statement does not.
+  Hence the rule: every check comes before a function's first write.
+- `idParam` runs the secret filter. Every id character is in the filter's key-like class, so an id
+  of 64 or more characters is always refused. Generated ids must be at most 63 characters (s.12).
+- `jsonParam` keeps an object's keys in their own order (`getOwnPropertyNames`). It does not sort
+  them.
+- `writeProblems` has no branch for the six tables yet (import-graph.test.ts:814-919). Today any
+  repository file could write them.
+- `PURE.core` is `[]`: core/ may import no Node built-in, node:crypto included.
+- Migration 1 has no transfers table. A transfer leaves no row of its own: the ledger account's
+  totals are its only record.
+
+UNVERIFIED (nothing was run for this design; each item has its test in s.15.14):
+- the size of the largest plan text (about 1,100 characters, counted by hand);
+- `JSON.parse` keeping the text's key order on Node 26.13.0, for these keys;
+- `peak IS ?` with a TEXT or NULL parameter through the wrapper (standard SQLite; not run here);
+- the chance that a random address holds a credential word (about 1e-8, my estimate; review S
+  counted about 1.7e-7, s.15.3).
+
+### 15.2 Files and who may import them
+
+| File | New or changed | Writes | Imported at runtime only by |
+|---|---|---|---|
+| `storage/plan-text.ts` | new | nothing (pure parsing plus sha256) | not restricted |
+| `storage/repo-book.ts` | new | positions | app/, storage/repo-orders.ts, repo-redeem.ts, repo-day.ts |
+| `storage/repo-orders.ts` | new | intents, risk_decisions, approvals (INSERT) | app/ |
+| `storage/repo-redeem.ts` | new | approvals (consume only), orders (INSERT) | `app/token-store.ts` only |
+| `storage/repo-day.ts` | not changed (s.15.18: the transfer writer waits for Phase 8) | | not restricted (unchanged) |
+| `storage/repo-server.ts` | changed | adds ledger_accounts (INSERT, the setup) | cli/ (unchanged) |
+
+Why repo-redeem.ts is its own file: if any file could call the consume, it could pass its own
+`slot` and use an expired token. That is K finding 3 again, through the database instead of the
+verifier. With one restricted importer, only the token store bound into the authority (s.4) can
+consume a token. The executor in execution/ (ALLOWED includes storage) cannot.
+
+### 15.3 The plan's text and hash (`storage/plan-text.ts`)
+
+Decision: no code moves into core/. The app passes risk's own canonical text, and storage hashes
+those exact bytes.
+
+```ts
+/** = risk/plan.ts PLAN_FIELDS (a test ties them): the keys of a plan's canonical text, sorted. */
+export const PLAN_FIELD_NAMES: readonly string[];
+export const ORDER_KINDS: readonly ['buy', 'sell', 'close-account'];  // = SCHEMA_V1_COPIES.orderKinds
+export type OrderKind = (typeof ORDER_KINDS)[number];
+
+/** One canonical plan text, checked, with the fields storage binds and the hash it computed. */
+export interface PlanRecord {
+  /** The exact text, in jsonParam's form: what orders.plan_json stores. */
+  readonly text: string;
+  /** sha256 of `text`, lower-case hex: computed here, never taken from a caller. */
+  readonly hash: string;
+  readonly orderId: string;
+  readonly intentId: string;
+  readonly positionId: string;
+  readonly mode: LedgerMode;
+  readonly kind: OrderKind;
+  readonly mint: string;
+  readonly inAmount: bigint;
+  readonly minOut: bigint;
+  readonly quoteSlot: bigint;
+}
+
+/** bad-param, never echoing the text, for anything but one plan's canonical text. */
+export function planRecordOf(planText: string): PlanRecord;
+```
+
+`planRecordOf`, step by step:
+1. `planText` is a string of at most 8,192 characters, and `JSON.parse` takes it.
+2. The value is a plain object whose own keys are exactly `PLAN_FIELD_NAMES`, in that order.
+   `tip` is an object with exactly the keys `lamports` and `path`, in that order. This is the
+   check that the text is sorted: `jsonParam` alone would accept an unsorted text.
+3. `jsonParam(parsed) === planText`. This proves the text is printable ASCII, has no spaces or
+   escapes, is at most 8 KiB, and passed the secret filter. So plan_json holds no signature, hash
+   or key (s.12.1).
+4. The bound fields are read once from `parsed` and typed:
+   - orderId, intentId, positionId and mint are ids (`isIdText`);
+   - mode is paper or live;
+   - kind is buy, sell or close-account (withdraw is refused: it has its own path);
+   - inAmount, minOut and quoteSlot are canonical u64 decimal text, parsed as codec.ts parses
+     cells; quoteSlot is also at most 2^63-1 (`slotParam`).
+5. `hash = createHash('sha256').update(planText, 'utf8').digest('hex')`. createHash is on the
+   architecture test's crypto allowlist.
+
+Storage does not re-validate the rest of the plan, and it does not need to. Both callers require
+`hash` to equal a hash that risk computed over a validated plan and sealed in a MAC'd token:
+- at T1, `token.planHash`;
+- at T2, the approvals row (written at T1 after that check) and the snapshot's `planHash`.
+An equal sha256 means the same text. So the text is `canonicalPlan` of the plan risk approved.
+
+Why the two hashes are equal: app/ may import risk at runtime, so it passes `canonicalPlan(plan)`.
+Storage hashes those bytes the same way `planHash` does. Tests tie the two together (s.15.14):
+- for random valid plans, `planRecordOf(canonicalPlan(p))` gives `text === canonicalPlan(p)` and
+  `hash === planHash(p)`;
+- `PLAN_FIELD_NAMES` deep-equals `PLAN_FIELDS`;
+- any non-canonical text of the same plan is refused: spaces, unsorted keys, unsorted tip keys,
+  a bigint written as a number, a missing or an extra key.
+
+The alternative I rejected: move `canonicalJson` to `core/canonical.ts`. Three reasons:
+- sha256 could not move with it: core/ may import no Node built-in, and allowing node:crypto
+  there would loosen an architecture rule;
+- it would change risk/plan.ts and the token MAC's code path for no safety gain: a drift between
+  two encoders already fails closed at the hash comparison;
+- storage would still need one snapshot of an untrusted object, and `canonicalJson` reads
+  properties directly, so getters run. Parsing one text gives that snapshot.
+
+`JSON.parse` keeps keys in their order in the text (ECMAScript: string keys in creation order,
+after integer-like keys). No plan key is integer-like. The round-trip property test pins this on
+Node 26.13.0.
+
+The largest plans pass (s.12.1). By my count the largest plan text is about 1,100 characters:
+- every generated id at 63 characters, and every address at 44;
+- every u64 field at 2^64-1, `attempts` at 2^53-1 and `cuLimit` at 2^32-1;
+- the longest list values (`close-account`, `protective`, `raydium-cpmm`, `jupiter-build`,
+  `helius-swqos`).
+None of the filter's patterns can match a canonical plan:
+- there are no lists and no whitespace;
+- no digit stands right before a colon;
+- there are no slashes;
+- every value is quoted or punctuated, so no run of key-like characters crosses a value.
+The test builds the largest buy, sell and close plans and asserts that `secretKinds` finds
+nothing.
+
+One exception, written down: a random address or id can contain a credential word
+(`apikey`, `secret`, `passwd`, `mnemonic`, `accesstoken`, case-insensitive). The chance is about
+1.7e-7 per 44-character address (review S's count: `secret` and `passwd` can be spelled in base58
+in either case; the design first guessed 1e-8). Such a mint is refused at T1, because T1 parses the
+plan text too, so it can never be held. Its exit can therefore never meet the filter through the
+mint, the token account or the wallet. A new exit pool can (a pump.fun graduation, or another
+venue): that exit is refused at T1 and alerts. Generated ids are another matter, so 6d's core/rng
+draws them until `secretKinds(id)` is empty. A filter refusal on the exit path alerts as a bug
+(s.12.1).
+
+### 15.4 `storage/repo-book.ts`
+
+```ts
+import type { Lamports } from '../core/units.ts';
+import type { Position } from '../portfolio/ledger.ts';
+import type { OpeningPosition } from '../risk/approve.ts';
+import type { LedgerMode } from './repo-day.ts';
+import type { Reader, Tx } from './sqlite.ts';
+
+export interface StoredAccount {
+  readonly mode: LedgerMode;
+  readonly sol: Lamports;
+  readonly totalDeposits: Lamports;
+  readonly totalWithdrawals: Lamports;
+  readonly updatedAt: number;
+}
+
+/** The Position of portfolio/ledger.ts (never 'stuck'), plus what only the book stores. */
+export interface StoredPosition extends Position {
+  readonly mode: LedgerMode;
+  /** The worst-case spend held back while the buy is in flight: set while opening. */
+  readonly maxSpend: Lamports | null;
+  readonly p95ExitCost: Lamports;
+  /** The sequence number the next exit intent takes. */
+  readonly exitSeq: number;
+  readonly updatedAt: number;
+}
+
+export interface StoredBook {
+  readonly account: StoredAccount;
+  /** Every position of the mode, closed ones included, by id. */
+  readonly positions: readonly StoredPosition[];
+}
+
+export function readAccount(r: Reader, m: LedgerMode): StoredAccount;
+export function readPosition(r: Reader, id: string): StoredPosition;
+export function readActivePositions(r: Reader): readonly StoredPosition[];
+export function readBook(r: Reader, m: LedgerMode): StoredBook;
+export function insertOpening(tx: Tx, opening: OpeningPosition, p95ExitCost: Lamports): void;
+export function advanceExitSeq(tx: Tx, positionId: string, seq: number, at: number): void;
+export function abandonOpening(tx: Tx, positionId: string, at: number): StoredPosition;
+```
+
+Every reader returns typed, checked, frozen rows (the pattern of repo-flags.ts and repo-day.ts).
+A cell is read through codec.ts, and a bad cell names its column, never its value.
+
+- `readAccount`: the account row is required (`row-missing`; contract 1, s.12.1). 6d uses it at
+  boot, for both modes, and in T1 step 3.
+- `readPosition`: `row-missing` for an unknown id; 'stuck' is refused (below).
+- `readActivePositions`: T1's snapshot (s.3.1 step 3), both modes (the cap and one-per-mint are
+  global).
+  - Its SELECT includes 'stuck': `WHERE status IN ('opening', 'open', 'exiting', 'stuck')`. So a
+    stuck row throws instead of being left out, which would count one active position too few.
+  - Order: by id.
+- `readBook`: the account and every position of the mode. 6d's boot rebuilds a ledger.ts `Ledger`
+  from it (with an empty settled-order set) and runs `checkConservation`. A failure refuses the
+  start. T3 uses it after every settlement.
+- `insertOpening`: T1 buy, after `approveBuy` approved. Each field of `opening` is read once.
+  - Checks, before any write:
+    - `idParam(id)`, `idParam(mint)`, the strategy and the mode from their lists, `msParam(openedAt)`;
+    - `maxSpend` from 1 to 70,000,000 (`SCHEMA_V1_COPIES.buyMaxSpendLamports`);
+    - `amountParam(p95ExitCost)`;
+    - the mode's account exists (`row-missing`): no position exists in a mode without its book;
+    - no position has this id yet (`row-count`).
+  - Write: `INSERT INTO positions (id, mint, strategy, mode, status, opened_at, max_spend,
+    p95_exit_cost, updated_at) VALUES (?, ?, ?, ?, 'opening', ?, ?, ?, ?)`. It must change 1 row.
+  - The database adds: one active position per mint, at most 4 active positions, born opening.
+    Each is a `constraint` error, which also marks the transaction failed.
+- `advanceExitSeq`: called only by `insertExitIntent` (s.15.6).
+  - Checks: `idParam`; seq a whole number from 0 to 999,999 (the column takes up to 1,000,000);
+    `msParam(at)`.
+  - Write: `UPDATE positions SET exit_seq = exit_seq + 1, updated_at = ? WHERE id = ? AND
+    exit_seq = ? AND status IN ('open', 'exiting')`. It must change 1 row (`row-count` otherwise:
+    a wrong seq, a position that cannot exit, or a missing one).
+  - Skipping a seq is harmless (the next intent id is new), so app/ may call it too.
+- `abandonOpening`: s.3.2's `abandonOpeningTx`. It returns the closed row, so the caller can
+  compare it with ledger.ts `abandonOpening` in its tests.
+  - Checks, before any write:
+    - `idParam`, `msParam(at)`;
+    - the position exists (`row-missing`) and is opening, holding no tokens and no rent locked
+      (`row-count`);
+    - `at >= openedAt` (`bad-param`). app/ passes `max(now, openedAt)`, the T3 rule of s.12.1 for a
+      clock that stepped back;
+    - the position's buy order (`SELECT status FROM orders WHERE position_id = ? AND kind =
+      'buy'`) is absent, failed or expired. An approved, submitted or landed buy is refused
+      (`row-count`): it may still land, or has landed.
+  - The new values: `cost_basis = '0'`, `realized = realized - cost_basis` (checked by
+    `signedParam`), `basis_released = basis_released + cost_basis` (checked by `amountParam`),
+    status 'closed', `closed_at = at`.
+  - Write, as a compare-and-set: `UPDATE positions SET status = 'closed', closed_at = ?,
+    cost_basis = '0', realized = ?, basis_released = ?, updated_at = ? WHERE id = ? AND
+    status = 'opening' AND cost_basis = ? AND realized = ? AND basis_released = ?`. It must change
+    1 row.
+  - Unchanged: the day's entry count (the entry still counts), and the ledger account
+    (abandoning moves no SOL). An unused token of the position cannot be consumed afterwards: the
+    trigger `approvals_consumed_while_active` refuses it.
+
+'Stuck' on read: `positionOf(row)` reads the status from all five values. A 'stuck' row throws
+`StorageError('bad-cell', "a stuck position is not supported until portfolio/ledger.ts has
+'stuck'")`. It is never mapped to another status. No writer here can write 'stuck' (write rule,
+s.15.11), so only tampering or a newer program can make one. The effects:
+- T1 refuses every entry (fail closed);
+- that one position cannot exit;
+- the exits of other positions still work, because the exit path reads one position by id;
+- boot refuses to start (`readBook`).
+The exit loop (later) must read its list of positions one by one, so that one bad row blocks only
+itself (s.15.15).
+
+### 15.5 How the rows map to the pure types
+
+positions to `StoredPosition` (Position of ledger.ts):
+
+| Column | Field | Reader |
+|---|---|---|
+| id, mint | id, mint | `idCell` |
+| strategy | strategy (StrategyId) | `cellOneOf(STRATEGY_IDS)` |
+| mode | mode (extra) | `cellOneOf` paper, live |
+| status | status (PositionStatus) | the 'stuck' rule above |
+| opened_at, closed_at | openedAt, closedAt | `msCell`, `msCellOrNull`; closed exactly when closed_at is set (CHECK; re-checked) |
+| max_spend | maxSpend (extra) | `lamportsCellOrNull`; must be set while opening (CHECK; re-checked) |
+| p95_exit_cost | p95ExitCost (extra) | `lamportsCell` |
+| exit_seq | exitSeq (extra) | `intCell(0, 1_000_000)` |
+| token_units, tokens_bought, tokens_sold | tokenUnits, tokensBought, tokensSold | `tokenUnitsCell` |
+| realized | realized (SignedLamports) | `signedCell` |
+| cost_basis, rent_locked, bought, sold, venue_fees, network_fees, failed_fees, tips, rent_paid, rent_refunded, exit_fees, basis_released | the same names in camelCase (Lamports) | `lamportsCell` |
+| updated_at | updatedAt (extra) | `msCell` |
+
+The ledger's own identities (cost basis against the cost lines, and so on) are not re-checked in
+the reader. `checkConservation` does that in app/, on `readBook`, at boot.
+
+ledger_accounts to `StoredAccount`: `sol`, `total_deposits` and `total_withdrawals` map to `sol`,
+`totalDeposits` and `totalWithdrawals` (Lamports), `updated_at` to `updatedAt`. Together with the
+positions they make the ledger.ts `Ledger` (with `settledOrders` empty until T3, and `updatedAt`
+as the newest time).
+
+T1's `ActivePosition` (approve.ts), built in app/snapshot.ts from `StoredPosition`:
+- opening: `{ id, mint, strategy, p95ExitCost, status: 'opening', maxSpend }` (maxSpend must not
+  be null, else a bug);
+- open or exiting: the same, with `value: marks.value(id, tokenUnits, now)`. A null mark makes the
+  equity unknown, and the entry is blocked.
+
+intents, decisions, approvals and orders have no pure row type. Their sources are BuyIntent, the
+exit request, BuyDecision or ExitDecision, ApprovalToken and RedeemSnapshot (s.15.6 and s.15.7).
+
+### 15.6 `storage/repo-orders.ts`
+
+```ts
+import type { StrategyId } from '../core/ids.ts';
+import type { Lamports, TokenUnits } from '../core/units.ts';
+import type { ApprovalToken } from '../risk/approval.ts';
+import type { PlanUrgency } from '../risk/plan.ts';
+import type { SizeLimit, SizingCap } from '../risk/sizing.ts';
+import type { OrderKind } from './plan-text.ts';
+import type { LedgerMode } from './repo-day.ts';
+
+/** A flat record of named features: whole numbers, amounts, flags and codes. No lists, objects or addresses. */
+export type IntentValue = number | bigint | boolean | string | null;
+export type IntentInputs = Readonly<Record<string, IntentValue>>;
+
+export interface NewEntryIntent {
+  readonly id: string;                 // 6d: the entry hash (strategy, mint, side, window), at most 63 characters
+  readonly mode: LedgerMode;
+  readonly strategy: StrategyId;
+  readonly mint: string;
+  readonly positionId: string;         // the position this entry would open: new
+  readonly sizeHint: 'min' | 'normal';
+  readonly confidenceBps: number | null;
+  readonly createdAt: number;
+  readonly inputsAsOf: number | null;
+  readonly reasons: readonly string[]; // 1-16 codes
+  readonly inputs: IntentInputs;
+}
+
+export interface NewExitIntent {
+  readonly id: string;                 // 6d: exitIntentId(positionId, exitSeq), at most 63 characters
+  readonly positionId: string;
+  readonly exitSeq: number;            // must be the position's stored exitSeq
+  readonly fractionBps: number;
+  readonly urgency: PlanUrgency;
+  readonly createdAt: number;
+  readonly inputsAsOf: number | null;
+  readonly reasons: readonly string[]; // 1-16 codes; s.3.2's `reason`
+  readonly inputs: IntentInputs;
+}
+// the exit's mode and mint are read from its position, never taken from the caller
+
+export type RefusalStage = 'blocked' | 'sizing' | 'plan' | 'error';
+interface DecisionBase {
+  readonly intentId: string;
+  readonly at: number;
+  readonly configVersion: number;      // must be the active (newest) version
+}
+export type NewDecision =
+  | (DecisionBase & { readonly outcome: 'entry-approved'; readonly slot: bigint;
+      readonly size: Lamports; readonly limitedBy: SizeLimit; readonly binding: SizingCap })
+  | (DecisionBase & { readonly outcome: 'exit-approved'; readonly slot: bigint })
+  | (DecisionBase & { readonly outcome: 'refused'; readonly stage: RefusalStage;
+      readonly reasons: readonly string[];  // 1-64 codes
+      readonly slot: bigint | null });      // null only for stage 'error' (the slot was unknown)
+
+export const ORDER_STATUSES: readonly ['approved', 'submitted', 'landed', 'failed', 'expired'];
+export type OrderStatus = (typeof ORDER_STATUSES)[number];
+export interface StoredOrder {
+  readonly id: string; readonly intentId: string; readonly tokenId: string; readonly positionId: string;
+  readonly mode: LedgerMode; readonly kind: OrderKind; readonly status: OrderStatus;
+  readonly planHash: string; readonly inAmount: bigint; readonly minOut: bigint;
+  readonly maxSpend: Lamports; readonly quoteSlot: bigint;
+  readonly createdAt: number; readonly updatedAt: number;
+}
+export interface ExitsInFlight {
+  readonly count: number;              // sells and closes, approved or submitted
+  readonly sellTokens: TokenUnits;     // the sum of those sells' in_amount
+}
+
+export function intentExists(r: Reader, id: string): boolean;
+export function insertEntryIntent(tx: Tx, intent: NewEntryIntent): void;
+export function insertExitIntent(tx: Tx, intent: NewExitIntent): void;
+export function insertDecision(tx: Tx, decision: NewDecision): void;
+export function insertApproval(tx: Tx, token: ApprovalToken, planText: string, at: number): void;
+export function exitsInFlight(r: Reader, positionId: string): ExitsInFlight;
+export function buyOrderOf(r: Reader, positionId: string): StoredOrder | null;
+```
+
+`SIZE_LIMITS` and `SIZING_CAPS` are copies in this file, typed `as const satisfies readonly
+SizeLimit[]`, with a compile-time check that no member of the union is missing (`Exclude<SizeLimit,
+(typeof SIZE_LIMITS)[number]>` must be `never`). The lists exist in sizing.ts only as types.
+
+- `intentExists`: T1 step 2's duplicate check. A duplicate writes nothing (s.3.1). The stage
+  'duplicate' is therefore never written, and `insertDecision` refuses it.
+- `insertEntryIntent`:
+  - Checks, before any write:
+    - `idParam` for id, mint and positionId; mode, strategy and sizeHint from their lists;
+      `confidenceBps` null or a whole number from 0 to 10,000; `msParam` for both times;
+    - `reasons_json = jsonParam({ reasons })` and `inputs_json = jsonParam(inputs)`, after the
+      shape checks of s.15.8;
+    - no position has the id `positionId` yet (`row-count`): an entry's position is new.
+  - Write: `INSERT INTO intents (...) VALUES (...)` with kind 'entry' and the exit columns NULL.
+    It must change 1 row. A second insert with the same id is a primary-key `constraint` error.
+- `insertExitIntent`:
+  - Checks, before any write:
+    - `idParam` for id and positionId; exitSeq from 0 to 999,999; fractionBps from 1 to 10,000;
+      urgency from `SCHEMA_V1_COPIES.urgencies`; the two times; the JSON as above;
+    - `p = repoBook.readPosition(tx, positionId)` (`row-missing`; stuck is `bad-cell`);
+    - `p.status` is open or exiting (`row-count`);
+    - `exitSeq === p.exitSeq` (`row-count`): an exit intent takes the position's next number.
+  - Writes:
+    - INSERT the intent with kind 'exit', `mode = p.mode` and `mint = p.mint`, strategy, size and
+      confidence NULL (1 row);
+    - then `repoBook.advanceExitSeq(tx, positionId, exitSeq, createdAt)` (1 row).
+  - So every exit intent, approved or refused, uses up its number. The next attempt gets a new id,
+    and `intents_one_per_exit_seq` is the backstop.
+- `insertDecision`:
+  - Checks, before any write:
+    - `idParam(intentId)`, `msParam(at)`;
+    - the intent exists (`row-missing`), and its kind fits the outcome: 'entry-approved' and the
+      stages 'blocked' and 'sizing' only for an entry, 'exit-approved' only for an exit, 'plan'
+      and 'error' for both (`bad-param`);
+    - for an approved entry: size from 1 to 2^64-1, limitedBy and binding from their lists;
+    - a refusal: 1-64 reasons, unique codes. An approval gets `{"reasons":[]}`;
+    - slot through `slotParam`. Null only with stage 'error', and it is stored as 0 (the column is
+      NOT NULL; s.15.13);
+    - `configVersion` is the newest config version (`row-missing` if there is none, `bad-param`
+      otherwise).
+  - Write: INSERT, 1 row. The primary key allows one decision per intent.
+  - `size`, `limited_by` and `binding` are set for an approved entry and NULL otherwise. `stage`
+    is NULL exactly when approved (CHECK).
+- `insertApproval`: T1, after the decision and, for a buy, after the position. The token's
+  fields are read once into locals. `mac` is never read and never stored.
+  - Checks, before any write:
+    - each field typed: `idParam` for id, intentId and positionId; mode; kind (withdraw refused);
+      reduceOnly a boolean; maxSpend and minOut through `amountParam`; expiresAtSlot through
+      `slotParam`; `msParam(at)`;
+    - `rec = planRecordOf(planText)`;
+    - `rec.hash === token.planHash` (`bad-param`: "the plan text is not the plan the token was
+      issued for");
+    - `rec.intentId`, `rec.positionId`, `rec.mode`, `rec.kind` and `rec.minOut` equal the
+      token's;
+    - `reduceOnly === (kind !== 'buy')`;
+    - `rec.quoteSlot <= expiresAtSlot <= rec.quoteSlot + 25` (`SCHEMA_V1_COPIES.planFreshSlots`);
+    - the decision for intentId exists and is approved (`row-missing` / `bad-param`);
+    - `p = repoBook.readPosition(tx, positionId)`, in the token's mode. A buy needs
+      `p.status === 'opening'` and `p.maxSpend === token.maxSpendLamports` (`bad-param`). A sell
+      or close needs open or exiting.
+  - Write: INSERT approvals, 1 row:
+    - `plan_hash = rec.hash` (computed here) and `quote_slot = rec.quoteSlot`;
+    - `max_spend`, `min_out` and `expires_at_slot` from the token, and `issued_at = at`;
+    - consumed NULL.
+  - The trigger `approvals_for_approved_intent` checks the intent, decision and position on top.
+- `exitsInFlight`: T1 exit (s.3.2 step 3).
+  - It reads `SELECT kind, in_amount FROM orders WHERE position_id = ? AND kind IN ('sell',
+    'close-account') AND status IN ('approved', 'submitted')`.
+  - It counts them, and sums the sells' `in_amount` as TokenUnits. An overflow is `bad-cell`.
+- `buyOrderOf`: the one buy order of a position, or null (the unique index allows at most one).
+  `abandonOpeningTx` and the boot use it ("an opening position with no order at boot").
+
+### 15.7 `storage/repo-redeem.ts` (T2)
+
+```ts
+import type { RedeemSnapshot } from '../risk/approval.ts';
+
+/**
+ * T2 inside the bound token store: true when the token was consumed now and its order recorded;
+ * false, with nothing written, when it was already consumed. Anything else throws.
+ */
+export function redeemApproval(tx: Tx, tokenId: string, snapshot: RedeemSnapshot, planText: string, at: number): boolean;
+```
+
+Steps (every check before the first write):
+1. `idParam(tokenId)` and `msParam(at)`. The snapshot's fields are read once into locals;
+   `slotParam(slot)`.
+2. The approvals row for tokenId. A missing row is `row-missing`: the store throws, and redeem
+   answers `store-error`.
+3. Already consumed: return false, nothing written. Redeem answers `already-consumed`.
+4. `rec = planRecordOf(planText)`.
+5. These must agree (`bad-param`, a fixed sentence for each):
+   - `rec.hash`, `row.plan_hash` and `snapshot.planHash`;
+   - the intent, position, mode and kind of the text, the row and the snapshot;
+   - `reduceOnly` and `row.reduce_only`;
+   - `maxSpendLamports` and `row.max_spend`;
+   - minOut in all three;
+   - `expiresAtSlot` and `row.expires_at_slot`;
+   - `rec.quoteSlot` and `row.quote_slot`.
+6. `row.quote_slot <= slot <= row.expires_at_slot`. `at >= row.issued_at` (a clock behind the
+   issue time refuses: a retry gets a new token, s.12).
+7. The position is in the row's mode and can take the order: a buy while opening, an exit while
+   open or exiting (`row-count`).
+8. A buy needs `rec.inAmount <= row.max_spend`.
+9. Writes:
+   - `UPDATE approvals SET consumed_at = ?, consumed_slot = ? WHERE token_id = ? AND consumed_at
+     IS NULL`, 1 row;
+   - `INSERT INTO orders` with id `rec.orderId`, status 'approved', `plan_hash = rec.hash`,
+     `plan_json = rec.text`, `in_amount`, `min_out` and `quote_slot` from rec, `max_spend` from
+     the row, and `created_at = updated_at = at`. 1 row.
+   - Return true.
+
+The database adds on top:
+- `orders_need_consumed_token`, one buy per position ever, one exit in flight per position;
+- UNIQUE on the order's intent and token;
+- the range of `consumed_slot`, `consumed_at >= issued_at`, and a consume only while the position
+  can take the order.
+
+So the order row comes from the verifier's validated snapshot and risk's text, never from the
+executor's objects (s.3.3). The app side (6d `app/token-store.ts`):
+`consume(id, s) = db.transaction((tx) => redeemApproval(tx, id, s, canonicalPlan(s.plan), clock.now()))`.
+
+### 15.8 The JSON columns
+
+Every `*_json` column is bound only through `jsonParam`, and the top level is always an object
+(s.12.1).
+
+| Column | Content | Shape rules (checked before `jsonParam`) |
+|---|---|---|
+| intents.reasons_json | `{"reasons":[...]}`: the strategy's reason codes; an exit's one reason code | 1-16 entries, each `codeParam` (a code, filtered), unique |
+| intents.inputs_json | the flat inputs record, e.g. `{"netFlowLamports":"123","windowMs":60000}` | at most 32 keys, each `^[a-z][A-Za-z0-9]{0,31}$`. Values: a safe whole number, a bigint (written as decimal text), a boolean, null, or a code (`codeParam`). No lists, no nested objects, no ids or addresses, no fractions |
+| risk_decisions.reasons_json | `{"reasons":[...]}`: block names, `sizing:<x>`, `plan:<x>`, the error code; `[]` when approved | 0 (approved) or 1-64 entries, each `codeParam`, unique |
+| orders.plan_json | the canonical plan text | `planRecordOf` (s.15.3) |
+
+How each condition of s.12.1 is met:
+- Objects only: a reasons list is always wrapped in `{"reasons": ...}`, and the inputs record is
+  an object.
+- No `e.message`: reasons are codes (`isCodeText`: no spaces), so a message cannot pass. 6d's
+  `recordRefusalTx` writes a fixed code.
+- No signatures, hashes or keys: values are codes or numbers. The filter refuses runs of 64 or more
+  key-like characters (a base58 signature is 87-88; a sha256 in hex is 64), and ids are not allowed
+  as values at all.
+- No raw lists of 32 or more small numbers: inputs hold no lists, and a reasons list holds codes.
+  An intent's list is at most 16 long. A decision's list of 32 or more all-digit codes would be
+  refused by the filter, which fails closed; risk's codes are words.
+- The largest plans pass `jsonParam`: s.15.3 and its test. The largest intent (32 keys at 32
+  characters, each value a 64-character code) and the largest decision (64 codes of 64 characters)
+  are tested against the 8 KiB bound. Anything larger is refused before any write.
+
+FOMO users' wallets (decision D1) are kept out by construction: inputs cannot hold an address, and
+an intent's mint has its own column. The creator address of `BuyIntent` is not stored with the
+intent (owner question 2, s.15.16).
+
+For 6d: `recordRefusalTx` writes the intent with `inputs: {}` and `reasons: [code]`. Otherwise,
+when the strategy's own inputs were what the filter refused, the refusal could never be recorded,
+and only the latch and the alert would remain.
+
+### 15.9 Transfers and the ledger setup (s.14.1)
+
+Not built as written here (s.15.18, M1): the transfer writer below waits for Phase 8 and
+migration 2's transfers table, and the setup writes both accounts directly, the day state
+untouched. The design is kept as the plan for Phase 8.
+
+The writer lives in `storage/repo-day.ts`, as s.14.1 asks, and it ties both rows in one call:
+
+```ts
+import type { SignedLamports } from '../core/units.ts';
+
+/**
+ * risk/daystate.ts applyTransfer, mirrored (a property test ties them): the day state after one
+ * confirmed transfer. Also refuses a delta of 0 (the ledger needs a positive amount). bad-param.
+ */
+export function transferMove(before: EquityState, delta: bigint): EquityState;
+
+/**
+ * A confirmed deposit (delta > 0) or withdrawal (delta < 0): the ledger account and the day state
+ * move together, in one call. `expected` is risk/daystate.ts applyTransfer(stored state, delta) as
+ * the caller computed it: storage moves the stored state itself and requires the two to be equal.
+ */
+export function recordTransfer(tx: Tx, m: LedgerMode, delta: SignedLamports, at: number, expected: EquityState): void;
+```
+
+`transferMove` copies `applyTransfer` exactly (s.15.1). It moves only `dayStart`, `lastEquity` and
+`peak`, and a reset baseline (0) stays reset (re-check, risk note 2).
+
+`recordTransfer`, step by step:
+1. Typed arguments: the mode, `signedParam(delta)`, `msParam(at)`.
+2. `acct = repoBook.readAccount(tx, m)` (`row-missing`).
+3. The ledger's rules (ledger.ts `deposit` and `withdraw`):
+   - the delta is not 0;
+   - paper: only one deposit ever, onto an account at 0 SOL and 0 in both totals (the setup's).
+     Every other paper transfer is refused (`row-count`): a paper withdrawal (ledger.ts refuses
+     those too), or a second paper deposit, which would make paper money from nothing;
+   - a withdrawal needs `-delta <= acct.sol`;
+   - no result above 2^64-1.
+4. `before = readDayState(tx, m)` and `moved = transferMove(before, delta)`. Then
+   `sameState(moved, expected)` over all ten fields, the nested pairs included, else `bad-param`:
+   "the day state after a transfer is exactly risk/daystate.ts applyTransfer's move".
+5. Writes, each a compare-and-set that must change 1 row:
+   - `UPDATE ledger_accounts SET sol = ?, total_deposits = ?, total_withdrawals = ?, updated_at = ?
+     WHERE mode = ? AND sol = ? AND total_deposits = ? AND total_withdrawals = ?`. A deposit adds
+     to `total_deposits`, and a withdrawal adds `-delta` to `total_withdrawals`;
+   - `UPDATE day_state SET day_start = ?, last_equity = ?, peak = ?, updated_at = ? WHERE mode = ?
+     AND day_start = ? AND last_equity = ? AND peak IS ?`.
+
+How it checks the move without importing risk: the mirror plus the caller's `expected`. The caller
+(6e `applyTransferTx`, and cli for the setup) runs risk's own `applyTransfer`. Storage runs its
+copy. Both must agree at run time, and a property test makes them agree on every state and delta,
+refusals included.
+
+What stays the same:
+- `writeDayState` keeps refusing any fall of the peak or of the same day's baseline.
+- Deposits go through `recordTransfer` too, so the comment on `writeDayState` loses "or one
+  deposit", and 6e never writes a deposit through `writeDayState`.
+- 6d tests that the next accepted observation sets a reset baseline again (s.14.1); this writer
+  alone cannot force it.
+
+Why a fake withdrawal by a bug is caught: it lowers the ledger's SOL together with the peak and
+the baseline. The chain does not move. Live SOL is `min(ledger, chain)`, and the reconciliation
+of ledger against chain finds the difference and halts. A paper withdrawal is refused outright.
+
+The ledger setup, in `storage/repo-server.ts` (cli/ only), with a new action
+`'server:setup-ledger'` in `SERVER_AUDIT_ACTIONS`:
+
+```ts
+/**
+ * The owner's one-time setup writes both ledger accounts (s.12.1: never a default, never a
+ * migration): paper with its starting bankroll as its one deposit, live at zero. `paperAfter` is
+ * risk/daystate.ts applyTransfer(emptyEquityState(), paperStart), computed by cli/.
+ */
+export function setUpLedger(tx: Tx, at: number, paperStart: Lamports, paperAfter: EquityState): void;
+```
+
+Checks, before any write:
+- `msParam(at)`; `paperStart` at least 1 (`amountParam`);
+- no ledger account exists yet (`row-count`: "the ledger is set up already");
+- the stored paper day state is the migration's empty state, every field (`row-count`: setup
+  only on a fresh database);
+- `sameState(transferMove(empty, paperStart), paperAfter)` (`bad-param`).
+
+Writes:
+- `appendServerAudit(tx, at, 'server:setup-ledger', { paper: paperStart })`;
+- INSERT the paper account at 0, 0, 0 and the live account at 0, 0, 0 (1 row each);
+- `recordTransfer(tx, 'paper', paperStart, at, paperAfter)`, which repeats its checks and passes.
+
+The one-time setup command runs `setUpConfig` and `setUpLedger` in one transaction.
+
+### 15.10 How 6d calls them
+
+T1 buy. Every write comes after `approveBuy`, and the approval is written last:
+
+```mermaid
+sequenceDiagram
+  participant App as app/approve-tx (one transaction)
+  participant O as repo-orders
+  participant B as repo-book
+  participant F as repo-flags
+  participant P as plan-text
+  participant DB as SQLite
+  App->>O: intentExists(id)? (yes: duplicate, nothing written)
+  App->>O: insertEntryIntent
+  App->>B: readActivePositions, readAccount(mode)
+  Note over App: risk approveBuy (pure), canonicalPlan(decision.plan)
+  alt approved
+    App->>B: insertOpening(decision.opening, p95)
+    App->>F: countEntry(day), must equal decision.entriesToday
+    App->>O: insertDecision(entry-approved)
+    App->>O: insertApproval(token, planText, now)
+    O->>P: planRecordOf(planText): hash = token.planHash?
+    O->>DB: INSERT approvals (trigger: approved decision, same intent, position and mode)
+  else refused
+    App->>O: insertDecision(refused, stage, reasons)
+  end
+  Note over App,DB: any throw: ROLLBACK, nothing written; then recordRefusalTx
+```
+
+T1 exit: `readPosition`, then `exitsInFlight`, then `approveExit`, then `insertExitIntent` (which
+uses up the number), then `insertDecision`, then `insertApproval` if approved. All of it is one
+transaction.
+
+T2:
+
+```mermaid
+sequenceDiagram
+  participant V as risk verifier (redeem)
+  participant S as app/token-store consume
+  participant R as repo-redeem
+  participant DB as SQLite
+  V->>S: consume(tokenId, snapshot)
+  S->>S: planText = canonicalPlan(snapshot.plan)
+  S->>DB: BEGIN IMMEDIATE
+  S->>R: redeemApproval(tx, tokenId, snapshot, planText, now)
+  R->>DB: read approval row, position
+  alt already consumed
+    R-->>S: false (nothing written)
+  else every field agrees
+    R->>DB: UPDATE approvals (consume, 1 row)
+    R->>DB: INSERT orders (trigger: consumed, matching token)
+    R-->>S: true
+  end
+  S->>DB: COMMIT (a throw: ROLLBACK, redeem answers store-error)
+```
+
+### 15.11 Write rules and restricted files (the architecture test)
+
+New branches of `writeProblems`, by table:
+- `ledger_accounts`:
+  - INSERT only in repo-server.ts (the setup), and as built no UPDATE anywhere (s.15.18: the
+    transfer writer waits for Phase 8).
+  - Phase 8: UPDATE only in repo-day.ts (the transfer). Its SET is limited to sol, total_deposits,
+    total_withdrawals and updated_at, each set once, and its WHERE is exactly `mode = ? AND
+    sol = ? AND total_deposits = ? AND total_withdrawals = ?`.
+  - T3 (later) will let repo-book.ts set `sol` and `updated_at` only. The totals change only with
+    a transfer.
+  - No DELETE (the trigger refuses it too).
+- `positions`:
+  - INSERT and UPDATE only in repo-book.ts.
+  - A written `status` only as the literal `'closed'` (in 6c-2b-2). T3 adds `'open'` and
+    `'exiting'`. Never `'stuck'`, never `'opening'`, never a parameter.
+  - `exit_seq` only as `exit_seq + 1`.
+  - Never id, mint, strategy, mode or opened_at (a trigger too), and in 6c-2b-2 never max_spend or
+    p95_exit_cost.
+  - Each column set once, and no `(a, b) = (...)`.
+  - No DELETE.
+- `intents` and `risk_decisions`: INSERT only, only in repo-orders.ts.
+- `approvals`:
+  - INSERT only in repo-orders.ts.
+  - UPDATE only in repo-redeem.ts, setting exactly `consumed_at = ?` and `consumed_slot = ?`, with
+    WHERE exactly `token_id = ? AND consumed_at IS NULL`.
+- `orders`: INSERT only in repo-redeem.ts. No UPDATE in 6c-2b-2: the executor's status moves come
+  later, as a reviewed file and rule.
+- `day_state`: no change. repo-day.ts already writes it, and the transfer sets no `streak_halt`.
+
+New `RESTRICTED_FILES` entries:
+- `storage/repo-redeem.ts`: allows only `app/token-store.ts`.
+- `storage/repo-orders.ts`: allows `app/` files.
+- `storage/repo-book.ts`: allows `app/` files, `storage/repo-orders.ts`, `storage/repo-redeem.ts`
+  and `storage/repo-day.ts`.
+- Proposed, a reviewer call because it tightens 6c-2b-1: `storage/repo-day.ts` allows `app/`,
+  `cli/`, `storage/repo-owner.ts` and `storage/repo-server.ts`. Today execution/, research/, ops/
+  and config/ could call `recordTransfer`.
+
+Who may call what:
+
+| Function | The engine (app/) | Only the owner's or the server's files |
+|---|---|---|
+| repo-book: every function | yes | |
+| repo-orders: every function | yes | |
+| repo-redeem `redeemApproval` | only app/token-store.ts | |
+| repo-day `transferMove`, `recordTransfer` | yes (paper: refused after the setup; live: no caller until Phase 8) | |
+| repo-server `setUpLedger` | | cli/ only |
+
+Each new file's exports are pinned by a test, as for repo-day.ts, repo-flags.ts and
+repo-config.ts. repo-day.ts's pinned list gains `transferMove` and `recordTransfer`.
+
+Canaries, each caught for its own reason:
+- an INSERT into positions from repo-orders.ts;
+- in repo-book.ts, `status = 'stuck'`, `status = ?`, `status = 'opening'` and `exit_seq = ?`;
+- an UPDATE of positions that sets `mint`;
+- an INSERT into orders from repo-orders.ts;
+- `UPDATE orders SET status = ?` anywhere;
+- `UPDATE approvals SET consumed_at = NULL`, and a consume WHERE without `consumed_at IS NULL`;
+- an INSERT into ledger_accounts from repo-day.ts or repo-book.ts;
+- an UPDATE of `total_deposits` from repo-book.ts;
+- a ledger UPDATE without the compare-and-set WHERE;
+- an INSERT into intents from repo-book.ts;
+- a DELETE from positions or orders;
+- importing repo-redeem.ts from app/approve-tx.ts, and repo-orders.ts from execution/x.ts;
+- re-exporting `redeemApproval`, or passing it on as a value.
+
+### 15.12 Failure modes
+
+| What fails | Detected by | What the bot does |
+|---|---|---|
+| The plan text is not canonical, or its hash differs from the token's (T1) | `planRecordOf`, the hash comparison (`bad-param`) | T1 rolls back; `recordRefusalTx` stores `error`; an alert as a bug ("cannot fire if the parts agree") |
+| A plan's address or id contains a credential word | the secret filter in `planRecordOf` | T1: the entry is refused, so the mint is never held. T2 or an exit: a bug alert; core/rng ids are drawn to pass the filter |
+| A T2 snapshot disagrees with the row or the text | `redeemApproval` (`bad-param`) | the store throws, redeem answers `store-error`, no order; a bug alert |
+| The token was already used | consumed_at set | false: `already-consumed`, nothing written |
+| The token is unknown | `row-missing` | `store-error`, no order |
+| The slot is outside the token's range, or the clock is behind its issue | the checks of step 6, then the CHECKs | refused, and the token is not burned; a retry gets a new token through T1 |
+| The position was abandoned before the redeem | position check, then the trigger | `store-error`, no order |
+| A 'stuck' row | `bad-cell` on read | entries refused; that position cannot exit; other exits go on; boot refuses; alert (tampering or newer code) |
+| A cell is malformed, or a row changed between read and write | codec readers, compare-and-set count (`row-count`) | fail closed, alert (tampering) |
+| Abandon while the buy is approved, submitted or landed | the buy-order check (`row-count`) | refused: freeing the cap and the held SOL would let a second buy spend the same lamports |
+| An exit intent with the wrong sequence number | `row-count` | refused; T1 reads the number in the same transaction, so this is a bug |
+| exit_seq reaches 999,999 | `advanceExitSeq` | further exits of that position are refused. 6d alerts long before (proposal: at 10,000) |
+| The decision names an old config version | `bad-param` | T1 rolls back; a bug alert |
+| The strategy's inputs trip the filter | `jsonParam` | T1 rolls back; the refusal is recorded with `inputs: {}` (s.15.8) |
+| The transfer's expected state differs from the mirror | `bad-param` | rolled back; `day-state-error:<mode>` halt and alert (as s.14.1 says for `writeDayState`); never retried with an edited state |
+| A paper withdrawal, a second paper deposit, a withdrawal above SOL or above lastEquity | `row-count` / `bad-param` | refused; reconcile first |
+| A deposit booked twice (a replayed chain event) | not detectable: migration 1 has no transfers table | the code must deduplicate. Live only, Phase 8, with a migration (s.15.15) |
+| Setup run twice, or on a used database | `row-count` | refused, nothing written |
+| A careless caller catches a refusal and commits | every check is made before the function's first write; a later database refusal marks the transaction failed | nothing of that call is written. An `expectChanges` after an earlier write in the same function can fire only if the database changed inside one BEGIN IMMEDIATE, which cannot happen; 6d's no-try/catch rule covers the rest |
+
+### 15.13 What migration 1 cannot enforce, so the code must
+
+- risk_decisions:
+  - size, limited_by and binding are set exactly for an approved entry;
+  - 'duplicate' is never written;
+  - a slot of 0 means "unknown", only with 'error';
+  - config_version is the active one.
+- intents:
+  - an entry's position id is new;
+  - an exit's mint and mode are its position's;
+  - exit_seq is the position's current number (the unique index only stops reuse);
+  - the format of an intent id is not checked;
+  - `position_id` has no foreign key.
+- positions:
+  - the ledger identities (cost basis, realized, rent, tokens; `checkConservation`);
+  - an opening position holds no tokens;
+  - `closed_at >= opened_at`;
+  - exit_seq only moves up (the schema lets it move anywhere);
+  - abandoning only with no buy in flight.
+- ledger_accounts:
+  - SOL against deposits, withdrawals and the cash flows;
+  - the totals only grow (the schema lets them fall);
+  - a paper account never withdraws, and deposits once;
+  - every transfer moves the day state exactly as `applyTransfer` does;
+  - one booking per real transfer (no transfers table).
+- approvals:
+  - plan_hash is the hash of the approved plan (SQLite has no sha256);
+  - max_spend is `planMaxSpend` (risk's), and for a buy the position's max_spend;
+  - quote_slot is the plan's;
+  - the plan trades its position's mint (review S): neither table has a mint column, and the
+    trigger ties only the intent's mint to the position, so `insertApproval` and `redeemApproval`
+    compare the text's mint with the position's.
+- orders:
+  - plan_json hashes to plan_hash;
+  - id, in_amount, min_out and quote_slot equal plan_json's fields.
+
+### 15.14 Tests to write first
+
+Unit tests, on `':memory:'` with migration 1 (each refusal is tried alone; "nothing written" means
+a logical dump before and after is equal, also when a careless caller catches the refusal inside
+the transaction and commits):
+- plan-text:
+  - the largest buy, sell and close plans pass, at about 1,100 characters, and `secretKinds` finds
+    nothing;
+  - refused: spaces; unsorted keys; unsorted tip keys; a bigint as a number; a missing, extra or
+    renamed key; withdraw; 8,193 characters; an id of 64 characters; an id that contains
+    `secret`;
+  - `hash` is the sha256 of exactly `text`.
+- repo-book:
+  - a missing account (`row-missing`); every column with a bad cell (each names its column);
+  - 'stuck' through `readPosition`, `readActivePositions` and `readBook`, each refused with the
+    fixed sentence, while another position's exit still works;
+  - closed rows are left out of the active list;
+  - `insertOpening` at its boundaries: max_spend 0, 1, 70,000,000 and 70,000,001; ids of 63 and 64
+    characters; a mode without its account; an id that already exists; a second active position on
+    a mint, and a fifth active position (`constraint`, nothing written);
+  - `advanceExitSeq`: the wrong seq; 999,999 and 1,000,000; opening and closed positions;
+  - `abandonOpening`: with no order and with each order status (approved, submitted and landed
+    refused; failed and expired allowed); `at` before `openedAt`; a position that is not opening.
+    The closed row equals ledger.ts `abandonOpening`. A token of the abandoned position can no
+    longer be consumed.
+  - `readBook` on a written book passes `checkConservation`.
+- repo-orders:
+  - each optional intent column in its own case;
+  - inputs: a nested object, a list, a fraction, an id value, 33 keys, a bad key, a value that
+    looks like a key: each refused. The largest intent and the largest decision pass;
+  - exit intent: the seq is used up once on approval and once on refusal; mint and mode come from
+    the position; the wrong seq is refused;
+  - decision: each outcome against each intent kind; 'duplicate' refused; an old config version;
+    a null slot outside 'error'; empty, repeated or non-code reasons;
+  - approval: each token field against the text, one at a time; the hash; a buy's max_spend
+    against the position; a refused or missing decision; withdraw;
+  - after a full scenario, the token's MAC appears in no cell.
+- repo-redeem:
+  - a missing token; an already-consumed token gives false with nothing written;
+  - each snapshot field mismatch, one at a time;
+  - the slot one below and one above its range; a clock behind the issue time; an abandoned
+    position;
+  - the order row equals the text's fields; a second call gives false.
+- transfer and setup:
+  - every ledger rule (paper withdrawal, second paper deposit, a withdrawal above SOL, an
+    overflow, delta 0);
+  - each of the ten state fields wrong in `expected`, one at a time;
+  - a compare-and-set that a change behind the bot's back makes fail;
+  - after a withdrawal, `writeDayState` still refuses a fall of the peak;
+  - setup twice; setup on a used paper day state; the setup's audit row comes first and is
+    `server:setup-ledger`.
+
+Property tests (1,000 cases each, with their boundary values on every run):
+- `planRecordOf(canonicalPlan(p))` gives back `canonicalPlan(p)` and `planHash(p)`, for random
+  valid plans (the arbitrary of the plan tests);
+- `transferMove` equals `applyTransfer` on random states and deltas, both signs. The cases include
+  a reset baseline, a null peak, a held jump, `-delta == lastEquity`, and the u64 edges. Storage
+  refuses exactly when risk throws, plus delta 0;
+- random T1 and T2 sequences on SQLite: every order has exactly one approved decision and a
+  consumed, matching token (invariant 1), and a written book always passes `checkConservation`.
+
+Pins: `PLAN_FIELD_NAMES` against `PLAN_FIELDS`; `SIZE_LIMITS` and `SIZING_CAPS` are exhaustive at
+compile time; the new files' export lists.
+
+Fault injection: for `insertExitIntent`, `redeemApproval`, `recordTransfer` and `setUpLedger`, a
+throw at each write k, for every k. Each time the dump is unchanged.
+
+Architecture: the write rules and restricted files of s.15.11, with every canary.
+
+Planted bugs worth planting (each must be caught by a test):
+- plan-text: drop the key-order check; drop the `jsonParam` equality; hash a re-encoded text.
+- approvals: drop the hash comparison; drop the buy's max_spend comparison; accept withdraw in
+  code (the database's kind list stays as the second line, so the test asserts `bad-param`, not
+  `constraint`).
+- T2: return true when already consumed; write before the checks; take `in_amount` from
+  `snapshot.plan` instead of the text; drop the upper slot bound in code (the test asserts the
+  code's error, not the CHECK's).
+- reads: read 'stuck' as 'open'; leave 'stuck' out of the active SELECT; leave opening positions
+  out; take closed ones in.
+- positions: drop the account check in `insertOpening`; drop the seq from `advanceExitSeq`'s WHERE.
+- exit intents: take the mint from the caller; skip the bump.
+- abandon: allow an approved buy; allow a submitted one; allow a landed one; accept `at` before
+  `openedAt`; leave `realized` unchanged.
+- transfers:
+  - in `transferMove`: move a baseline of 0 (the review R bug); keep a peak of 0 instead of null;
+    allow a withdrawal above `lastEquity`;
+  - in `recordTransfer`: update the wrong total; allow a paper withdrawal; allow a second paper
+    deposit; skip one field (the peak) in the expected-state comparison; drop the compare-and-set
+    WHERE; let the transfer UPDATE also write the jump fields.
+- decisions: allow a null slot outside 'error'; skip the active-version check; accept a size on an
+  approved exit; allow repeated reasons.
+- inputs: allow a nested object; allow a list; allow a fraction.
+- setup: accept a second run; skip the audit row; write the audit row after the inserts.
+- the architecture test: each new write rule removed, and each new restricted importer widened.
+
+### 15.15 Later, not in 6c-2b-2
+
+- T3 settlement (paper engine): `applyBuy`, `applySell` and `applyClose` moves in repo-book.ts.
+  The ledger's `sol` changes with each one, the statuses become open, exiting and closed, and
+  max_spend is cleared when the buy settles. A settlement record must be unique per order (s.12.1).
+  `readBook` then rebuilds `settledOrders`.
+- The executor's status moves (submitted, landed, failed, expired), in their own restricted file.
+  A landed exit that T3 has not booked yet must still count in `exitsInFlight`.
+- 'stuck': a reader and a writer once ledger.ts has it. The exit loop's list reader must keep one
+  bad row from blocking the others.
+- Readers for "explain any trade" (`readOrder` with its plan, `readDecision`): with Telegram.
+- Live transfers' callers (the reconciler's deposits, `/withdraw`), with migration 2:
+  - a transfers table with a unique chain signature;
+  - a live withdrawal record that requires the owner's `owner:withdraw` audit row first;
+  - an engine audit row for a deposit.
+- Phase 8: T1 reads the intent mode's own SOL and exposure.
+
+### 15.16 Open questions for the owner
+
+1. **The paper bankroll is fixed after setup.** The setup writes it once. Nothing can top it up
+   later, because a top-up would also make paper results look bigger than they are. A different
+   paper bankroll means a new database (or, later, a reviewed command). Recommended: yes, keep it
+   fixed.
+2. **What the bot records about why it wanted a trade.** Numbers and short labels only, never
+   another person's wallet address. So no FOMO user's wallet, and no token creator's address, can
+   end up in the database. Explanations will name the token and the numbers. (The orders hold the
+   bot's own public wallet, pool and token-account addresses: public, and needed to explain a
+   trade; review S.) Recommended: yes.
+
+### 15.17 Decisions the reviewers should challenge
+
+- No code moves into core/: the hash is taken over risk's own text, passed in by app/ (s.15.3).
+- T2 lives in its own file, restricted to app/token-store.ts (s.15.2).
+- `recordTransfer` accepts live deposits and withdrawals now (with no caller until Phase 8), and
+  paper's one setup deposit only. The stricter choice is to refuse live until Phase 8, at the cost
+  of untested ledger code for withdrawals.
+- A slot of 0 stands for "unknown" in an error decision, because the column is NOT NULL.
+- Intent inputs hold no fractions and no addresses (strategies scale their features to whole
+  numbers).
+- repo-day.ts becomes a restricted file (a tightening of 6c-2b-1).
+- The setup also moves the paper day state through the transfer, although the first observation
+  replaces `lastEquity` anyway. I chose it so that no exception to the transfer rule exists.
+- Abandon books at the caller's `at`, which must be at or after `openedAt` (app passes
+  `max(now, openedAt)`).
+
+### 15.18 As built in step 6c-2b-2, and what changed from the design
+
+The main session's decisions on s.15.17 (the reviewers challenge these too):
+- M1, stricter than the design: no transfer writer in this step. `transferMove` and
+  `recordTransfer` (s.15.9) wait for Phase 8, together with migration 2's transfers table, which
+  is needed anyway so that one real transfer is booked once (s.15.12, s.15.15). Paper can never
+  withdraw (RISK_POLICY invariant 20) and live trades only from Phase 8, so nothing can move a
+  ledger account's SOL or totals after the setup: there is no ledger UPDATE at all, and the write
+  rules allow only the setup's INSERT. `writeDayState` keeps refusing a withdrawal's shape, so the
+  condition of s.14.1 holds by having no path, and it moves to Phase 8.
+- The setup, as built: `setUpLedger(tx, at, paperStart)` in repo-server.ts (cli/ only). It writes
+  the `server:setup-ledger` audit row (detail `{"paper": amount}`), then paper with the bankroll as
+  its one deposit (sol = total_deposits = bankroll) and live at zero. The day state stays the
+  migration's empty state: the first accepted observation sets it from the equity, which is the
+  same value. Refused, with nothing written, once an account exists, or for a bankroll below 1
+  lamport or above the hard equity sanity limit (2.0 SOL; review S). The paper bankroll is then
+  fixed (owner question 1 of s.15.16, the recommended answer).
+- M2: repo-day.ts stays unrestricted, as it gets no transfer writer. Its restriction comes with the
+  transfer writer in Phase 8.
+- Accepted as designed: no code moves into core/ (s.15.3); T2 in its own file, which only
+  app/token-store.ts may import; slot 0 stands for unknown, only with stage 'error'; inputs without
+  fractions, lists or addresses (owner question 2 of s.15.16, the recommended answer); abandon at the
+  caller's time, never before the position opened.
+
+Small differences from the design text:
+- `insertExitIntent` moves the exit number first and inserts the intent second: a refused move then
+  leaves nothing behind, and a refused insert is a failed statement, which refuses the commit.
+- repo-book.ts keeps its own copy of the order statuses (repo-orders.ts imports repo-book.ts, so the
+  other way round would be a cycle); repo-orders.ts exports `ORDER_STATUSES`, pinned by a test.
+- `exitsInFlight` has no overflow check of its own: the schema keeps one exit in flight per position,
+  and `tokenUnits` refuses a sum past 2^64-1 (only a database changed by hand could make one).
+- `abandonOpening` also refuses a position whose row still holds tokens or rent, as ledger.ts does.
+
+Review S (REVIEWS.md S: both reviewers approved with notes; security's approval held only if its
+findings 1 and 2 were fixed before the commit). Fixed before the commit, each with its tests and
+planted bugs:
+- Reason lists (security 1): `reasonsJson` used the caller's own `map`, so a list with its own
+  `map`, a proxy or a subclass could store prose, an error message or an address. It now takes only
+  a plain list (no proxy, the Array prototype, its own names exactly the indices and `length`, no
+  symbols) and reads each element from its descriptor (no getter, no hidden element) before
+  `codeParam`, as `inputsJson` does. Refused alike for entry intents, exit intents and refused
+  decisions.
+- The outcome read once (security 2): `insertDecision` branched on `decision.outcome` read a second
+  time, so a getter answering 'refused' and then 'exit-approved' could store an approval that was
+  checked as a refusal. It now branches on the checked value and reads each branch's fields once.
+- The plan's mint (risk 1, security 3): `insertApproval` and `redeemApproval` refuse a plan whose
+  mint is not its position's (s.15.13).
+- The token store's one importer (security 4): app/token-store.ts is a restricted file that only
+  app/authority.ts may import, so no other file can call `consume` with a slot of its choosing,
+  past the verifier's MAC and slot checks.
+- Every value before the first write (security 5): `redeemApproval` computes the order's row before
+  the consume (`insertExitIntent` already did so before moving the exit number).
+- More canaries (security 6): upserts on approvals and orders; DELETE from approvals,
+  risk_decisions and ledger_accounts; `export const r = redeemApproval` in app/token-store.ts.
+  Not pinned, a note: the approvals INSERT's column list. The write-rule parser reads no INSERT
+  columns, and a token inserted as used can never get an order (only T2 adds orders, and T2 returns
+  false for a used token).
+- The paper bankroll (risk 4): at most the hard equity sanity limit, 2.0 SOL. Storage may not import
+  config/ at runtime, so repo-server.ts keeps its own copy of the number; a test pins it to
+  `HARD_CAPS.equitySanityLamports`.
+- The position write rule (risk 5): until T3, an UPDATE that sets a position's status (only to
+  'closed') must have a WHERE that starts `id = ? AND status = 'opening'` and has no OR, and an
+  UPDATE that moves any of a position's 16 amount columns must be that close (the abandon). T3
+  brings its own reviewed writes. On the confirmation round security found that a comparison
+  could continue the pinned start and turn it round (S8: `status = 'opening' = 0` reads as
+  `(status = 'opening') = 0`, since `=`, `IS` and `IN` share one precedence). Fixed: the WHERE ends
+  right after the start or goes on with AND, which binds more loosely than any comparison, so later
+  clauses can only narrow it; canaries for `= 0`, `IS 0`, `IN (0)`, `<> 1` and `IS NOT 1`.
+- Wording (security 7): s.15.3 (a new exit pool can meet the filter; about 1.7e-7 per address),
+  s.15.16 and the owner summary ("no other person's wallet address").
+- A known slot is at least 1 (security's note on decision 5, optional, taken): `insertDecision`
+  refuses slot 0 for every outcome and stage, error included, so a stored 0 can only mean unknown
+  (passed as null, only with an error).
+Notes kept, not changed: an address split across several inputs, or a deliberate lower-case hex
+string of 63 characters or fewer, would still pass as inputs (risk 8, security on decision 6):
+"out by construction" holds against an honest strategy, which is fine while every strategy is our
+own code. Coverage, measured after the fixes (risk 7): plan-text.ts, repo-book.ts, repo-orders.ts,
+repo-redeem.ts and repo-server.ts at 100% of lines and branches. The reviewers had measured
+repo-orders.ts at 98.29% and 99.14% of branches: the random property tests reached two branches only
+in some runs (an exit intent with an inputs time, an exit token for an exiting position), and unit
+tests now cover both.
+
+The UNVERIFIED items of s.15.1, settled by tests:
+- the largest plan texts are 1,023 (buy), 1,024 (sell) and 1,033 (close-account) characters, and the
+  secret filter finds nothing in them;
+- `JSON.parse` keeps the text's key order on Node 26.13.0: the property test round-trips 1,000 random
+  valid plans to exactly `canonicalPlan` and `planHash`;
+- `peak IS ?` is not used (no transfer writer);
+- the chance that a random address holds a credential word is still an estimate; such a plan is
+  refused at T1, so the mint is never held (a test refuses a position id with "secret" in it).
+
+Tests: every function at its boundary, each refusal alone with nothing written even when a careless
+caller catches it inside the transaction; tokens issued and redeemed by risk's own authority, the
+store doing T2 in SQLite as app/token-store.ts will; a property test of random T1 and T2 sequences
+(buys, redeems at slots around each token's range, abandons, settlements, exits, failed orders)
+that checks invariant 1 and the book's conservation after every step; each write of the setup, a
+buy's T1, an exit intent and T2 failing in turn, with nothing left behind; the MAC in no cell.
+Planted bugs (scratchpad `mut/run25.py`): 81 planted, 78 caught. The three left repeat a check that
+another line makes: the plan text's length (JSON.parse and jsonParam's 8 KiB refuse a longer one),
+the exit number in `insertExitIntent` (advanceExitSeq's compare-and-set refuses the same stale
+number first), and the token kind's own list in `insertApproval` (the text's kind is compared with
+the token's, and a withdraw text is refused by `planRecordOf`). After the review S fixes
+(`mut/run26.py`, `run26b.py` and `run26c.py`): run25's 81 again on the fixed code plus 28 for the
+fixes, 109 planted, 105 caught. The fourth one left moves the order's values after the consume in
+`redeemApproval`: every one of them was checked before, so none can throw between the two writes,
+and the order of the statements is defence in depth only.
+
+Conditions for the next steps:
+- 6d: `app/token-store.ts` is the only importer of repo-redeem.ts, and its `consume` passes
+  `canonicalPlan(snapshot.plan)` and the guarded clock's now; T1 passes `canonicalPlan` of the
+  checked plan to `insertApproval`. `recordRefusalTx` writes `inputs: {}` and the error code
+  (s.15.8). 6d's id generator draws ids until the secret filter passes them, at most 63
+  characters. The slot of an error decision is 0 only when it was unknown.
+- 6d: the boot reads both ledger accounts (a missing one refuses the start, contract 1), rebuilds
+  each ledger from `readBook` and runs `checkConservation`; an opening position with no order, or a
+  failed or expired buy, is abandoned at `max(now, openedAt)` (but see the T3 condition on a
+  failed buy's fee below).
+- 6d (review S, risk 4): the day-state policy's `bankrollLamports` for paper is the stored paper
+  deposit (`readAccount(..., 'paper').totalDeposits`), so the bankroll has one source.
+- 6d (review S, risk 6): T1 buy passes `insertOpening` the exact `market.newPositionP95ExitCost`
+  that `approveBuy` used, and a test checks the stored value equals it. Refusing 0 there is
+  optional (any real exit costs at least the 5,000-lamport base fee).
+- T3 (the paper engine): settlement, the order status moves and the ledger's SOL get their own
+  reviewed writers and write rules; a settlement is unique per order (s.12.1).
+- T3 and the order-status writer (review S, risk 2): an abandon after a failed or expired buy needs
+  that order's settlement record (unique per order), or happens in the same T3 transaction as that
+  settlement; otherwise the failed fee is never booked once the position is closed
+  (`positions_closed_final`), and paper flatters (invariant 29). The status writer marks an order
+  failed or expired only once it can no longer land (its blockhash has expired, then a final status
+  check), as ledger.ts requires.
+- T3 and the order-status writer (review S, risk 3): a second full sell must not be recordable.
+  (a) The `landed` move and T3's settlement are one transaction; or T2 refuses a sell while another
+  exit of the position is landed but not booked, and checks the sell's input against the
+  position's tokens minus the sells in flight. (b) T1 exit counts unused, unexpired exit approvals
+  of the position as in flight, or refuses a new exit while one is outstanding (today
+  `exitsInFlight` sees only approved and submitted orders, and the one-exit index covers only
+  those).
+- Phase 8: the transfer writer of s.15.9, with migration 2's transfers table (one booking per chain
+  signature), repo-day.ts restricted, and the condition of s.14.1.
