@@ -2698,7 +2698,7 @@ Planted bugs worth planting (each must be caught by a test):
 1. **The paper bankroll is fixed after setup.** The setup writes it once. Nothing can top it up
    later, because a top-up would also make paper results look bigger than they are. A different
    paper bankroll means a new database (or, later, a reviewed command). Recommended: yes, keep it
-   fixed.
+   fixed. Decided: yes (owner decision D7, 2026-11-19).
 2. **What the bot records about why it wanted a trade.** Numbers and short labels only, never
    another person's wallet address. So no FOMO user's wallet, and no token creator's address, can
    end up in the database. Explanations will name the token and the numbers. (The orders hold the
@@ -2737,7 +2737,7 @@ The main session's decisions on s.15.17 (the reviewers challenge these too):
   migration's empty state: the first accepted observation sets it from the equity, which is the
   same value. Refused, with nothing written, once an account exists, or for a bankroll below 1
   lamport or above the hard equity sanity limit (2.0 SOL; review S). The paper bankroll is then
-  fixed (owner question 1 of s.15.16, the recommended answer).
+  fixed (owner question 1 of s.15.16: the recommended answer, owner decision D7).
 - M2: repo-day.ts stays unrestricted, as it gets no transfer writer. Its restriction comes with the
   transfer writer in Phase 8.
 - Accepted as designed: no code moves into core/ (s.15.3); T2 in its own file, which only
