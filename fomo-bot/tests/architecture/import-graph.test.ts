@@ -9,7 +9,8 @@
 //   deterministic: Date only as new Date(x), Date.UTC or Date.parse; Math never random;
 //   Temporal never Now; no performance; no zero-argument format() (it formats "now");
 // - node:crypto only as named imports from an allowlist, never re-exported (its random
-//   functions live in core/rng.ts only);
+//   functions live in core/rng.ts only, which imports randomBytes and nothing else from it and is
+//   held to the pure rules like the rest of core/);
 // - pure folders (PURE) import no Node built-in beyond their list, no dynamic import, and
 //   core/clock.ts or core/rng.ts only as types; every global they name must be a plain
 //   ECMAScript global (ES_GLOBALS: no console, process, fetch, timers, Buffer, ...), and
@@ -111,6 +112,14 @@ const RESTRICTED_FILES: Readonly<Record<string, { readonly allows: (rel: string)
   // its consume directly, past the verifier's MAC and its slot (review S, security 4)
   'app/token-store.ts': { allows: (rel) => rel === 'app/authority.ts', who: 'app/authority.ts (where the store is bound into the verifier)' },
   'storage/repo-orders.ts': { allows: (rel) => rel.startsWith('app/'), who: 'app/ (T1)' },
+  // randomness has one door, and only the composition root and the process entry use it: other code
+  // takes an Rng or random data as an argument, so tests stay deterministic (6d-1, STORAGE_DESIGN s.16.7.4)
+  'core/rng.ts': { allows: (rel) => rel.startsWith('app/') || rel.startsWith('cli/'), who: 'app/ and cli/ (other code takes an Rng)' },
+  // one authority, one boot and one engine per process: no other app/ file can make a second authority
+  // or start a second engine, and only the process entry starts one (6d, STORAGE_DESIGN s.16.3, D14)
+  'app/authority.ts': { allows: (rel) => rel === 'app/engine.ts', who: 'app/engine.ts (one authority per process)' },
+  'app/storage-boot.ts': { allows: (rel) => rel === 'app/engine.ts', who: 'app/engine.ts (the boot runs once, before the authority)' },
+  'app/engine.ts': { allows: (rel) => rel.startsWith('cli/'), who: 'cli/ (the process entry)' },
   'storage/repo-book.ts': {
     allows: (rel) => rel.startsWith('app/') || rel === 'storage/repo-orders.ts' || rel === 'storage/repo-redeem.ts',
     who: 'app/, storage/repo-orders.ts and storage/repo-redeem.ts',
@@ -136,7 +145,15 @@ const AUDIT_ACTORS: Readonly<Record<string, readonly string[]>> = {
 const CONFLICT_CLAUSE = /\b(?:INSERT|UPDATE)\s+OR\s+(?:REPLACE|IGNORE|ROLLBACK|ABORT|FAIL)\b|\bREPLACE\s+INTO\b|\bON\s+CONFLICT\s+(?:REPLACE|IGNORE|ROLLBACK|ABORT|FAIL)\b/i;
 /** Lower case: the check compares import targets in lower case, because Windows and macOS ignore case in file names. */
 const CLOCK_FILES = new Set(['core/clock.ts', 'core/rng.ts']);
+/**
+ * The one file the clock rules leave out. core/rng.ts is held to the pure rules like the rest of
+ * core/, with node:crypto allowed and randomBytes its only import from it: randomness has one audited
+ * door, and the global crypto, Math.random and Date are refused there too (6d-1, STORAGE_DESIGN s.16.7.4).
+ */
+const CLOCK_EXEMPT = new Set(['core/clock.ts']);
 const RNG_FILE = 'core/rng.ts';
+const RNG_BUILTINS: readonly string[] = ['node:crypto'];
+const RNG_CRYPTO = new Set(['randomBytes']);
 
 /**
  * Single files outside the pure folders that any folder may import at runtime: config/caps.ts holds
@@ -337,7 +354,7 @@ export function checkSource(rel: string, text: string): string[] {
   }
   // A pure file is found whatever the case of its name (a look-alike `Caps.ts` is held to the same rules).
   const pureFile = Object.hasOwn(PURE_FILES, rel.toLowerCase()) ? PURE_FILES[rel.toLowerCase()] : undefined;
-  const pure = CLOCK_FILES.has(rel) ? undefined : (pureFile ?? PURE[folder]);
+  const pure = CLOCK_EXEMPT.has(rel) ? undefined : rel === RNG_FILE ? RNG_BUILTINS : (pureFile ?? PURE[folder]);
   const declared = pure === undefined ? new Set<string>() : declaredNames(source);
 
   const checkSpecifier = (spec: string, typeOnly: boolean, reexport = false, dynamic = false): void => {
@@ -352,7 +369,7 @@ export function checkSource(rel: string, text: string): string[] {
       if (pure !== undefined && !typeOnly && !pure.includes(spec)) {
         problems.push(`${rel}: ${spec} is not allowed in ${folder}/ (pure code)`);
       }
-      if (spec === 'node:perf_hooks' && !typeOnly && !CLOCK_FILES.has(rel)) {
+      if (spec === 'node:perf_hooks' && !typeOnly && !CLOCK_EXEMPT.has(rel)) {
         problems.push(`${rel}: node:perf_hooks reads the clock outside core/clock.ts`);
       }
       return;
@@ -413,22 +430,22 @@ export function checkSource(rel: string, text: string): string[] {
     if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
       const clause = node.importClause;
       checkSpecifier(node.moduleSpecifier.text, clause?.isTypeOnly === true);
-      if (isCrypto(node.moduleSpecifier) && rel !== RNG_FILE && clause !== undefined && !clause.isTypeOnly) {
+      if (isCrypto(node.moduleSpecifier) && clause !== undefined && !clause.isTypeOnly) {
         const bindings = clause.namedBindings;
         if (clause.name !== undefined || (bindings !== undefined && ts.isNamespaceImport(bindings))) {
           problems.push(`${rel}: import named functions from node:crypto (no default or namespace import)`);
         } else if (bindings !== undefined && ts.isNamedImports(bindings)) {
           for (const element of bindings.elements) {
             const imported = (element.propertyName ?? element.name).text;
-            if (!element.isTypeOnly && !CRYPTO_ALLOWED.has(imported)) {
-              problems.push(`${rel}: ${imported} from node:crypto is not allowed outside core/rng.ts`);
+            if (rel === RNG_FILE ? !RNG_CRYPTO.has(imported) : !element.isTypeOnly && !CRYPTO_ALLOWED.has(imported)) {
+              problems.push(rel === RNG_FILE ? `${rel}: core/rng.ts imports randomBytes only from node:crypto (not ${imported})` : `${rel}: ${imported} from node:crypto is not allowed outside core/rng.ts`);
             }
           }
         }
       }
     } else if (ts.isExportDeclaration(node) && node.moduleSpecifier !== undefined && ts.isStringLiteral(node.moduleSpecifier)) {
       checkSpecifier(node.moduleSpecifier.text, node.isTypeOnly, true);
-      if (isCrypto(node.moduleSpecifier) && rel !== RNG_FILE && !node.isTypeOnly) {
+      if (isCrypto(node.moduleSpecifier) && !node.isTypeOnly) {
         problems.push(`${rel}: node:crypto may not be re-exported`);
       }
     } else if (ts.isImportEqualsDeclaration(node)) {
@@ -441,7 +458,7 @@ export function checkSource(rel: string, text: string): string[] {
         }
         if (arg !== undefined && ts.isStringLiteral(arg)) {
           checkSpecifier(arg.text, false, false, true);
-          if (isCrypto(arg) && rel !== RNG_FILE) {
+          if (isCrypto(arg)) {
             problems.push(`${rel}: node:crypto may not be imported dynamically`);
           }
         } else {
@@ -453,7 +470,7 @@ export function checkSource(rel: string, text: string): string[] {
     } else if (ts.isIdentifier(node) && node.text === 'createRequire') {
       problems.push(`${rel}: createRequire is not allowed`);
     }
-    if (!CLOCK_FILES.has(rel)) {
+    if (!CLOCK_EXEMPT.has(rel)) {
       // Every reference to a date formatter's format must be a direct call with a real value:
       // a bare reference, an alias, destructuring, .call/.apply/.bind or format() formats "now".
       const formatter =
@@ -493,7 +510,7 @@ export function checkSource(rel: string, text: string): string[] {
       node.moduleSpecifier !== undefined &&
       ts.isStringLiteral(node.moduleSpecifier) &&
       (node.moduleSpecifier.text === 'node:process' || node.moduleSpecifier.text === 'process') &&
-      !CLOCK_FILES.has(rel)
+      !CLOCK_EXEMPT.has(rel)
     ) {
       const bindings = ts.isImportDeclaration(node) ? node.importClause?.namedBindings : node.exportClause;
       const names = bindings !== undefined && (ts.isNamedImports(bindings) || ts.isNamedExports(bindings)) ? bindings.elements : [];
@@ -507,14 +524,14 @@ export function checkSource(rel: string, text: string): string[] {
       problems.push(`${rel}: process.getBuiltinModule is a hidden require and is not allowed`);
     }
     if (ts.isIdentifier(node) && !isPropertyName(node)) {
-      if (!CLOCK_FILES.has(rel) && !isTypePosition(node)) {
+      if (!CLOCK_EXEMPT.has(rel) && !isTypePosition(node)) {
         const problem = clockProblem(node);
         if (problem !== null) {
-          problems.push(`${rel}: ${problem} outside core/clock.ts and core/rng.ts`);
+          problems.push(`${rel}: ${problem} outside core/clock.ts`);
         }
       }
-      if (node.text === 'crypto' && rel !== RNG_FILE && !inTypeContext(node)) {
-        problems.push(`${rel}: the global crypto (randomness) outside core/rng.ts`);
+      if (node.text === 'crypto' && !inTypeContext(node)) {
+        problems.push(`${rel}: the global crypto (randomness) is never used: core/rng.ts imports randomBytes`);
       }
       if (pure !== undefined && AMBIENT.has(node.text)) {
         problems.push(`${rel}: ${node.text} is not allowed in ${folder}/ (pure code)`);
@@ -526,7 +543,7 @@ export function checkSource(rel: string, text: string): string[] {
     }
     const dotted = ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression);
     const indexed = ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression);
-    if (!CLOCK_FILES.has(rel) && (dotted || indexed)) {
+    if (!CLOCK_EXEMPT.has(rel) && (dotted || indexed)) {
       const owner = (node.expression as ts.Identifier).text;
       const hostObject = owner === 'globalThis' || owner === 'global' || owner === 'process';
       // a.b and a['b'] name the member; a[expr] could name any member.
@@ -543,7 +560,7 @@ export function checkSource(rel: string, text: string): string[] {
         problems.push(`${rel}: process.${member} reads the clock outside core/clock.ts`);
       }
       if ((owner === 'globalThis' || owner === 'global') && member !== null && CLOCK_GLOBALS.has(member)) {
-        problems.push(`${rel}: ${owner}.${member} outside core/clock.ts and core/rng.ts`);
+        problems.push(`${rel}: ${owner}.${member} outside core/clock.ts`);
       }
     }
     // In every folder, not only the pure ones: `x.constructor` reaches Function and the members of
@@ -1512,6 +1529,26 @@ describe('architecture: imports and determinism', () => {
     ]);
   });
 
+  it('CANARY: core/rng.ts is held to the pure rules, with randomBytes from node:crypto its only door (6d-1, STORAGE_DESIGN s.16.7.4)', () => {
+    flaggedFor([
+      ['core/rng.ts', "import { randomUUID } from 'node:crypto';", 'core/rng.ts imports randomBytes only from node:crypto (not randomUUID)'],
+      ['core/rng.ts', "import { createHash } from 'node:crypto';", 'core/rng.ts imports randomBytes only'],
+      ['core/rng.ts', "import { randomBytes as r, randomInt } from 'node:crypto';", 'not randomInt'],
+      ['core/rng.ts', "import * as c from 'node:crypto';", 'import named functions from node:crypto'],
+      ['core/rng.ts', "import c from 'node:crypto';", 'import named functions from node:crypto'],
+      ['core/rng.ts', "export { randomBytes } from 'node:crypto';", 'node:crypto may not be re-exported'],
+      ['core/rng.ts', "export const c = async (): Promise<unknown> => import('node:crypto');", 'no dynamic import in core/'],
+      ['core/rng.ts', "import { readFileSync } from 'node:fs';", 'node:fs is not allowed in core/'],
+      ['core/rng.ts', 'export const r = (): number => Math.random();', 'Math may only be Math.<member>, never random'],
+      ['core/rng.ts', 'export const t = (): number => Date.now();', 'Date may only be'],
+      ['core/rng.ts', 'export const v = (): Uint8Array => crypto.getRandomValues(new Uint8Array(4));', 'the global crypto'],
+      ['core/rng.ts', 'export const p = (): number => process.pid;', 'process is not allowed in core/'],
+      ['core/rng.ts', "export const b = (): unknown => Buffer.from('x');", 'the global Buffer is not allowed in core/'],
+    ]);
+    // what the real file does stays allowed
+    assert.deepEqual(checkSource('core/rng.ts', "import { randomBytes } from 'node:crypto';\nimport { hexOf } from './encode.ts';\nexport const id = (): string => hexOf(randomBytes(16));"), []);
+  });
+
   it('CANARY: pure folders get no Node built-ins beyond their list and no ambient global', () => {
     flagged([
       ['core/x.ts', "import { readFileSync } from 'node:fs';"],
@@ -1808,6 +1845,15 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['storage/repo-day.ts', "import { readPosition } from './repo-book.ts'; export function f(): void { readPosition(); }", only],
       ['app/engine.ts', "import { createSqliteTokenStore } from './token-store.ts'; export function f(): void { createSqliteTokenStore(); }", `${only} app/authority.ts`],
       ['cli/x.ts', "import { createSqliteTokenStore } from '../app/token-store.ts'; export function f(): void { createSqliteTokenStore(); }", `${only} app/authority.ts`],
+      // 6d-1: randomness only in app/ and cli/; one authority, one boot and one engine per process
+      ['execution/x.ts', "import { newId } from '../core/rng.ts'; export function f(): string { return newId('token'); }", `${only} app/ and cli/`],
+      ['telegram/x.ts', "import { systemRng } from '../core/rng.ts'; export const r = systemRng;", `${only} app/ and cli/`],
+      ['app/x.ts', "export { newId } from '../core/rng.ts';", only],
+      ['app/x.ts', "import { createEngineAuthority } from './authority.ts'; export function f(): void { createEngineAuthority(); }", `${only} app/engine.ts`],
+      ['cli/x.ts', "import { createEngineAuthority } from '../app/authority.ts'; export function f(): void { createEngineAuthority(); }", `${only} app/engine.ts`],
+      ['app/approve-tx.ts', "import { bootStorage } from './storage-boot.ts'; export function f(): void { bootStorage(); }", `${only} app/engine.ts`],
+      ['app/x.ts', "import { startPaperEngine } from './engine.ts'; export function f(): void { startPaperEngine(); }", `${only} cli/`],
+      ['app/engine.ts', "export { createEngineAuthority } from './authority.ts';", only],
     ]);
     // the typed rule (below) checks that what is imported is only called; these are the import rules alone
     const fine: [string, string][] = [
@@ -1823,6 +1869,11 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['storage/repo-orders.ts', "import { readPosition } from './repo-book.ts'; export function f(): void { readPosition(); }"],
       ['storage/repo-redeem.ts', "import { readPosition } from './repo-book.ts'; export function f(): void { readPosition(); }"],
       ['execution/x.ts', "import type { StoredOrder } from '../storage/repo-orders.ts'; export const x = (o: StoredOrder): StoredOrder => o;"],
+      ['app/engine.ts', "import { createEngineAuthority } from './authority.ts'; import { bootStorage } from './storage-boot.ts'; export function f(): void { bootStorage(); createEngineAuthority(); }"],
+      ['cli/start.ts', "import { startPaperEngine } from '../app/engine.ts'; import { systemRng } from '../core/rng.ts'; export function f(): void { startPaperEngine(systemRng); }"],
+      ['app/x.ts', "import { newId } from '../core/rng.ts'; export function f(): string { return newId('token'); }"],
+      ['app/faults.ts', "import { RngError } from '../core/rng.ts'; export const isRng = (e: unknown): boolean => e instanceof RngError;"],
+      ['execution/x.ts', "import type { Rng } from '../core/rng.ts'; export const x = (r: Rng): string => r.orderId();"],
     ];
     for (const [rel, text] of fine) {
       assert.deepEqual(checkSource(rel, text), [], rel);
@@ -2172,6 +2223,7 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       'storage/repo-owner.ts': `${HEAD}export function unpause(tx: Tx): number { return tx.run('DELETE FROM t'); }`,
       'storage/audit-chain.ts': `${HEAD}export const AUDIT_GENESIS = '0'.repeat(64);\nexport function appendAuditRow(tx: Tx): number { return tx.run('DELETE FROM t'); }`,
       'storage/repo-redeem.ts': `${HEAD}export function redeemApproval(tx: Tx): number { return tx.run('DELETE FROM t'); }`,
+      'core/rng.ts': "export function newApprovalKey(): Uint8Array { return new Uint8Array(32); }\nexport const systemRng = Object.freeze({ approvalKey: newApprovalKey });",
       'cli/ok.ts': [
         "import type { Tx } from '../storage/sqlite.ts';",
         "import { clearKill, SERVER_AUDIT_ACTIONS } from '../storage/repo-server.ts';",
@@ -2200,6 +2252,8 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       'storage/repo-b12.ts': ["import { appendAuditRow } from './audit-chain.ts';\nexport const a = appendAuditRow;", handed],
       // the token store handing T2 on to whoever imports it (s.15.11; review S, security 6)
       'app/token-store.ts': ["import { redeemApproval } from '../storage/repo-redeem.ts';\nexport const r = redeemApproval;", handed],
+      // the key maker handed on to whoever imports this app/ file (6d-1, STORAGE_DESIGN s.16.7.4)
+      'app/x.ts': ["import { newApprovalKey } from '../core/rng.ts';\nexport const k = newApprovalKey;", handed],
     };
     const { program, srcRoot } = virtualProgram({ ...files, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])) });
     const { problems, restrictedCalls } = sqlProblems(program, srcRoot);

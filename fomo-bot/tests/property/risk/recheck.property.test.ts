@@ -307,8 +307,53 @@ describe('plan re-check properties', () => {
     for (const [kind, count] of Object.entries(accepted)) {
       assert.ok(count >= 20, `only ${count} accepted plans of kind ${kind}`);
     }
-    // every fault actually led to a refusal somewhere, so none of them is dead weight
-    const never = FAULT_NAMES.filter((name) => (refusedBy[name] ?? 0) === 0);
+    // every fault actually led to a refusal somewhere, so none of them is dead weight. Each fault is
+    // also put alone on every base case, so the check never rests on what a random run happened to
+    // draw (a rare run once drew inAmountHuge only on buys, where it changes nothing; review T,
+    // security 8): the oracle must agree there too.
+    for (const name of FAULT_NAMES) {
+      for (const kind of ['buy', 'sell', 'close-account'] as const) {
+        for (const mode of ['paper', 'live'] as const) {
+          for (const urgency of ['normal', 'protective', 'emergency'] as const) {
+            for (const automatic of [false, true]) {
+              const [plan, c] = (FAULTS[name] as (x: Case) => Case)(baseCase(kind, mode, urgency, automatic, 0));
+              const ok = planProblems(plan, c).length === 0;
+              assert.equal(ok, acceptable(plan, c), `${name} alone on a ${kind}`);
+              if (!ok) {
+                refusedBy[name] = (refusedBy[name] ?? 0) + 1;
+              }
+            }
+          }
+        }
+      }
+    }
+    // Two faults refuse only next to another: each on the one case where it bites, which passes without it.
+    const F = (name: string): ((x: Case) => Case) => FAULTS[name] as (x: Case) => Case;
+    const automaticSell = baseCase('sell', 'paper', 'normal', true, 0);
+    const [sellPlan, sellCtx] = automaticSell;
+    const exactBudget = onExit((e) => ({ origin: { kind: 'automatic', budgetLeft: lamports(BigInt(sellPlan.attempts) * perAttempt(sellPlan)), automaticStopped: false, sellSimPassed: true } }))([sellPlan, sellCtx]);
+    for (const [name, before] of [
+      ['budgetLow', exactBudget],
+      ['costBasisLow', F('collapsedPrice')(automaticSell)],
+    ] as const) {
+      assert.deepEqual(planProblems(...before), [], `${name}'s case passes without it`);
+      const [plan, c] = F(name)(before);
+      assert.equal(acceptable(plan, c), false, `the oracle refuses ${name}'s case`);
+      assert.notDeepEqual(planProblems(plan, c), [], `${name} refuses its case`);
+      refusedBy[name] = (refusedBy[name] ?? 0) + 1;
+    }
+    // Two widen what passes by design (an owner's exit skips the automatic stops; a cost basis keeps the
+    // landing cap alive): each turns a refused case into an accepted one, with the oracle's agreement.
+    for (const [name, refusedCase, relieved] of [
+      ['ownerOrdered', F('stopped')(automaticSell), F('ownerOrdered')(F('stopped')(automaticSell))],
+      ['collapsedPrice', F('smallSale')(automaticSell), F('collapsedPrice')(automaticSell)],
+    ] as const) {
+      assert.notDeepEqual(planProblems(...refusedCase), [], `${name}: the case it relieves is refused`);
+      assert.deepEqual(planProblems(...relieved), [], `${name} relieves it`);
+      assert.equal(acceptable(...relieved), true, `the oracle agrees with ${name}`);
+    }
+    const RELIEF = new Set(['ownerOrdered', 'collapsedPrice']);
+    const never = FAULT_NAMES.filter((name) => !RELIEF.has(name) && (refusedBy[name] ?? 0) === 0);
     assert.deepEqual(never, [], 'faults that never caused a refusal');
   });
 

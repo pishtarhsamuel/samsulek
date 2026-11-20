@@ -24,6 +24,8 @@ export const GATED: readonly RegExp[] = [
   /^src\/config\//,
   // the database wrapper, the amount codec and the schema runner: every money record passes through them
   /^src\/storage\//,
+  // the composition root: the approval transactions, the token store and the engine's one authority (6d)
+  /^src\/app\//,
 ];
 export const GATED_PERCENT = 90;
 export const OTHER_PERCENT = 80;

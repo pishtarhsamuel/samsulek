@@ -2860,3 +2860,1400 @@ Conditions for the next steps:
   those).
 - Phase 8: the transfer writer of s.15.9, with migration 2's transfers table (one booking per chain
   signature), repo-day.ts restricted, and the condition of s.14.1.
+
+## 16. Step 6d design: the approval transactions
+
+Status: PROPOSED by the architect (2026-11-19), for the reviewers before any code. Paper only.
+Nothing in migration 1 changes. No new dependency. No network code: the slot feed, the rent read,
+the marks and the alerts are interfaces with test fakes. Nothing here can sign, send or move funds.
+
+Files read: fomo-bot/CLAUDE.md, docs/STATUS.md, docs/DECISIONS.md (D1-D7), this file (s.1-15),
+docs/REVIEWS.md (K to S), docs/RISK_POLICY.md (s.3, 3a, 4 and its contracts, 6, 8, 9, 15),
+docs/ARCHITECTURE.md (s.2, 4, 7, 11, 12), docs/VERIFIED_FACTS.md (s.4, s.8), src/risk/{approval,
+approve,recheck,exits,blocks,reserve,sizing,daystate,plan}.ts, src/portfolio/{ledger,equity}.ts,
+src/config/{caps,tunables,changes}.ts, src/core/{ids,redact,day,time,units}.ts, src/storage/{sqlite,
+codec,migrations,audit-chain,repo-audit,repo-flags,repo-book,repo-orders,repo-config,plan-text}.ts
+(and the exports of the others), tests/architecture/import-graph.test.ts, tests/unit/storage/
+{helpers,money-fixtures,processes}.ts, package.json.
+
+### 16.0 In plain English
+
+- Step 6d connects the risk engine to the database. Every buy or sell decision becomes one locked,
+  all-or-nothing database step: the bot reads its money, positions, limits and halts, asks risk,
+  and writes the answer. If anything fails half-way, nothing of that step is saved.
+- The one-time approval that lets an order run is now checked against the database itself, with
+  the bot's own clock of the chain (the slot), so no other code can reuse an approval.
+- At start-up the bot checks its database, its safety log and its books before it trades. If
+  anything does not add up, it refuses to start and tells you.
+- Why it matters for your money: these are the steps a live bot would use. A bug here could
+  double-spend or ignore a halt. The design makes each of those impossible or loudly refused.
+- Still paper only. It cannot hold a key, send a transaction or move funds.
+
+### 16.1 Facts from the code, and where the docs differ
+
+The code wins where it differs; each difference below is resolved as stated.
+
+- core/rng.ts is already in the architecture test's `CLOCK_FILES` and is `RNG_FILE`: it may import
+  any node:crypto function, the global `crypto`, `Date` and `Math.random`, and it is exempt from
+  every pure rule (import-graph.test.ts:138-139, 340, 416-424, 516). The canary list already accepts
+  `import { randomBytes } from 'node:crypto'` there (line 1578). So no rule must be loosened for
+  6d. The exemption is wider than 6d needs: 16.7 tightens it.
+- `PURE.core` is `[]`, so core/redact.ts and a new core/encode.ts cannot import node:crypto or
+  Buffer. Base58 and base64 for the exact-value list are written by hand (16.7).
+- risk/approval.ts: the issuer reads its own bound slot source, ratchets it, and treats a reading
+  above 2^63-1 as unknown (approval.ts:54, 297-311). `newTokenId` must return `isIdText`; the key is
+  copied and must be at least 32 bytes, not all zero.
+- risk/approve.ts: `BuyMarket` carries `wallet`, `ownTokenAccount` and `wsolMint`. RISK_POLICY s.6
+  says these come "from config, never from the plan". In 6d app/ fills them from a fixed paper
+  identity, never from the caller's market object (stricter than s.3.1, which passed `market` as is).
+- risk/reserve.ts: `ReserveCaps.wsolHelperRent` is taken as given (the chain fact of review L);
+  `positionExitBudget` is 27 x 125,000 + 5,000 = 3,380,000 at the hard values. The failed-fee budget
+  of RISK_POLICY s.3a (3,375,000) has no function of its own; app/caps.ts computes it (16.4).
+- There is no function that maps the stored tunables to `BuyCaps` or `PlanCaps`, and no stored
+  minimum trade (RISK_POLICY limit 15, 0.02 SOL, a P value). 6d adds that mapping in app/caps.ts.
+- portfolio/equity.ts `valueEquity(ledger, marks, now, policy)` already holds the mark freshness
+  rule. s.3's `MarkReader.value(positionId, tokenUnits, now)` is replaced by a map of
+  equity.ts `Mark`s, so there is one freshness rule, not two.
+- repo-orders.ts `NewExitIntent` takes a list of reason codes and an inputs record; s.3.2's
+  `ExitRequest.reason` (one code) becomes `reasons` (1-16 codes).
+- repo-audit.ts `verifyAuditChain` returns the newest id and hash but not the newest time, and no
+  function reads one audit row by id. The boot needs both (16.3, a read-only change).
+- repo-orders.ts `exitsInFlight` counts only approved and submitted orders. Review S risk 3(b)
+  needs unused, unexpired exit approvals too (16.3, a read-only change).
+- `config/changes.ts` `checkHistory` is not exported. T1 and the boot decode the active version with
+  `decodeTunables`; the full history check stays with 6e's config transactions.
+- s.4 proposed `maxAgeMs` 10 s for the slot source. Review N risk 3 asks that it stay at or below
+  what 25 slots allow, and VERIFIED_FACTS measures slots at about 214 ms (25 slots, about 5.3 s).
+  This design uses 2 s (16.7).
+- s.3.1 step 2 inserts the intent before the snapshot reads. This design reads everything and runs
+  the pure decision first, then writes (16.5). The result is identical, because the transaction is
+  atomic, and it meets "every check before the first write" literally.
+- s.11 (review O) says only `busy` at BEGIN and expected `constraint` refusals are handled per
+  intent. s.15.12 (review S) handles a refused input (`bad-param` from a repository's precondition)
+  per intent too. 16.5.6 keeps both: `bad-param` is per intent, because it is always thrown before
+  any write of that function and the transaction rolls back. Reviewers to confirm.
+
+### 16.2 Every 6d condition, and where it goes
+
+Each line: the source, the condition, and the answer. "6d-1/2/3" are the sub-steps of 16.10.
+
+From this file's plan (s.4, s.5, s.7) and review K:
+- C1 (s.7; K security 2, 3; N): close the K gate in app/: the store bound, the slot injected, T2
+  records from validated data. 6d-1: app/authority.ts binds `createSqliteTokenStore` and the
+  slot feed; T2 writes the order from the `RedeemSnapshot` and risk's canonical text (16.5.5). The
+  security-auditor re-runs its K reproductions; the verdict goes in REVIEWS.md.
+- C2 (s.7; L security OPEN): the wSOL helper rent comes only from the chain read, and
+  `positionExitBudget` is never an allowance. 6d-2: `RentSource` is the only source of
+  `wsolHelperRent`; the exit budget is `FAILED_FEE_BUDGET`; an architecture rule keeps
+  `positionExitBudget` inside risk/; tests in 16.9.
+- C3 (s.5, s.7): exhaustive fault injection, the deterministic and parallel races, invariants 1, 2
+  and 17 on SQLite, the KILL from another process. 6d-2 (16.9).
+- C4 (s.4; N risk 3): the slot source returns null when stale; the exit loop's HTTP polling must
+  feed it. 6d-1: `SlotFeed.report('http', ...)` from any channel; a test with the stream stale and
+  HTTP alive still issues exit tokens. The exit loop itself comes later.
+- C5 (K re-review risk N5): `approveExit` is a thin wrapper, so T1 exit re-reads every exit fact
+  inside the transaction. 6d-2 (16.5.2).
+- C6 (K re-review): `buyOrdersForPosition: 0` is sound only because the partial unique index on
+  `positions(mint)` stays in T1. 6d-2: `insertOpening` runs in the same transaction as the token.
+- C7 (K security 9; ARCHITECTURE s.11): a start-up check that `Object.isFrozen(Array.prototype)`.
+  6d-3 in `startPaperEngine` (cheap, before anything else). The process-flag checks
+  (`--heapsnapshot-signal`, `--report`) stay with the start script (ops step).
+- C8 (K risk 9): an exit plan's size is not tied to `fractionBps`. Moves to the exit planner
+  (execution step): only the planner knows the fraction's base. It only ever reduces risk.
+
+From s.11 (review O):
+- C9: only `busy` at BEGIN and expected `constraint` refusals per intent, every other code
+  latches. 6d-2: the classification table of 16.5.6 (with the `bad-param` extension of 16.1).
+- C10: cap, exposure and one-per-mint reads go through the transaction. 6d-2: `readBuySnapshot(tx)`.
+- C11: a poisoned handle leads to a controlled exit and restart. 6d-2: `poisoned` is scope
+  `fatal`: the latch is set and `onFatal` is called; the run loop that exits the process is a later
+  step (it does not exist yet), and a test checks `onFatal` is called once.
+- C12: the start passes `create: false` and `allowFresh: false`, and refuses missing required rows.
+  6d-3 (16.6 steps 3-6).
+- C13: the single-instance run lock exists before the bot runs on a real file. Moves to the ops
+  step that writes the start script (nothing in 6d runs the bot on a real file; tests use temp
+  files). Node has no file-lock call; the proposed lock is UNVERIFIED (16.12, V9). 6d-3 makes the
+  lock a required boot input (`BootOptions.runLock`), so the boot cannot be called without one.
+- C14: quick_check and foreign_key_check at every boot. 6d-3 (16.6 step 3).
+- C15 (O security 6, 7; D5.3): data folder 0700, `-wal`/`-shm` 0600 or refused, a symbolic link
+  refused, UNC paths refused, on Windows under the user profile with the OneDrive check. 6d-3
+  (16.6 step 1), plus a local-file-system allowlist on Linux (UNVERIFIED values, 16.12 V1).
+- C16 (O risk 6): before any migration 2, quick_check the pre-migration copy. Stays "before
+  migration 2": 6d adds no migration.
+
+From s.12.1 (reviews P):
+- C17: the audit chain checked at start-up. 6d-3 (16.6 step 6).
+- C18: a deliberate test of the `chmodSync` failure branch (sqlite.ts:793-797). 6d-3: a child
+  process started with uid and gid 65534 opens a root-owned 0666 file; skipped where the tests do
+  not run as root, and on win32 (16.12 V2).
+- C19: ledger rows and config version 1 only from the owner's setup; a normal start refuses
+  without them. 6d-3 (16.6 step 5).
+- C20: snapshot pruning keeps at least an hour. Done in 6c-2b-1 (a day); 6e calls it.
+- C21 (P security 5): the exact-value list of the bot's own secrets, registered at boot in hex,
+  base64, base64url and base58. 6d-1: the registry in core/redact.ts and the approval key's
+  registration in app/authority.ts. The bot token, RPC key and Anthropic key do not exist yet; each
+  later step registers its own at its own start (Telegram, chain clients, AI review).
+- C22 (P security 8g): token ids random and independent of the MAC; the MAC and the HMAC key
+  never stored. 6d-1: ids from `randomBytes`, never derived from the key; a test scans every cell.
+- C23: generated ids at most 63 characters, drawn until the filter passes them, tested on the
+  longest. 6d-1 (16.7).
+- C24: T1 blocks on any halt row of either mode (D5.4) and on KILL, never on day_state flags
+  alone; a constraint hit that "cannot fire if the parts agree" alerts as a bug. 6d-2: halt rows
+  of both modes, KILL, the sentinel and the latch; plus each mode's sticky streak halt (stricter).
+- C25 (P risk n3): if a KILL or halt write fails: the latch holds, the sentinel still stops orders,
+  the owner is alerted outside the database, the KILL command exits the bot. 6d-2: the latch, the
+  sentinel read in T1 and in T2 for buys, `AlertSink`. The KILL command is cli (Phase 7).
+- C26 (P risk n4): a clock behind the newest audit row alerts and never blocks a write; tested
+  with an audit row at the largest timestamp. 6d-3 (16.6 step 6; alert only, 16.11 D2).
+- C27: the code is the gate for times (`nextVersion`, `eventTime`). 6e (config) and T3 (ledger).
+- C28: 6e fixes the order of a halt and its audit row. 6e. 6d's `persistHaltTx` uses repo-flags
+  `setHalt`, which already writes the audit row first.
+- C29: T3 books at max(now, opened_at); one settlement per order. T3.
+- C30: Phase 3: BIP39 and the filter's input cap. Phase 3.
+- C31 (s.12.1, JSON): a filter refusal on the exit path alerts as a bug. 6d-2 (16.5.6).
+
+From s.13.1 (review Q):
+- C32: no try/catch inside a transaction callback in app/; design the rule. 6d-2 (16.7.4).
+- C33 (Q risk 4): the low-equity stop is derived from equity on every tick. Moves to 6e: only the
+  equity observation (`observeDayTx`) sees fully valued equity; T1 reads `entries_stopped` as stored.
+- C34 (Q risk 3): `pruneBans` runs only while the clock guard is healthy. Moves to whoever
+  schedules pruning (6e or the scheduler). 6d never prunes; T1's `activeBans(now)` ignores ended
+  rows, so a row left unpruned changes nothing.
+- C35 (Q risk 8): at start-up, `kill_audit_id` and every `set_audit_id` are at most the newest id
+  and name an engine row of the matching action. 6d-3 (16.6 step 7), also checking the row's
+  detail (the KILL source, the halt reason).
+- C36 (Q security 6): anchor the chain's tail. 6d-3: the anchor file, logged at boot and compared
+  (16.6 step 6). "Put it in each backup" moves to the ops backup step (no backup exists yet).
+- C37 (Q risk 5, 6, N1; Q security 1b; ALTER): Phase 3, Phase 8 and before migration 2. Unchanged.
+
+From s.14.1 (review R): all of these need the equity observation, which is 6e's `observeDayTx`
+(s.1 puts day-tx.ts in 6e), so they move to 6e:
+- C38: `observeDayTx` with `snapshotNear`, `writeDayState`, a snapshot and pruning, one write per
+  step, `at` the observation's own clock reading. 6e.
+- C39 (R re-check risk 2): a test that the next accepted observation sets a reset baseline again.
+  6e (the first observation after the setup is that case today); the transfer half is Phase 8.
+- C40 (R re-check risk 3): a `writeDayState` refusal becomes `day-state-error:<mode>` and an
+  alert, never a retry with an edited state. 6e. 6d supplies `persistHaltTx` for it.
+- C41 (R risk 6): jump verification keeps running while halted, or a server confirm command. 6e
+  (`confirmJumpTx`) and Phase 7 (cli).
+- C42 (R risk 7, security 5): `snapshotNear` only at or before now; an alert when the base is far
+  from an hour ago; `insertSnapshot` refuses an `at` beyond the run's now. 6e (both are called only
+  by `observeDayTx`).
+- C43 (R risk 5): the live peak rebase with the 24 h wait. Phase 8.
+
+From s.15 and review S:
+- C44 (s.15.18; S security 4): app/token-store.ts is the only importer of repo-redeem.ts; its
+  `consume` passes `canonicalPlan(snapshot.plan)` and the clock's now. 6d-1 (16.5.5).
+- C45 (s.15.18): T1 passes `canonicalPlan` of the checked plan to `insertApproval`. 6d-2.
+- C46 (s.15.8): `recordRefusalTx` writes `inputs: {}` and the error code. 6d-2 (16.5.4).
+- C47 (s.15.18; S security on decision 5): the slot of an error decision is 0 (null) only when it
+  was unknown. 6d-2: T1 keeps the slot it read; null is passed only for `slot-unknown` and errors
+  before the read.
+- C48 (s.15.18; S risk 2): the boot reads both accounts, rebuilds each ledger from `readBook`, runs
+  `checkConservation`, and abandons stale openings at max(now, openedAt), but an abandon after a
+  failed or expired buy needs that order's settlement (T3). 6d-3 abandons only openings with no buy
+  order at all; 6d-2's `abandonOpeningTx` refuses any position that has a buy order, whatever its
+  status, until T3 (stricter than repo-book.ts, which allows failed and expired).
+- C49 (D7; S risk 4): the day-state policy's paper bankroll is the stored deposit. 6d-2:
+  `dayPolicyOf` in app/caps.ts (used by 6e's `observeDayTx`), plus boot checks of the paper account.
+- C50 (S risk 6): T1 passes `insertOpening` the exact `newPositionP95ExitCost` approveBuy used,
+  tested; refusing 0 is optional. 6d-2: read once, passed to both, and refused below the
+  5,000-lamport base fee (stricter).
+- C51 (S risk 3b): T1 exit counts unused, unexpired exit approvals as in flight. 6d-2 (new reader).
+  Part (a) (the landed move and settlement) is T3.
+- C52 (S risk 2, 3a; s.15.15): settlement, order status moves, landed-but-unbooked sells. T3.
+- C53 (s.15.12): alert when `exit_seq` reaches 10,000. 6d-2.
+- C54 (s.3.2; s.15.1): `exitIntentId` in app/, never from the caller. 6d-2.
+- C55 (s.3.2): the exit fee-budget inputs from `positions.failed_fees` against the hard budget
+  until T3. 6d-2 (16.5.2), flagged for T3.
+- C56 (s.15.4): a 'stuck' row still throws. No change; T1 refuses every entry then (fail closed).
+- C57 (s.10): Phase 8, T1 reads the intent mode's own SOL. 6d is paper only: T1 reads the paper
+  account and refuses any live path (16.5.1).
+
+From reviews L, M and N:
+- C58 (L risk 1, 2): warn when a setting is capped; a SOL backstop for the EUR caps. Before live
+  (STATUS.md). 6d's caps never exceed the hard values (16.4), so nothing is capped silently in paper.
+- C59 (L risk 4): a hard cap on attempts. The execution step.
+- C60 (M; RISK_POLICY s.12): `liveArmed` is the server's flag; pending rows by the guarded clock.
+  6e. In 6d `liveArmed` does not exist: paper only.
+- C61 (N risk 1, security 1; STATUS): the slot feed accepts a reading only when plausible against
+  the previous one and the time, or when two channels agree; anything else is unknown and alerts;
+  one wild slot does not stop exits. 6d-1 (16.7.3).
+- C62 (N risk 2): T1 reads the slot once for the re-check; app/slots.ts is a ratchet. 6d-1/2.
+- C63 (N risk 3): an alert when the slot stays unknown over 30 s while positions are open;
+  `maxAgeMs` at or below 25 slots. 6d-1: `unknownSinceMs()` and the 2 s bound; the health loop that
+  sends the alert is later, and the function is tested now.
+- C64 (N risk 4): at start-up the verifier's mode is the process mode, one authority per mode.
+  6d-3 (`startPaperEngine` creates exactly one paper authority and asserts both modes).
+- C65 (N security 2): the executor receives only the redeemer. 6d-3 (`PaperEngine.redeemer`).
+
+From ARCHITECTURE, RISK_POLICY and the decisions:
+- C66 (s.6): busy 3 times in 10 minutes means DISK_DB; disk full latches, tries the `disk-db` halt
+  and alerts outside the database. 6d-2 (16.5.6).
+- C67 (ARCHITECTURE s.4 (e)): paper orders still submitted at boot become failed. T3 and the status
+  writer. In 6d no order can leave 'approved'; the boot leaves such openings counted and alerts.
+- C68 (D6, RISK_POLICY s.7): the 15-minute wait after a halt lift or a KILL clear. 6d-2: T1 passes
+  `flags.halt_cleared_at` (which repo-server writes for both) as `haltClearedAt`.
+- C69 (contract 9): the policy mode comes from the same source as the authority's mode. 6d-2:
+  `dayPolicyOf` takes the engine's mode, never a caller's.
+
+### 16.3 Files
+
+New files. "Imported by" is the proposed `RESTRICTED_FILES` entry (runtime imports; types always
+fine). All are TypeScript with erasable syntax only (no parameter properties, no enums).
+
+| File | Sub-step | Exports | Imports (runtime) | Imported by |
+|---|---|---|---|---|
+| `core/encode.ts` | 6d-1 | `hexOf`, `base64Of`, `base64UrlOf`, `base58Of` (pure) | nothing | anyone (pure core) |
+| `core/rng.ts` | 6d-1 | `Rng`, `systemRng`, `newApprovalKey`, `keyFromBytes`, `newId`, `drawId`, `idFromBytes`, `RngError` | `node:crypto` (`randomBytes` only), `core/encode.ts`, `core/redact.ts`, `core/ids.ts` | app/ and cli/ only (new entry); pure code types only (existing rule) |
+| `app/faults.ts` | 6d-1 | `AppError`, `AppErrorCode`, `classify`, `Fault`, `createEntryLatch`, `EntryLatch`, `createFaultSink`, `FaultSink`, `AlertSink`, `Alert` | `storage/sqlite.ts` (StorageError), `risk/reserve.ts` (RiskError), `core/units.ts`, `core/redact.ts`, `portfolio/ledger.ts` (LedgerError) | app/ (not restricted) |
+| `app/slots.ts` | 6d-1 | `createSlotFeed`, `SlotFeed`, `SlotFeedOptions`, `SLOT_FEED_DEFAULTS`, `Clock` | `core/time.ts` | app/ (not restricted) |
+| `app/token-store.ts` | 6d-1 | `createSqliteTokenStore` | `storage/repo-redeem.ts`, `risk/plan.ts` (`canonicalPlan`), `app/faults.ts` | `app/authority.ts` only (existing entry) |
+| `app/authority.ts` | 6d-1 | `createEngineAuthority`, `EngineAuthority` | `risk/approval.ts` (the factory), `app/token-store.ts`, `core/redact.ts`, `config/caps.ts` | `app/engine.ts` only (new entry) |
+| `app/caps.ts` | 6d-2 | `buyCapsOf`, `exitPlanCapsOf`, `dayPolicyOf`, `FAILED_FEE_BUDGET`, `MIN_TRADE_LAMPORTS`, `ALLOWED_ROUTES`, `MARK_POLICY` | `config/caps.ts`, `risk/reserve.ts`, `core/units.ts` | app/ (not restricted) |
+| `app/snapshot.ts` | 6d-2 | `readActiveConfig`, `readBuySnapshot`, `ledgerOf`, `BuySnapshot` | `storage/repo-flags.ts`, `repo-book.ts`, `repo-day.ts`, `repo-config.ts`, `config/tunables.ts`, `risk/daystate.ts`, `portfolio/equity.ts`, `core/day.ts`, `app/caps.ts` | app/ (not restricted) |
+| `app/approve-tx.ts` | 6d-2 | `approveBuyTx`, `approveExitTx`, `abandonOpeningTx`, `recordRefusalTx`, `persistKillTx`, `persistHaltTx`, `entryIntentId`, `exitIntentId`, `peekExitIntent`, the request, outcome and `EngineDeps` types | `storage/repo-orders.ts`, `repo-book.ts`, `repo-flags.ts`, `risk/approve.ts`, `risk/plan.ts`, `app/snapshot.ts`, `app/caps.ts`, `app/faults.ts`, `node:crypto` (`createHash`) | app/ (not restricted; the engine loop will be app/ code) |
+| `app/run-files.ts` | 6d-3 | `createKillSentinel`, `createAnchorFile`, `KillSentinel`, `AnchorStore`, `AuditAnchor` | `node:fs`, `node:path` | app/ (not restricted) |
+| `app/storage-boot.ts` | 6d-3 | `bootStorage`, `BootOptions`, `BootReport`, `BootRefusal`, `checkDataPath`, `FsProbe` | `storage/sqlite.ts`, `migrations.ts`, `repo-audit.ts`, `repo-flags.ts`, `repo-book.ts`, `repo-day.ts`, `repo-config.ts`, `repo-orders.ts`, `portfolio/ledger.ts`, `config/tunables.ts`, `app/approve-tx.ts`, `app/snapshot.ts`, `app/faults.ts`, `node:fs`, `node:path` | `app/engine.ts` only (new entry) |
+| `app/engine.ts` | 6d-3 | `startPaperEngine`, `PaperEngine`, `PaperEngineOptions` | `app/storage-boot.ts`, `app/authority.ts`, `app/slots.ts`, `app/faults.ts`, `app/run-files.ts`, `core/rng.ts` | `cli/` only (new entry) |
+
+s.1 listed `slots.ts`, `snapshot.ts`, `approve-tx.ts`, `token-store.ts`, `authority.ts` and
+`storage-boot.ts`. The four extra app/ files each hold one job the plan left without a home:
+`faults.ts` (the error rules and the latch, used by T1 and T2), `caps.ts` (tunables to caps, D7),
+`run-files.ts` (the two small run files), `engine.ts` (the one place the authority is made, C64).
+`core/encode.ts` exists so the registry has no hand-rolled encoders hidden inside redact.ts.
+
+Changes to existing files (each needed by a condition; nothing else changes):
+- `core/redact.ts` (C21): `registerOwnSecret`, the kind `'own-secret'`, the registry (16.7.2).
+- `storage/repo-audit.ts` (C26, C35, C36), read-only: `ChainCheck.newestAt`, and
+  `readAuditRow(r, id)` with the constant SQL `SELECT id, at, actor, action, detail_json, hash FROM
+  audit_log WHERE id = ?`. Its pinned exports gain `readAuditRow`.
+- `storage/repo-orders.ts` (C51), read-only: `outstandingExitApprovals(r, positionId, slot)` with
+  `SELECT count(*) AS n FROM approvals WHERE position_id = ? AND kind IN ('sell', 'close-account')
+  AND consumed_at IS NULL AND expires_at_slot >= ?`. Its pinned exports gain it.
+- `tests/architecture/import-graph.test.ts` (C21-C23, C32, C2): 16.7.4.
+- `tests/tools/check-coverage.ts`: the gate covers app/, core/rng.ts and core/encode.ts.
+- No change to risk/, portfolio/, config/, other core/ files, other storage/ files or migration 1.
+
+### 16.4 Interfaces and types
+
+```ts
+// app/slots.ts
+export interface Clock { now(): number }                       // UTC ms; the guarded clock comes with contract 8
+export type SlotChannel = 'stream' | 'http' | 'http-2';        // http-2: a second provider (Phase 8)
+export interface SlotFeedOptions {
+  readonly clock: Clock;
+  readonly maxAgeMs: number;          // 2_000 (16.7.3); at most MAX_SLOT_AGE_MS = 2_500
+  readonly maxSlotsPerSecond: number; // 10 (measured ~4.7, VERIFIED_FACTS s.4); 1 to 50
+  readonly toleranceSlots: number;    // 150 (the DATA_STALE "150 slots behind" figure)
+  readonly agreeSlots: number;        // 150: two channels agree within this
+  readonly alerts: AlertSink;
+}
+export interface SlotFeed extends SlotSource {   // SlotSource of risk/approval.ts
+  /** Never throws; an implausible or malformed reading is ignored and counted. */
+  report(channel: SlotChannel, slot: unknown): void;
+  /** When currentSlot() last turned null, or null while it is known (review N risk 3). */
+  unknownSinceMs(): number | null;
+}
+export function createSlotFeed(options: SlotFeedOptions): SlotFeed;
+
+// core/rng.ts
+export interface Rng {
+  approvalKey(): Uint8Array;   // 32 bytes, a new array each call
+  tokenId(): string;           // 'tk_' + 32 hex
+  positionId(): string;        // 'ps_' + 32 hex
+  orderId(): string;           // 'or_' + 32 hex
+}
+export type IdKind = 'token' | 'position' | 'order';
+export class RngError extends Error { readonly code: 'rng-zero-key' | 'rng-filter' }
+export function newApprovalKey(): Uint8Array;
+export function keyFromBytes(bytes: Uint8Array): Uint8Array | null; // null: not 32 bytes, or all zero (tests use it)
+export function newId(kind: IdKind): string;                     // = drawId(kind, () => randomBytes(16))
+export function drawId(kind: IdKind, nextBytes: () => Uint8Array): string; // at most 8 draws, then RngError
+export function idFromBytes(kind: IdKind, bytes: Uint8Array): string | null; // null: the filter refused it
+export const systemRng: Rng;
+
+// app/faults.ts
+export type AppErrorCode =
+  | 'slot-unknown' | 'rent-unknown' | 'p95-below-base-fee' | 'entry-count-mismatch'
+  | 'abandon-needs-settlement' | 'entries-latched' | 'live-not-built' | 'bad-request'
+  | 'stale-opening-has-order';
+export class AppError extends Error { readonly code: AppErrorCode }
+export type FaultScope = 'intent' | 'latch' | 'fatal';
+export interface Fault {
+  /** The fixed code stored and alerted, e.g. 'error:storage-full': codeParam's form, never a message. */
+  readonly code: string;
+  readonly scope: FaultScope;
+  readonly bug: boolean;           // "cannot happen if the parts agree": alert as a bug
+  readonly busy: boolean;
+}
+export function classify(e: unknown): Fault;    // total: unknown throwables are 'error:unexpected', latch, bug
+export type LatchReason = 'storage' | 'storage-busy' | 'refusal-write-failed' | 'kill-write-failed'
+  | 'halt-write-failed' | 'bug';
+export interface EntryLatch {
+  /** Entries blocked before the database is touched (storage-class faults). Sticky until restart. */
+  set(reason: LatchReason): void;
+  blocked(): readonly LatchReason[];
+  /** KILL seen anywhere (flag, sentinel, a failed KILL write). Sticky until restart; T1 records it as 'kill'. */
+  markKill(): void;
+  killSeen(): boolean;
+}
+export function createEntryLatch(): EntryLatch;
+export type AlertSeverity = 'info' | 'warn' | 'bug' | 'fatal';
+export interface Alert { readonly code: string; readonly severity: AlertSeverity; readonly codes?: readonly string[] }
+export interface AlertSink { alert(a: Alert): void }    // outside the database (Telegram later); never throws
+export type FaultSite = 't1-buy' | 't1-exit' | 't2' | 'abandon' | 'refusal' | 'kill' | 'halt' | 'boot';
+export interface FaultSink { report(site: FaultSite, f: Fault): void }
+export function createFaultSink(o: { latch: EntryLatch; alerts: AlertSink; clock: Clock;
+  onFatal: (code: string) => void; onBusyStorm: () => void }): FaultSink;
+
+// app/caps.ts
+export const MIN_TRADE_LAMPORTS: Lamports;        // 20_000_000n: RISK_POLICY limit 15 (P); the server file later
+export const ALLOWED_ROUTES: readonly Route[];    // ['direct', 'jupiter-build']: never Jupiter /order (its fee)
+export const FAILED_FEE_BUDGET: Lamports;         // 9 x 3 x attemptCost(exit caps, no tip) = 3_375_000n
+export const MARK_POLICY: EquityPolicy;           // portfolio/equity.ts: staleAfterMs 30_000 (HARD markStaleMs), stopZeroAfterMs 300_000
+export function buyCapsOf(t: Tunables, wsolHelperRent: Lamports): BuyCaps;   // liveSol always null (paper)
+export function exitPlanCapsOf(t: Tunables): PlanCaps;
+export function dayPolicyOf(mode: 'paper', t: Tunables, paper: StoredAccount): EquityPolicy;
+
+// app/snapshot.ts
+export interface ActiveConfig { readonly versionId: number; readonly tunables: Tunables }
+export function readActiveConfig(r: Reader): ActiveConfig;   // newest version, decodeTunables; v1 required
+export interface BuySnapshot {
+  readonly world: BuyWorld;      // risk/approve.ts
+  readonly caps: BuyCaps;
+  readonly configVersion: number;
+  readonly day: string;          // athensDay(now)
+}
+export function readBuySnapshot(tx: Tx, s: { readonly now: number; readonly slot: bigint;
+  readonly mode: 'paper'; readonly marks: ReadonlyMap<string, Mark>; readonly breakers: readonly BreakerState[];
+  readonly wsolHelperRent: Lamports; readonly killSeen: boolean }): BuySnapshot;
+export function ledgerOf(book: StoredBook): Ledger;   // settledOrders empty until T3
+
+// app/approve-tx.ts
+export interface MarkReader { marks(): ReadonlyMap<string, Mark> }    // the exit loop's cache, keyed by position id
+export interface RentSource { wsolHelperRent(): Lamports | null }    // getMinimumBalanceForRentExemption(165), cached
+export interface BreakerSource { breakers(): readonly BreakerState[] } // in memory (s.0: no breakers table)
+export interface PaperIdentity {                                      // paper: fixed placeholder ids, never a key
+  readonly wallet: string;
+  readonly wsolMint: string;
+  tokenAccountOf(mint: string): string;
+}
+export interface EngineDeps {
+  readonly mode: 'paper';
+  readonly db: Db;
+  readonly clock: Clock;
+  readonly slots: SlotSource;        // the same SlotFeed bound into the authority
+  readonly issuer: ApprovalIssuer;   // from app/authority.ts
+  readonly marks: MarkReader;
+  readonly rent: RentSource;
+  readonly breakers: BreakerSource;
+  readonly identity: PaperIdentity;
+  readonly sentinel: KillSentinel;
+  readonly anchors: AnchorStore;
+  readonly latch: EntryLatch;
+  readonly faults: FaultSink;
+  readonly alerts: AlertSink;
+}
+/** What a strategy asks for (Phase 4 makes it); app derives the intent id and fills the identity. */
+export interface EntryRequest {
+  readonly strategy: StrategyId;
+  readonly mode: 'paper';
+  readonly mint: string;
+  readonly creator: string | null;     // to the entry blocks only; never stored (s.15.16 question 2)
+  readonly sizeHint: 'min' | 'normal';
+  readonly windowStartMs: number;      // the strategy's signal window: one entry per (strategy, mint, window)
+  readonly positionId: string;         // from the engine's Rng, before the plan is built
+  readonly confidenceBps: number | null;
+  readonly inputsAsOf: number | null;
+  readonly reasons: readonly string[]; // 1-16 codes
+  readonly inputs: IntentInputs;       // repo-orders.ts form
+  readonly plan: OrderPlan;            // untrusted
+  readonly market: Omit<BuyMarket, 'wallet' | 'ownTokenAccount' | 'wsolMint'>;  // the engine's own read
+}
+export type EntryOutcome =
+  | { readonly kind: 'approved'; readonly intentId: string; readonly positionId: string;
+      readonly token: ApprovalToken; readonly plan: CheckedPlan }
+  | { readonly kind: 'refused'; readonly intentId: string; readonly stage: 'blocked' | 'sizing' | 'plan';
+      readonly reasons: readonly string[] }
+  | { readonly kind: 'duplicate'; readonly intentId: string }       // nothing written
+  | { readonly kind: 'not-run'; readonly latched: readonly LatchReason[] }  // nothing written, the DB not touched
+  | { readonly kind: 'error'; readonly code: string; readonly scope: FaultScope; readonly recorded: boolean };
+export function approveBuyTx(deps: EngineDeps, req: EntryRequest): EntryOutcome;
+
+export type ExitOrigin6d = { readonly kind: 'automatic'; readonly sellSimPassed: boolean };
+export interface ExitMarket {
+  readonly quote: QuoteContext; readonly quotedOut: bigint; readonly pool: ApprovedPool;
+  readonly attemptsAllowed: number; readonly simulatedCu: number | null;
+}
+export interface ExitRequest {
+  readonly positionId: string;
+  readonly fractionBps: number;
+  readonly urgency: PlanUrgency;
+  readonly reasons: readonly string[];
+  readonly inputs: IntentInputs;
+  readonly inputsAsOf: number | null;
+  readonly origin: ExitOrigin6d;       // the owner's /sell and /panic come with Phase 3 (16.11 D7)
+  readonly plan: OrderPlan;            // untrusted; built for peekExitIntent's intent id
+  readonly market: ExitMarket;
+}
+export type ExitOutcome =
+  | { readonly kind: 'approved'; readonly intentId: string; readonly exitSeq: number;
+      readonly token: ApprovalToken; readonly plan: CheckedPlan }
+  | { readonly kind: 'refused'; readonly intentId: string; readonly exitSeq: number; readonly problems: readonly string[] }
+  | { readonly kind: 'error'; readonly code: string; readonly scope: FaultScope; readonly recorded: boolean };
+export function approveExitTx(deps: EngineDeps, req: ExitRequest): ExitOutcome;
+export function peekExitIntent(deps: EngineDeps, positionId: string): { readonly intentId: string; readonly exitSeq: number };
+
+/** What the small writes need: the boot calls them before the issuer exists. */
+export type StoreDeps = Pick<EngineDeps, 'db' | 'clock' | 'latch' | 'faults' | 'alerts' | 'anchors'>;
+export type AbandonOutcome = { readonly kind: 'abandoned'; readonly at: number } | { readonly kind: 'error'; readonly code: string };
+export function abandonOpeningTx(deps: StoreDeps, positionId: string): AbandonOutcome;
+
+export type RefusalSubject =
+  | { readonly kind: 'entry'; readonly req: EntryRequest }
+  | { readonly kind: 'exit'; readonly req: ExitRequest };
+export function recordRefusalTx(deps: EngineDeps, s: RefusalSubject, code: string, slot: bigint | null): 'recorded' | 'duplicate' | 'failed';
+export function persistKillTx(deps: StoreDeps, source: 'sentinel' | 'cli'): 'set' | 'already' | 'failed';
+export function persistHaltTx(deps: StoreDeps, reason: string): 'set' | 'already' | 'failed';
+export function entryIntentId(strategy: StrategyId, mint: string, windowStartMs: number): string; // 'en_' + 40 hex
+export function exitIntentId(positionId: string, exitSeq: number): string;                       // 'ex_' + 40 hex
+
+// app/token-store.ts
+export function createSqliteTokenStore(db: Db, clock: Clock, faults: FaultSink, latch: EntryLatch, sentinel: KillSentinel): TokenStore;
+
+// app/authority.ts
+export interface EngineAuthority { readonly issuer: ApprovalIssuer; readonly redeemer: ApprovalRedeemer; readonly mode: 'paper' }
+export function createEngineAuthority(o: { readonly db: Db; readonly clock: Clock; readonly slots: SlotSource;
+  readonly rng: Rng; readonly faults: FaultSink; readonly latch: EntryLatch; readonly sentinel: KillSentinel }): EngineAuthority;
+
+// app/run-files.ts
+export interface KillSentinel { present(): boolean }        // any error but ENOENT reads as present (fail closed)
+export interface AuditAnchor { readonly id: number; readonly hash: string; readonly at: number }
+export interface AnchorStore { read(): AuditAnchor | null; write(a: AuditAnchor): void }  // read: malformed throws
+export function createKillSentinel(runDir: string): KillSentinel;   // <runDir>/KILL
+export function createAnchorFile(runDir: string): AnchorStore;      // <runDir>/audit-anchor.json, 0600, write-then-rename
+
+// app/storage-boot.ts
+export interface FsProbe {                         // node:fs in the bot; fakes in tests (Windows cases on Linux)
+  lstat(p: string): { readonly isSymbolicLink: boolean; readonly isDirectory: boolean; readonly mode: number; readonly uid: number } | null;
+  realpath(p: string): string;
+  fsType(p: string): number | null;                // statfsSync(p).type on Linux; null elsewhere
+  chmod(p: string, mode: number): void;
+}
+export interface BootOptions {
+  readonly dataDir: string;                        // absolute
+  readonly dbFile: string;                         // inside dataDir, e.g. 'fomo.sqlite'
+  readonly copyDir: string;                        // inside dataDir: pre-migration copies ('db-copies')
+  readonly runDir: string;                         // inside dataDir: 'run'
+  readonly platform: string;                       // process.platform
+  readonly uid: number | null;                     // process.getuid?.() ?? null
+  readonly windows: { readonly userProfile: string | null; readonly oneDriveRoots: readonly string[] };
+  readonly nodeVersion: string;
+  readonly busyTimeoutMs: number;                  // 5_000
+  readonly clock: Clock;
+  readonly fs: FsProbe;
+  readonly runLock: { readonly held: true };       // the ops step's lock; a test passes { held: true }
+  readonly sentinel: KillSentinel;
+  readonly anchors: AnchorStore;
+  readonly alerts: AlertSink;
+}
+export type BootRefusal =
+  | 'runtime-not-frozen' | 'path' | 'open' | 'health' | 'migrations' | 'required-rows' | 'config'
+  | 'audit-chain' | 'audit-anchor' | 'kill-link' | 'halt-link' | 'book' | 'conservation'
+  | 'paper-account' | 'live-account' | 'abandon';
+export class BootError extends Error { readonly refusal: BootRefusal; readonly code: string }
+export interface BootReport {
+  readonly schemaVersion: number;
+  readonly auditNewestId: number;
+  readonly auditNewestHash: string;
+  readonly killOn: boolean;
+  readonly halts: readonly string[];
+  readonly abandoned: readonly string[];        // position ids
+  readonly openingsWithOrders: readonly string[];
+  readonly warnings: readonly string[];          // codes: 'no-audit-anchor', 'clock-behind-audit', ...
+}
+/** The latch the boot made (KILL already marked when it is on); the engine keeps using it. */
+export function bootStorage(o: BootOptions): { readonly db: Db; readonly report: BootReport; readonly latch: EntryLatch };
+
+// app/engine.ts
+export interface PaperEngineOptions {
+  readonly boot: Omit<BootOptions, 'clock' | 'alerts' | 'sentinel' | 'anchors'>;
+  readonly clock: Clock;
+  readonly rng: Rng;
+  readonly alerts: AlertSink;
+  readonly marks: MarkReader;
+  readonly rent: RentSource;
+  readonly breakers: BreakerSource;
+  readonly identity: PaperIdentity;
+  readonly slotOptions: Omit<SlotFeedOptions, 'clock' | 'alerts'>;
+  readonly onFatal: (code: string) => void;
+}
+export interface PaperEngine {
+  readonly deps: EngineDeps;           // for the app/ transactions
+  readonly redeemer: ApprovalRedeemer; // for the executor: redeem only (review N security 2)
+  readonly slotFeed: SlotFeed;         // chain clients report here (later)
+  readonly ids: { positionId(): string; orderId(): string };
+  readonly report: BootReport;
+  close(): void;
+}
+export function startPaperEngine(o: PaperEngineOptions): PaperEngine;
+```
+
+`app/caps.ts`, exactly (every number at or inside its hard value, so no clamp ever bites in paper):
+- `buyCapsOf(t, rent)`:
+  - sizing: `perTradeBps = t.risk.tradePctBps`, `maxPositionLamports = HARD positionLamports`,
+    `exposureBps = t.risk.exposurePctBps`, `maxExposureLamports = HARD exposureLamports`,
+    `launchShareBps = HARD launchShareOfExposureCapBps`, `poolShareBps = t.risk.poolShareBps`,
+    `minTradeLamports = MIN_TRADE_LAMPORTS`, `minTradeFloorLamports = HARD minTradeFloorLamports`;
+  - reserve: `baseFeePerSignature = BASE_FEE_PER_SIGNATURE`, `exitSignatures = 1`,
+    `exitCuPriceMax = HARD exitCuPriceMicroLamports`, `cuLimitMax = HARD cuLimit`,
+    `retryWindows`, `attemptsPerWindow`, `reserveFloor`, `p95Multiplier` at their HARD values,
+    `landedTipMax` = the largest HARD tip, `wsolHelperRent = rent` (the argument, never a constant);
+  - plan: `exitPlanCapsOf(t)` with `buySlippageMaxBps = t.risk.buySlippageBps`;
+  - `liveSol: null`.
+- `exitPlanCapsOf(t)`: `planFreshSlots = HARD 25`, `exitSlippageNormalBps = t.risk.sellSlippageBps`,
+  `exitSlippageEmergencyBps = HARD 1_000`, `cuLimitMax = HARD`, both CU prices HARD,
+  `landingSpendBuyBps = landingSpendExitBps = t.risk.landingSpendBps` (RISK_POLICY limit 18 gives
+  one P value for buys and normal exits; stricter than the exit H of 0.6%), `allowedRoutes =
+  ALLOWED_ROUTES`.
+- `FAILED_FEE_BUDGET = HARD exitBudgetWindows x HARD exitAttemptsPerWindow x attemptCost({
+  signatures: 1, cuPrice: HARD exitCuPrice, cuLimit: HARD cuLimit, tip: 0 }, BASE_FEE)` =
+  3,375,000. It is not `positionExitBudget` (3,380,000), which only the reserve uses (C2).
+- `dayPolicyOf('paper', t, paper)` (D7, contract 9): refuses (AppError `bad-request`) unless
+  `paper.totalWithdrawals === 0` and `1 <= paper.totalDeposits <= HARD equitySanityLamports`; then
+  `{ mode: 'paper', dailyStopBps: t.risk.dailyStopBps, peakHaltBps: t.risk.peakHaltBps,
+  sanityMaxLamports: HARD equitySanityLamports, bankrollLamports: paper.totalDeposits,
+  sanityBankrollMultiple: HARD equitySanityBankrollMultiple, jumpBps: HARD equityJumpBps }`. Its
+  type takes only 'paper': a live policy is a Phase 8 change.
+
+### 16.5 The transactions, step by step
+
+Shared rules:
+- Each is one `deps.db.transaction` (BEGIN IMMEDIATE). Phase R (reads and pure calls) runs to the
+  end before phase W (writes) starts. Any throw rolls everything back.
+- The callback is an inline arrow with no try/catch (16.7.4). Errors are caught only around the
+  whole `db.transaction(...)` call, after the rollback, and classified there (16.5.6).
+- Every outside value is read once into a local before BEGIN (requests, the sentinel, the rent,
+  the marks map, the breakers list). Inside, only the clock and the slot are read, once each.
+- Alerts, anchor writes and replies happen after COMMIT.
+
+#### 16.5.1 `approveBuyTx(deps, req)`
+
+Before BEGIN (no database):
+1. `deps.latch.blocked()` non-empty: return `not-run` (nothing written; the caller logs it).
+2. `deps.sentinel.present()`: `latch.markKill()`, then `persistKillTx(deps, 'sentinel')` (its own
+   transaction; `failed` latches `kill-write-failed` and alerts). Then go on: T1 records the
+   refusal as `blocked: kill`.
+3. `req.mode !== 'paper'` throws `live-not-built` (caught below and recorded by `recordRefusalTx`).
+4. Read once: `intentId = entryIntentId(req.strategy, req.mint, req.windowStartMs)`, the plan
+   object, the market fields, `p95 = market.newPositionP95ExitCost`, `rent =
+   deps.rent.wsolHelperRent()`, `marks = deps.marks.marks()`, `breakers = deps.breakers.breakers()`.
+   `rent === null` throws `rent-unknown`; `p95 < 5_000n` throws `p95-below-base-fee` (both are
+   caught below and recorded).
+
+Inside the transaction, phase R:
+1. `now = clock.now()`; `slot = slots.currentSlot()` (kept in an outer `let` for the refusal);
+   null throws `slot-unknown`.
+2. `repoOrders.intentExists(tx, intentId)`: return `duplicate` (nothing written).
+3. `snap = readBuySnapshot(tx, { now, slot, mode, marks, breakers, wsolHelperRent: rent, killSeen:
+   latch.killSeen() })`, which reads, all inside this transaction:
+   - `readFlags`, `readHalts`, `readModes`, `activeBans(now)`, `entriesOn(athensDay(now))`;
+   - `readDayState(paper)` and `readDayState(live)`;
+   - `readAccount(paper)` and `readAccount(live)` (both required; a missing one is `row-missing`);
+   - `readActivePositions` (both modes: the cap and one-per-mint are global; 'stuck' throws);
+   - `readActiveConfig` (version 1 required; `decodeTunables` of the newest).
+   It builds:
+   - `EntryFlags`: `kill = flags.kill !== null || killSeen`; `haltReasons` = every halt row, plus
+     `daily-stop-twice:<m>` for each mode whose day state has `streakHalt` (D5.4, stricter), sorted
+     and unique; `haltClearedAt = flags.haltClearedAt` (D6 too); `paused = flags.pausedAt !== null`;
+     `dailyStop = dailyStopActive(dayState[mode], now)`; `entriesStopped = flags.entriesStopped`;
+     `equityJumpPending = dayState[mode].jumpPending`; `modes` from the mode rows; `breakers`;
+     cooldowns, pauses and bans from `activeBans`; `entriesToday`; `entriesPerDay =
+     t.risk.entriesPerDay`; `maxPositions = t.risk.openPositions`.
+   - `positions`: an opening row as `{ status: 'opening', maxSpend }` (null max_spend is a
+     `bad-cell` already); open and exiting rows as `{ value }` = the fresh mark's value, else 0
+     (equity is then null, which blocks the entry first).
+   - `equity.current` = `valueEquity(ledgerOf(account + this mode's active positions), marks, now,
+     MARK_POLICY).equity`; `equity.dayStart = dayState[mode].dayStart`.
+   - `walletSol = account(mode).sol` (paper: the ledger; live is refused before this).
+   - `caps = buyCapsOf(t, rent)`; `configVersion`; `day`.
+4. `market = { ...req.market fields read in step 4, wallet, ownTokenAccount =
+   identity.tokenAccountOf(req.mint), wsolMint }` from `deps.identity`, never from the request.
+5. `decision = approveBuy({ intent: { strategy, mode, mint, creator, sizeHint, positionId,
+   intentId }, plan, world: snap.world, market, caps: snap.caps }, deps.issuer)`. Pure; it throws
+   on malformed input; the token is issued last, inside it.
+6. If approved: `planText = canonicalPlan(decision.plan)`.
+
+Phase W, in this order (s.15.10):
+- approved:
+  1. `insertEntryIntent(tx, { id: intentId, mode, strategy, mint, positionId, sizeHint,
+     confidenceBps, createdAt: now, inputsAsOf, reasons, inputs })`;
+  2. `insertOpening(tx, decision.opening, p95)` (the same local `p95` approveBuy got: C50);
+  3. `n = countEntry(tx, snap.day)`; `n !== decision.entriesToday` throws `entry-count-mismatch`
+     (a bug: the count changed inside one BEGIN IMMEDIATE);
+  4. `insertDecision(tx, { outcome: 'entry-approved', intentId, at: now, configVersion, slot, size,
+     limitedBy, binding })`;
+  5. `insertApproval(tx, decision.token, planText, now)`.
+- refused: `insertEntryIntent` as above, then `insertDecision(tx, { outcome: 'refused', stage,
+  reasons, slot, ... })`.
+
+After COMMIT: if the snapshot saw `flags.kill` set, `latch.markKill()` (so T2 refuses buy tokens
+issued before it); return `approved` with the token and the plan, or `refused`.
+
+On a throw (outside the callback): `f = classify(e)`; `deps.faults.report('t1-buy', f)`; unless
+`f.busy`, `recordRefusalTx(deps, { kind: 'entry', req }, f.code, slotRead)` (slot null only when it
+was not read or unknown, C47); return `error` with `recorded` true when it answered `recorded`.
+
+```mermaid
+sequenceDiagram
+  participant Eng as Engine (caller)
+  participant App as app/approve-tx
+  participant L as latch, sentinel (memory)
+  participant DB as SQLite
+  participant Risk as risk/approveBuy (pure)
+  Eng->>App: approveBuyTx(deps, req)
+  App->>L: latched? sentinel present?
+  alt latched
+    App-->>Eng: not-run (nothing written)
+  end
+  App->>DB: BEGIN IMMEDIATE
+  App->>DB: R: intent exists? flags, halts, modes, bans, count, day states, accounts, active positions, config
+  App->>Risk: approveBuy(world, market with identity, caps with chain rent, issuer)
+  Risk-->>App: decision (token issued last)
+  App->>DB: W: intent, then position, count, decision, approval (approved) or decision (refused)
+  App->>DB: COMMIT
+  Note over App,DB: any throw: ROLLBACK; classify; recordRefusalTx in a second transaction
+  App-->>Eng: outcome (token only after COMMIT)
+```
+
+#### 16.5.2 `approveExitTx(deps, req)`
+
+No latch, no sentinel and no flag is read: a valid reduce-only exit is always approved (s.9). A
+poisoned handle still stops it (D5.2).
+
+Before BEGIN: read the request once; `req.origin.kind !== 'automatic'` throws `bad-request`.
+
+Phase R:
+1. `now`, `slot` (null throws `slot-unknown`).
+2. `p = readPosition(tx, positionId)` (missing: `row-missing`; stuck: `bad-cell`).
+3. `seq = p.exitSeq`; `intentId = exitIntentId(positionId, seq)` (C54).
+4. `inflight = exitsInFlight(tx, positionId)`; `outstanding = outstandingExitApprovals(tx,
+   positionId, slot)` (C51).
+5. `{ versionId, tunables } = readActiveConfig(tx)`; `caps = exitPlanCapsOf(tunables)`.
+6. The origin (C55, until T3): `budgetLeft = max(0, FAILED_FEE_BUDGET - p.failedFees)`;
+   `automaticStopped = budgetLeft === 0n`; `sellSimPassed` from the request. `failed_fees` is
+   cumulative over the position's life, so this budget never resets: stricter than s.3a's per-day
+   budget. The per-day budget and the 2-day stop arrive with T3's attempts and cost lines.
+7. `context: PlanContext = { currentSlot: slot, intentId, quote, position: { id, mint: p.mint, mode:
+   p.mode, status: p.status }, wallet: identity.wallet, ownTokenAccount:
+   identity.tokenAccountOf(p.mint), wsolMint: identity.wsolMint, pool, ledgerTokens: p.tokenUnits,
+   chainTokens: p.tokenUnits (paper; live from the reconciler), simulatedCu, caps, buy: null, exit: {
+   attemptsAllowed, urgency, costBasis: p.costBasis, quotedOut, inFlightSellTokens:
+   inflight.sellTokens, inFlightExits: inflight.count + outstanding, origin } }`.
+8. `decision = approveExit({ plan, context }, deps.issuer)`; if approved, `planText =
+   canonicalPlan(decision.plan)`.
+
+Phase W: `insertExitIntent(tx, { id: intentId, positionId, exitSeq: seq, fractionBps, urgency,
+createdAt: now, inputsAsOf, reasons, inputs })` (moves the number, then inserts); then
+`insertDecision` (`exit-approved` with the slot, or `refused` with stage `plan` and the reasons
+`plan:<problem>`); then, if approved, `insertApproval(tx, token, planText, now)`.
+
+After COMMIT: if `seq + 1 >= 10_000`, alert `exit-seq-high` (C53). On a throw: classify, report
+(`t1-exit`; a `bad-param` here also alerts as a bug, C31), and `recordRefusalTx` for the exit,
+which uses up the number with an `error` decision.
+
+`peekExitIntent(deps, positionId)` reads `readPosition` on the handle (an autocommit read) and
+returns `{ exitIntentId(id, exitSeq), exitSeq }` for the planner. It decides nothing: T1 re-reads
+the number, and a plan built for a stale number is refused `plan:wrong-intent` (and uses it up).
+
+#### 16.5.3 `abandonOpeningTx(deps, positionId)`
+
+Phase R: `now`; `p = readPosition`; `p.status !== 'opening'` is left to the repository;
+`buyOrderOf(tx, positionId) !== null` throws `abandon-needs-settlement` (C48: until T3, a position
+with any buy order is never abandoned). `at = max(now, p.openedAt)`.
+Phase W: `abandonOpening(tx, positionId, at)` (repo-book.ts: the compare-and-set close; no SOL
+moves; the entry still counts).
+Callers: the engine after a buy token was refused or expired unredeemed (later), and the boot.
+Abandoning while the token is still valid is safe: T2 then fails (the trigger
+`approvals_consumed_while_active`), and the cap room and the held SOL are free only because no order
+can ever exist for the position.
+
+#### 16.5.4 `recordRefusalTx`, `persistKillTx`, `persistHaltTx`
+
+`recordRefusalTx(deps, subject, code, slot)`, one small transaction:
+- entry: `intentExists` returns `duplicate`; else `insertEntryIntent` with the request's own ids
+  and times, `reasons: [code]`, `inputs: {}` (s.15.8), then `insertDecision({ outcome: 'refused',
+  stage: 'error', reasons: [code], slot, configVersion: readActiveConfig(tx).versionId })`.
+- exit: `p = readPosition`; `insertExitIntent` at `p.exitSeq` with `reasons: [code]`, `inputs: {}`;
+  then the `error` decision.
+- Its own throw: no recursion. `faults.report('refusal', ...)`, latch `refusal-write-failed`, alert
+  outside the database, answer `failed`.
+
+`persistKillTx(deps, source)`: `setKill(tx, now, source)` (repo-flags.ts: its engine audit row
+first). After COMMIT, `anchors.write` of the new tail. A throw: latch `kill-write-failed` and
+`markKill()`, alert, answer `failed`. `persistHaltTx(deps, reason)`: the same with `setHalt`
+(`halt-write-failed`). 6d calls `persistHaltTx` only for `disk-db` (16.5.6); 6e calls it for the day
+state's trips.
+
+#### 16.5.5 T2: `createSqliteTokenStore(db, clock, faults, latch, sentinel).consume(tokenId, snapshot)`
+
+1. Before BEGIN: for `snapshot.kind === 'buy'`, `latch.blocked()` non-empty, `latch.killSeen()` or
+   `sentinel.present()` (which also calls `markKill()`) throws `entries-latched` (16.11 D3; redeem
+   answers `store-error`). Exit tokens skip this check. `planText =
+   canonicalPlan(snapshot.plan)` (a throw is a `store-error` too).
+2. `db.transaction((tx) => redeemApproval(tx, tokenId, snapshot, planText, clock.now()))`.
+   repo-redeem.ts does every check of s.15.7 before its two writes (the consume, then the order).
+3. A throw is reported (`faults.report('t2', classify(e))`) and re-thrown, in a try around the
+   whole `db.transaction` call (outside the callback). risk's `redeem` turns it into `store-error`.
+4. `true` and `false` go back unchanged; risk accepts only `true`.
+
+The order row comes from the verifier's snapshot and risk's canonical text, never the executor's
+objects (C1, C44). The executor holds only the redeemer (C65), so it can neither pass a store nor a
+slot.
+
+#### 16.5.6 How a throw is classified (`classify`)
+
+| Thrown | Stored code | Scope | Bug alert |
+|---|---|---|---|
+| StorageError `busy` | `error:storage-busy`, not stored | intent; 3 within 10 minutes: latch `storage-busy`, `persistHaltTx('disk-db')`, alert | no |
+| StorageError `constraint` | `error:storage-constraint` | intent | yes (single writer: it cannot fire if the parts agree) |
+| StorageError `bad-param` | `error:storage-bad-param` | intent (thrown before any write of its function) | yes, except a secret-filter refusal of an entry's inputs or reasons (warn) |
+| StorageError `row-missing`, `row-count`, `bad-cell`, `tx-failed`, `denied`, `bad-sql`, `audit-broken`, `bad-option`, `other` | `error:storage-<code>` | latch `storage` | yes |
+| StorageError `full`, `io`, `corrupt`, `not-a-database`, `readonly`, `pragma`, `closed`, `missing`, `foreign-file`, `schema-*` | `error:storage-<code>` | latch `storage`; `full`/`io` also try `persistHaltTx('disk-db')` | no (an environment fault) |
+| StorageError `poisoned`, `async-in-transaction`, `nested-transaction`, `tx-closed` | `error:storage-<code>` | fatal: latch, `onFatal` once (the run loop exits; a restart runs the boot) | yes, except `poisoned` |
+| AppError | `error:<its code>` | intent; `entry-count-mismatch` latches `bug` | `entry-count-mismatch` only |
+| RiskError, AmountError, LedgerError | `error:risk`, `error:amount`, `error:ledger` | intent | yes when it comes from `buyLimitViolations` (its fixed text starts "the approval would break a hard limit") |
+| anything else | `error:unexpected` | latch `bug` | yes |
+
+Messages are never stored or alerted: only the code (C46). A recorded refusal that itself fails
+latches (16.5.4).
+
+### 16.6 The boot (`bootStorage`)
+
+Each step either passes or throws `BootError` (the start is refused, the database is closed, and
+the owner is alerted). Nothing trades before the last step.
+
+0. `Object.isFrozen(Array.prototype)` (C7): else `runtime-not-frozen`. `runLock.held === true`.
+1. The path (C15), through `FsProbe`:
+   - `dataDir` absolute; `dbFile`, `copyDir` and `runDir` plain names inside it;
+   - win32: refuse a UNC path (`\\` or `//` at the start, which includes `\\?\UNC\`); require it
+     under `windows.userProfile`; refuse it under any `oneDriveRoots` entry or with a path segment
+     starting `OneDrive` (case-insensitive; D5.3 heuristic);
+   - `realpath(dataDir) === dataDir` and `lstat(db file)` is not a symbolic link (a link anywhere
+     on the way is refused, stricter than "the database path");
+   - Linux: `fsType(dataDir)` on the local allowlist (ext4, xfs, btrfs, tmpfs, overlay; values
+     UNVERIFIED until V1): anything else, a network share, FUSE, 9p or virtiofs (a Docker Desktop
+     bind mount), is refused;
+   - not win32: `dataDir`, `copyDir` and `runDir` owned by `uid` (else refused) and made 0700;
+     the db file and any `-wal`/`-shm` owned by `uid` and made 0600. A chmod that fails refuses.
+2. `openDb(file, { busyTimeoutMs, create: false })` (C12): a missing or empty file, a foreign file,
+   or WAL refused (a network share) refuses the start (`open`).
+3. `quickCheck()` and `foreignKeyCheck()` both empty (C14), else `health`.
+4. `migrate(db, { now: clock.now, backupDir: copyDir, nodeVersion, allowFresh: false })` (C12):
+   an edited, newer or missing schema refuses (`migrations`). Today it is a no-op at version 1.
+5. Required rows (C19): `readFlags`, `readModes`, `readDayState` for both modes, `readAccount` for
+   both modes, and `readActiveConfig` (version 1, decoded). A missing row or a bad cell refuses
+   (`required-rows` or `config`).
+6. The audit log (C17, C26, C36):
+   - `chain = verifyAuditChain(db)` (else `audit-chain`);
+   - `a = anchors.read()` (malformed refuses). With an anchor: `chain.newestId >= a.id` and
+     `readAuditRow(db, a.id).hash === a.hash`, else `audit-anchor` (16.11 Q1). Without one: the
+     warning `no-audit-anchor` and an alert (the first start, or a removed file);
+   - `clock.now() < chain.newestAt`: the warning `clock-behind-audit` and an alert, never a refusal
+     (16.11 D2; tested with an audit row at `MAX_TIMESTAMP_MS`).
+7. KILL and halt links (C35): if `flags.kill` is set, `readAuditRow(db, kill.auditId)` must exist,
+   be at most `newestId`, have actor `engine`, action `engine:kill-set` and detail `{ source }`
+   equal to the flag's source; else `kill-link`. Each halt: the same with `engine:halt-set` and
+   `{ reason }` equal to its reason; else `halt-link`.
+8. The books (C48, D7): for each mode, `readBook` (a stuck row refuses, `book`), `ledgerOf`, and
+   `checkConservation` (`conservation`; the LedgerError's text goes to no alert, only its code).
+   Paper: `totalWithdrawals === 0` and `1 <= totalDeposits <= 2 SOL` (`paper-account`). Live: SOL,
+   deposits and withdrawals all 0 until Phase 8 (`live-account`).
+9. Stale openings (C48, S risk 2), both modes: for each opening position, `buyOrderOf`:
+   - none: `abandonOpeningTx` (its own transaction) at max(now, openedAt). Safe at boot: the old
+     process is gone (run lock) and its tokens' MACs were made with a key that died with it. A
+     failure refuses the start (`abandon`);
+   - one (in 6d only 'approved'; later also submitted, failed or expired): left opening, so it
+     stays counted at its maxSpend (fail closed), with the warning `opening-with-order` and an
+     alert. T3 and the status writer resolve it (C67).
+10. The sentinel: `sentinel.present()` sets KILL through `persistKillTx(storeDeps, 'sentinel')`
+    (its own transaction; `failed` refuses the start). Steps 9 and 10 run with `StoreDeps` built
+    from the boot's own handle, clock, a boot latch and the alerts; the engine takes that latch.
+11. `anchors.write({ id, hash, at: now })` of the newest row (after step 10), and the newest id and
+    hash in the report (logged by the caller).
+
+`startPaperEngine(o)`, in this order: `bootStorage` (which returns its latch, KILL already marked);
+the fault sink on that latch; `createSlotFeed`; `createEngineAuthority` (exactly one, paper, C64; it asserts
+`issuer` exists and `redeemer.mode === 'paper'`); `EngineDeps`; return. Any throw closes the
+database. There is no live start function: Phase 8 adds one with its own review.
+
+`createEngineAuthority(o)`: `key = rng.approvalKey()`; `registerOwnSecret(key)` (C21) before
+anything else can see it; `store = createSqliteTokenStore(db, clock, faults, latch, sentinel)`;
+`createApprovalAuthority({ mode: 'paper', key, newTokenId: () => rng.tokenId(), planFreshSlots:
+HARD_CAPS.planFreshSlots, slots, store })`; `key.fill(0)` (the authority keeps its own copy).
+
+```mermaid
+sequenceDiagram
+  participant Cli as cli (later)
+  participant Eng as app/engine
+  participant Boot as app/storage-boot
+  participant DB as SQLite
+  participant Auth as app/authority
+  Cli->>Eng: startPaperEngine(options)
+  Eng->>Boot: bootStorage
+  Boot->>Boot: frozen built-ins, run lock, path checks
+  Boot->>DB: open (create false), quick_check, foreign keys, migrate (allowFresh false)
+  Boot->>DB: required rows, audit chain, anchor, KILL and halt links, books, conservation
+  Boot->>DB: abandon openings with no order; sentinel KILL
+  Boot-->>Eng: db, report (refusal: BootError, db closed, alert)
+  Eng->>Auth: createEngineAuthority (key registered, SQLite store, slot feed)
+  Auth-->>Eng: issuer, redeemer (paper)
+  Eng-->>Cli: deps, redeemer, slot feed, ids
+```
+
+### 16.7 core/rng.ts, the secret registry, the slot feed and the architecture rules
+
+#### 16.7.1 core/rng.ts
+
+- `newApprovalKey()`: `keyFromBytes(randomBytes(32))`; null (all zero, never in practice) draws
+  once more, then throws `rng-zero-key`. The returned array is new and owned by the caller.
+- `drawId(kind, nextBytes)` is the redraw loop below with its byte source passed in, so tests reach
+  every branch without stubbing node:crypto; `newId(kind)` is `drawId(kind, () =>
+  randomBytes(16))`.
+- `idFromBytes(kind, bytes)`: needs exactly 16 bytes; `id = prefix + '_' + hexOf(bytes)` (35
+  characters: `tk_`, `ps_` or `or_`); returns null when `secretKinds(id)` is not empty (with
+  lower-case hex this happens only if a registered own secret appears in it).
+- The loop: up to 8 draws of 16 bytes through `idFromBytes`; the first non-null wins; 8 nulls throw
+  `rng-filter` (fail closed). Ids are independent of the key and of every MAC.
+- `systemRng`: the key and the three id kinds, frozen. Only cli/ (the process entry) passes it, as
+  `PaperEngineOptions.rng`; app/ code takes an `Rng`. (As built, the import rule lets app/ and cli/
+  import core/rng.ts, systemRng included, and keeps everything else out; that app/ code takes an Rng
+  and leaves systemRng to cli/ is a convention that review keeps: review T, security 6.) Tests inject
+  their own `Rng` (a counter that makes `tk_000...1`, a fixed key), so every test stays
+  deterministic.
+- Intent ids are not random: `entryIntentId` and `exitIntentId` (app/approve-tx.ts) are the first
+  40 hex characters of `sha256('fomo-entry-intent-v1\n' + strategy + '\n' + mint + '\nbuy\n' +
+  windowStartMs)` and of `sha256('fomo-exit-intent-v1\n' + positionId + '\n' + exitSeq)`, with the
+  prefixes `en_` and `ex_` (43 characters). Hex never meets a filter pattern; both stay below 64.
+
+#### 16.7.2 The exact-value list (core/redact.ts)
+
+```ts
+export function registerOwnSecret(value: Uint8Array | string): void;
+// SecretKind gains 'own-secret'.
+```
+- A byte value (at least 16 bytes) is registered as `hexOf`, `base64Of` (with and without
+  padding), `base64UrlOf` and `base58Of`. A text value (at least 16 characters, e.g. a bot token)
+  is registered as itself and as the same four encodings of its UTF-8 bytes.
+- `secretKinds(text)` adds `'own-secret'` when the lower-cased text contains any lower-cased
+  registered form (case-insensitive: stricter, at no real cost for 22+ character forms).
+- At most 32 registered forms in all (bounded work per call); a 33rd throws. Nothing can remove a
+  form. Registering only makes the filter stricter, so any file may call it.
+- `core/encode.ts` holds the four encoders (pure; tested against Buffer and known vectors in the
+  tests, which may use Buffer).
+- The registry is module state in a pure file. Each test file runs in its own process (node:test),
+  so a test's registration cannot leak into another file.
+- Limits, written down: a split, truncated or re-encoded (say, decimal) secret is not found; the
+  byte-array pattern already covers the decimal list form.
+
+#### 16.7.3 The slot feed (app/slots.ts)
+
+Superseded by s.16.14 (review T): the bound below let the tolerance compound with every accepted
+reading, a clock step back stopped every token for as long as the step, and nothing caught a
+source that advances too slowly. The rules as built are in s.16.14; this is the first design.
+
+State: `accepted: { slot, at } | null`; per channel, the last reading `{ slot, at }`.
+
+`report(channel, slot)`, with `now = clock.now()` read once; it never throws:
+- not a bigint, below 1 or above 2^63-1: ignored, counted, an alert at most once a minute;
+- `accepted` set: `bound = accepted.slot + ceil((now - accepted.at) x maxSlotsPerSecond / 1000) +
+  toleranceSlots`. A reading above `accepted.slot` and at most `bound` is accepted (`accepted =
+  { slot, at: now }`). A reading at or below `accepted.slot` changes nothing (it neither raises the
+  slot nor refreshes its age). A reading above `bound` is held as that channel's candidate and
+  adopted only when another channel reports within `agreeSlots` of it inside `maxAgeMs`; else it is
+  ignored with the alert `slot-implausible`;
+- `accepted` null (cold start): adopt the higher of two channels' readings that agree within
+  `agreeSlots`, both inside `maxAgeMs`; or, from one channel, the second of two readings at least
+  500 ms apart with `0 <= s2 - s1 <= the same bound` (a lone wild first reading is then replaced by
+  the next sane one, never adopted);
+- `now < accepted.at` (the clock stepped back): nothing is accepted and `currentSlot` is null until
+  the clock passes `accepted.at` again; an alert.
+
+`currentSlot()`: `accepted` and `0 <= now - accepted.at <= maxAgeMs` give `accepted.slot`, else
+null. `unknownSinceMs()` is the time it turned null. The authority's own ratchet sits on top.
+
+Why `maxAgeMs` is 2 s (C63): a stale slot is lower than the real one, which lengthens a token's
+life. 25 slots at the measured 214 ms is about 5.3 s; 2 s keeps a margin for faster slots, and the
+creation refuses more than 2.5 s (25 slots at 100 ms; slot times below 100 ms are UNVERIFIED, V10).
+Exits do not depend on the stream: the exit loop reports its own quote's context slot (`http`) just
+before T1 exit, so the slot is fresh at the moment it is used (C4).
+
+This paragraph was wrong, and review T showed it: "A liar inside the bound can push the slot up by
+at most `toleranceSlots` plus the rate margin ... it cannot stick: the real readings catch up within
+about 30 s". The bound was measured from the last accepted reading, so it was granted again on every
+reading: one channel walked the feed 151,000 slots ahead in a second (risk W1), or 19,080 in an
+hour at the rate margin alone (W2); and a slow source could hold the slot back, so a token outlived
+its real expiry (security F1). The corrected rules are s.16.14's.
+
+#### 16.7.4 The architecture rules (tests/architecture/import-graph.test.ts)
+
+core/rng.ts (C21-C23):
+- It stays in `CLOCK_FILES` for the "pure code imports it as types only" check, but it is no
+  longer exempt from the pure rules: it is pure with `node:crypto` allowed, its node:crypto imports
+  limited to `randomBytes` (named), and the global `crypto`, `Math.random`, `Date` and every other
+  built-in refused in it too. Randomness then has one audited door.
+- New `RESTRICTED_FILES` entries: `core/rng.ts` (app/ and cli/ only), `app/authority.ts` (`app/engine.ts`
+  only), `app/storage-boot.ts` (`app/engine.ts` only), `app/engine.ts` (`cli/` only).
+  `app/token-store.ts` and the storage entries stay as they are.
+- `positionExitBudget` of risk/reserve.ts is imported only inside risk/ (C2).
+- Canaries: rng importing `randomUUID` or `node:fs`; `Math.random` and `crypto.getRandomValues` in
+  rng; execution/ importing core/rng.ts; app/x.ts importing app/authority.ts, app/storage-boot.ts or
+  app/engine.ts; app/x.ts importing `positionExitBudget`; `export const k = newApprovalKey` in an
+  app/ file (a restricted function handed on).
+
+No catch inside a transaction (C32), a typed rule over app/ and cli/:
+1. The argument of every call of the `Db.transaction` method (resolved to storage/sqlite.ts's
+   interface) is an arrow function or function expression written in place.
+2. Its body, nested functions included, has no `try` statement and no call of a member named
+   `catch`, `then` or `finally`.
+3. Every call inside it whose callee resolves to a function or method declared in app/ or cli/ is
+   followed, transitively (a visited set): each such body is held to rules 2 and 3.
+4. Inside it, the callback's `tx` and any function literal may be passed only to functions declared
+   in storage/, app/ or cli/ (followed by rule 3) or in TypeScript's own lib files except Promise
+   members. So an interface method, a parameter or a variable of function type never receives the
+   transaction or a closure over it, and cannot swallow a repository's error.
+5. In storage/ (except sqlite.ts and migrations.ts), every `catch` block ends with a `throw`. Today
+   codec.ts, plan-text.ts and config-tree.ts already do: their catches only turn a parser's error
+   into a StorageError, so a repository called inside a transaction never swallows one.
+- Allowed, no false positive: a try around the whole `db.transaction(...)` call (16.5.1, 16.5.5);
+  `rows.forEach((x) => repo.write(tx, x))` inside the callback.
+- Canaries, each for its own reason: a try in the callback; a try in an arrow nested in it; a
+  callback passed by name (`db.transaction(step)`); an app/ helper with a try called from it; the
+  same two calls deep; `tx` handed to a parameter `(f: (t: Tx) => void)`; a closure over `tx`
+  handed to an interface method; a `.catch(` inside; a storage repository whose catch returns.
+- LIMIT, written down: an implementation behind an interface is not followed (rule 4 makes sure it
+  never gets the transaction), and code reached through `this` dispatch is not followed (app/ has
+  no classes with such methods; review is the guard).
+- The runtime backstop already exists: a statement that threw sinks its whole transaction even if
+  caught (`tx-failed`, s.11). The rule covers the other half: a repository's precondition refusal,
+  thrown before its statement runs.
+
+### 16.8 Failure modes
+
+| What fails | Who notices | What happens |
+|---|---|---|
+| Slot unknown or stale (over 2 s) | `currentSlot()` null in T1 | entry: `error:slot-unknown`, recorded with slot 0; exit: the same, recorded; no token issued or redeemed |
+| One wild slot (10^15, u64 max) | the feed's bound | ignored, alert; the next sane reading is accepted; exits go on |
+| A provider lying a little high | inside the bound | tokens expire early (liveness only); real readings catch up |
+| Slot unknown over 30 s with positions open | `unknownSinceMs()` | the health loop alerts (later); the function is tested now |
+| Clock steps back | the feed (`now < accepted.at`) | slot unknown until the clock passes again; alert |
+| KILL set by another process | T1 reads `flags` inside its transaction | the next entry is refused `blocked: kill`, recorded |
+| KILL sentinel file present | T1 before BEGIN; the boot | `markKill`, KILL persisted (`sentinel`); entries refused; T2 refuses buy tokens |
+| The sentinel cannot be read (EACCES) | `present()` | reads as present: fail closed |
+| KILL or halt write fails | `persistKillTx` / `persistHaltTx` | latch, `markKill` for KILL, alert outside the database |
+| Busy (another writer over 5 s) | `busy` at BEGIN | that entry refused unrecorded; 3 in 10 min: latch, `disk-db` halt (best effort), alert |
+| Disk full, I/O error | `full` / `io` | rolled back; latch; `disk-db` halt attempted; alert directly |
+| ROLLBACK or COMMIT outcome unknown | `poisoned` | fatal: latch, `onFatal`; the run loop exits, the restart runs the boot |
+| Constraint or trigger fires in T1/T2 | `constraint` | rolled back, refusal recorded, bug alert |
+| A repository refuses an input | `bad-param` before its first write | rolled back, recorded `error:storage-bad-param`; a filter hit on inputs records with `inputs: {}` |
+| A stuck or malformed row | `bad-cell` | entries latched; that position cannot exit; other exits work; the boot refuses |
+| Config version 1 or a ledger account missing | `row-missing` | runtime: latch; boot: refused |
+| Entry count differs from risk's | `entry-count-mismatch` | rolled back, latched as a bug, alert |
+| Rent unknown | `RentSource` null | entry `error:rent-unknown`, recorded; no token |
+| p95 exit cost below 5,000 | app pre-check | entry `error:p95-below-base-fee`, recorded |
+| The refusal record fails too | `recordRefusalTx` | latch `refusal-write-failed`, alert outside the database |
+| An exit token outstanding | `outstandingExitApprovals` | a new exit is refused `plan:exit-in-flight` until it is used or expires |
+| exit_seq reaches 10,000 | after COMMIT | alert; at 999,999 storage refuses further exits of that position |
+| Executor passes its own store or slot | impossible: it holds only the redeemer | (K gate) |
+| Executor mutates its plan after redeem | the order row is written from the snapshot | the row matches what risk validated |
+| Abandon while a buy order exists | `abandon-needs-settlement` | refused until T3 |
+| Audit chain broken, anchor behind, KILL or halt link wrong | the boot | the start is refused, alert |
+| No anchor file | the boot | warning and alert (first start, or the file was removed) |
+| Clock behind the newest audit row | the boot | warning and alert only; the owner's commands still work (ids decide) |
+| Ledger conservation fails | the boot | refused, alert with the code only |
+| Database in OneDrive, a UNC path, a network or FUSE file system, a Docker bind mount | the boot's path checks | refused, with the reason |
+| Path is a symbolic link; wrong owner; chmod fails | the boot | refused |
+| Built-ins not frozen | the boot | refused |
+| Generated id refused 8 times by the filter | `newId` | `rng-filter`: that entry fails before T1 |
+
+### 16.9 Tests to write first
+
+All on `':memory:'` or temp files from `tempDir()`, never under fomo-bot/data/. A test world helper
+(`tests/unit/app/world.ts`): migration 1, `setUpConfig`, `setUpLedger` (0.5 SOL), strategies set to
+paper with `setStrategyMode` (tests may import the owner's and server's writers), a fake clock, a
+fake slot feed or the real one on the fake clock, a test `Rng`, fake marks, rent, breakers,
+identity, sentinel, anchors and alerts. "Nothing written" means `dump(db)` is unchanged.
+
+Unit tests per file:
+- core/encode.ts: each encoder against Buffer on 1,000 random byte strings (property) and known
+  vectors (base58 of leading zero bytes).
+- core/rng.ts: key length, a new array each call, `keyFromBytes` refusing 31 bytes and all zeros;
+  id shape and length 35; ids never contain the key's encodings; `idFromBytes` refusing an id that
+  holds a registered secret (register a 16-character hex text, feed bytes whose hex contains it);
+  `drawId` taking the first accepted draw, and throwing `rng-filter` after 8 refused draws (a byte
+  source that always returns the refused bytes).
+- core/redact.ts: each registered form found, in upper and lower case, inside JSON; 15 bytes or
+  characters refused; the 33rd form refused; unregistered values pass; existing tests unchanged.
+- app/slots.ts: cold start by two channels and by one channel's two consistent readings; a lone
+  wild first reading never adopted; 10^15 and u64 max after anchoring ignored and the next sane one
+  accepted; the bound at its edge (bound accepted, bound + 1 held); a held candidate adopted when
+  another channel agrees; equal or lower readings change nothing; stale after `maxAgeMs` + 1;
+  clock stepped back; `unknownSinceMs`; options outside their ranges refused; `report` never throws
+  on any value (property).
+- app/faults.ts: every row of 16.5.6, the busy window (2 then 3 in 10 minutes, and 3 over 11
+  minutes), the latch is sticky, `onFatal` once.
+- app/caps.ts: every field of `buyCapsOf` and `exitPlanCapsOf` against its source; `FAILED_FEE_BUDGET
+  === 3_375_000n` and `< positionExitBudget(...)`; `dayPolicyOf` takes the stored deposit and refuses
+  a withdrawal, 0 and 2 SOL + 1; `MIN_TRADE_LAMPORTS` equals RISK_POLICY's 0.02 SOL.
+- app/snapshot.ts: each EntryFlags field from its row; a halt of the other mode blocks; a streak
+  halt of either mode blocks; a stale mark makes equity null; stuck throws; a missing account of
+  either mode throws.
+- app/approve-tx.ts:
+  - buy: approved writes exactly intent, position, count, decision, approval (in that order, with
+    the stored p95 equal to the market's); each refusal stage recorded with its reasons; duplicate
+    writes nothing; latched writes nothing and touches no table; sentinel persists KILL then records
+    `blocked: kill`; live refused; rent null and p95 4,999 recorded as errors; the identity overrides
+    a market's wallet, token account and wSOL mint;
+  - exit: approved and refused both use up the number; mint and mode from the position; a stale
+    planner seq refused `plan:wrong-intent`; an outstanding unexpired exit token blocks, an expired
+    one does not, a consumed one counts through `exitsInFlight`; no flag (KILL, halt, pause, latch)
+    blocks an exit; `bad-request` for an owner origin; the 10,000 alert;
+  - abandon: no order abandoned at max(now, openedAt), also with the clock behind `openedAt`; any
+    buy order (each status set by raw SQL) refused; then T2 of its token fails;
+  - recordRefusalTx: `inputs: {}`, one code, slot 0 only for null, duplicate, its own failure
+    latches.
+- app/token-store.ts with the real authority: first redeem true and an order row equal to the
+  snapshot and text; a replay `already-consumed`; a token unknown to the database `store-error`; a
+  buy token while latched or killed `store-error` with nothing written; an exit token while latched
+  still redeems; the executor's plan object mutated after redeem leaves the row unchanged.
+- app/storage-boot.ts: each refusal of 16.6 alone (one test per `BootRefusal`), each warning, the
+  stale-opening rule both ways, the sentinel at boot; Windows, UNC, OneDrive and file-system cases
+  through a fake `FsProbe` on Linux; the real `FsProbe` on a temp dir (Linux).
+- app/engine.ts: one authority; `redeemer.mode === 'paper'`; a token from a second, separate
+  authority fails `bad-mac`; the key's encodings are registered (a write containing them refused);
+  the returned engine has no issuer or verifier besides `deps.issuer`; a boot refusal closes the db.
+
+Exhaustive fault injection: a test `Db` wrapper whose `transaction(fn)` calls the real one with a
+`Tx` that throws a chosen StorageError at its k-th `run`, `get` or `all`, in the first transaction
+only. For every k over all statements of a successful call, and for the codes `full`, `io`,
+`constraint`, `bad-param` and `busy`:
+- `approveBuyTx` (about 14 reads and 5 writes), `approveExitTx` (about 8 reads and 4 writes),
+  `abandonOpeningTx`, T2 `consume` (2 writes), `recordRefusalTx`, `persistKillTx`;
+- after each: the dump equals the dump before plus exactly the refusal's two rows (intent and
+  `error` decision with the class's code), or nothing for `busy`; no position, count, approval or
+  order is left; the latch and the alerts are as 16.5.6 says.
+A crash test: a child process runs `approveBuyTx` with a slot source that calls `process.exit(1)`
+inside the transaction; on reopen nothing is persisted and quick_check is clean.
+
+Races (child processes, as tests/unit/storage/processes.test.ts does: scripts in the temp folder,
+started with the test flags and the no-secrets import, on one database file in that folder):
+- Deterministic: connection A's T1 runs with a slot source whose `currentSlot` (called inside A's
+  transaction) runs connection B's `approveBuyTx` on the same file with a 100 ms busy timeout. B
+  answers `error:storage-busy`, unrecorded. After A commits, B again: refused `blocked:
+  max-positions` (A's opening counts). Repeat with the entry count and with the free SOL as the
+  last room.
+- Parallel: N children (2 to 6), long-lived, driven over stdin with a line protocol: per round the
+  parent writes a fresh database (3 active positions, one slot of room), sends "round k" to all,
+  waits for every "ready", then sends "go" to all; each child runs `approveBuyTx` for its own mint
+  with a 5 s busy timeout and prints its outcome. Exactly one is approved; the rest are refused by
+  the cap (or `storage-busy`, never approved); the database invariants below hold. 50 seeded
+  rounds; the seed picks N and which room is last (positions, entries, exposure, free SOL).
+- KILL from another process: a child opens the file and commits `setKill(tx, now, 'cli')`; the
+  parent's next `approveBuyTx` is refused `blocked: kill` and recorded; T2 of a buy token issued
+  before the KILL then fails (the latch saw KILL through the next T1: `markKill`).
+
+Invariants on SQLite (fast-check, 1,000 cases where the run time allows, else 200 with the
+boundary cases on every run; a fake executor that redeems, replays, mutates plans, waits past
+expiry and uses a second authority's tokens):
+- invariant 1: after every step, every order has exactly one approved decision for its intent and
+  a consumed approval matching it in every field, consumed at a slot within its range; no token
+  works twice, for another intent or in another mode;
+- invariant 2: every approved buy, re-checked from the stored rows with `buyLimitViolations` at its
+  approval time, has no violation; active positions <= 4; one active position per mint;
+- invariant 17: across random interleavings of T1 buys, T1 exits, T2, abandons and slot moves,
+  no cap is ever exceeded with opening positions at their max_spend, and the wallet minus the held
+  SOL stays above the fee reserve after each approved buy;
+- the MAC and the key's encodings appear in no cell after every scenario.
+
+The review L item (C2):
+- `RentSource` returning 1,488,440 then 1,513,840 changes the reserve sizing uses and nothing else;
+  no constant in app/ or the tunables can change it (a test sets every tunable to its bounds);
+  `null`, a negative or a `number` value refuses the entry;
+- a fresh position's `budgetLeft` is 3,375,000, never 3,380,000; an automatic exit whose worst fees
+  are 3,375,001 is refused `plan:exit-fee-budget`, 3,375,000 passes; the import rule's canary.
+
+The K gate closure (C1): the security-auditor's K reproductions against `startPaperEngine`'s
+redeemer and the SQLite store: no way to hand redeem a store or a slot; `{ consume: () => true }` is
+unreachable; an expired token stays expired with any slot the executor could invent; the stored
+order equals the validated snapshot.
+
+The architecture canaries of 16.7.4, each caught for its own reason, and the real src/ showing at
+least one followed transaction callback per app/ transaction (so the rule cannot go quiet).
+
+### 16.10 The split
+
+Each sub-step's Definition of Done is that of s.7 (tests shown, typecheck, architecture test,
+coverage gate extended to its files at 100% of lines and branches, both Opus reviews in REVIEWS.md,
+STATUS.md, the owner's summary, a commit, no new dependency), plus its own:
+
+- **6d-1, the K gate in app/** (about 8 files): core/encode.ts, core/rng.ts, the registry in
+  core/redact.ts, app/slots.ts, app/faults.ts, app/token-store.ts, app/authority.ts, and the rng
+  rules and restricted entries of 16.7.4. Extra DoD: the security-auditor re-runs its K
+  reproductions against the SQLite store and the slot feed and records the K gate as closed in
+  REVIEWS.md; the wild-slot test (one outlier does not stop exits); the scratch runs V6 and V7.
+- **6d-2, T1** (about 4 files and a reader): app/caps.ts, app/snapshot.ts, app/approve-tx.ts,
+  `outstandingExitApprovals`, the no-catch rule. Extra DoD: exhaustive fault injection, the
+  deterministic and parallel races, invariants 1, 2 and 17 on SQLite, the KILL from another process,
+  the review L item, the p95 and bankroll tests; planted bugs for every rule of 16.5 (scratchpad,
+  as in earlier steps); the scratch runs V3 and V8.
+- **6d-3, the boot** (3 files and a reader): app/run-files.ts, app/storage-boot.ts, app/engine.ts,
+  the repo-audit.ts additions. Extra DoD: every `BootRefusal` tested alone; the chmod-failure test;
+  the clock at `MAX_TIMESTAMP_MS` in the audit log; the scratch runs V1, V2, V4 and V5, with the
+  Windows rows run by the owner or left UNVERIFIED.
+
+6d-2 uses 6d-1's authority; 6d-3 uses 6d-2's `abandonOpeningTx`. Each review reads one sub-step.
+
+### 16.11 Questions for the owner, and decisions to challenge
+
+Owner question (plain English, one at a time):
+- Q1. **If the bot's safety log looks shorter than when it last ran, should it refuse to start
+  until you confirm at the server?** This happens if someone deletes the newest entries, or if you
+  restore an older copy of the database. Recommended: yes. Until the server command exists (Phase
+  7), you confirm by deleting one small file the bot names in its message; I will give you the exact
+  command when it is needed.
+
+Decisions the reviewers should challenge:
+- D1. `bad-param` is handled per intent (recorded, no latch), extending s.11's list (16.1).
+- D2. A clock behind the newest audit row only alerts. Blocking entries would lock trading out for
+  good after one far-future row, and the day state's clock checks (6e) and contract 8 guard entries.
+- D3. T2 refuses buy tokens while the latch is set or KILL was seen (stricter than s.3.3, which
+  leaves it to the executor's re-check). Exit tokens still redeem.
+- D4. The slot feed's numbers: 2 s maximum age, 10 slots a second, 150 slots of tolerance and of
+  agreement, and the single-channel cold start after two consistent readings.
+- D5. The exit fee budget until T3 is lifetime (`failed_fees` never resets), and
+  `automaticStopped` is "the budget is used up".
+- D6. The exit landing-spend cap uses the tunable (0.2%), not the exit H (0.6%); routes are
+  `direct` and `jupiter-build` only; the 0.02 SOL minimum trade is a constant in app/caps.ts until
+  the server file exists.
+- D7. Only automatic exits in 6d: the owner's /sell and /panic (not budget-limited) need the
+  Telegram owner check of Phase 3, and arrive with it.
+- D8. A streak halt of either mode blocks entries (D5.4 read for the day state's sticky halt too).
+- D9. At boot, an opening with an order is left counted and alerted, never abandoned (S risk 2).
+- D10. The anchor: no file means a first start (warn); deleting the file therefore passes the
+  check. It is a tripwire against truncation and old copies, not against someone who can edit both
+  files. Rows appended and then removed between two anchor writes are not seen.
+- D11. The run lock moves to the ops step; the boot only requires a token saying it is held.
+- D12. p95 exit costs below 5,000 lamports are refused (the optional half of S risk 6).
+- D13. The exact-value registry is module state in a pure core file.
+- D14. Four app/ files beyond s.1's list, and `app/engine.ts` restricted to cli/, so no app/ file
+  can start a second engine or a second authority.
+- D15. Docker Desktop bind mounts are refused by the file-system allowlist: paper on the owner's PC
+  keeps its data in a named Docker volume (within D5.3; the start message says so).
+
+### 16.12 UNVERIFIED, each with a scratch test before code depends on it
+
+- V1. `fs.statfsSync(p).type` on Node 26.13.0 returns the Linux file-system magic number, and the
+  allowlist values (ext4, xfs, btrfs, tmpfs, overlay) are right. Scratch: `statfsSync` on the
+  container's root (overlay), `/tmp` and `/dev/shm` against `stat -f -c %t`; on the owner's PC,
+  Docker Desktop's named volume and a bind mount (the bind mount must be refused). Until then the
+  values are not in the code.
+- V2. A child process spawned with `{ uid: 65534, gid: 65534 }` under the test flags can open a
+  root-owned 0666 database in a 0777 folder, and `chmodSync` then fails with EPERM, so `openDb`
+  throws `io`. Scratch on the container (root). Not possible on win32 or as non-root: skipped there.
+- V3. Six processes doing BEGIN IMMEDIATE on one WAL file with a 5 s busy timeout, 50 rounds: none
+  gets `busy` before its timeout, including during a WAL checkpoint. Scratch with the race script.
+- V4. Windows: `lstat` and `realpath` on a junction and a symbolic link; the UNC forms; the
+  OneDrive variables (`OneDrive`, `OneDriveConsumer`, `OneDriveCommercial`). The owner runs it.
+- V5. `renameSync` over an existing anchor file is atomic on Linux and replaces it on Windows
+  (antivirus can hold the file: EPERM). Scratch on Linux; the owner on Windows.
+- V6. `randomBytes` under `--frozen-intrinsics --disallow-code-generation-from-strings`, in the
+  main process and in a child. Scratch.
+- V7. The type checker resolves the callees the no-catch rule follows (calls through aliases,
+  namespace imports and method shorthands) to their declarations. Scratch: the canaries themselves.
+- V8. A plain read on a second connection (`peekExitIntent`) does not wait while another process
+  holds BEGIN IMMEDIATE in WAL. Scratch.
+- V9. For the ops step: a run lock released by the OS when the process dies, with no dependency
+  (proposal: SQLite's own lock on a separate small file, held for the process's life). Scratch:
+  kill the holder with SIGKILL and take the lock; Windows by the owner.
+- V10. Chain, not Node: slots stay at or above 100 ms (the 2.5 s cap of `maxAgeMs` relies on it).
+  VERIFIED_FACTS measured about 214 ms on 2026-11-04; re-measure in Phase 3.
+
+### 16.13 As built in step 6d-1 (the K gate in app/), and what changed from the design
+
+Built, tests first: `core/encode.ts`, the exact-value list in `core/redact.ts`, `core/rng.ts`,
+`app/faults.ts`, `app/slots.ts`, `app/token-store.ts`, `app/authority.ts`, the rng and
+restricted-file rules of 16.7.4, and the coverage gate over app/. Nothing in risk/, portfolio/,
+config/, storage/ or migration 1 changed.
+
+Differences from 16.3 to 16.7 (the main session's decisions; the reviewers challenge these too):
+- `KillSentinel` lives in app/faults.ts: the token store needs it in 6d-1, before 6d-3's
+  app/run-files.ts exists. run-files.ts will implement it.
+- A `Fault` has four flags, not one: `bug` (alert as a bug), `warn` (alert though no bug: the
+  environment, or data the bot was given), `busy` and `disk` (a full disk or an I/O error). The sink
+  takes `onDiskTrouble(code)`, called for the busy storm and for each full-disk or I/O fault: 6d-2
+  wires it to `persistHaltTx('disk-db')`. The table of 16.5.6 is followed row by row; for the app
+  codes: `entry-count-mismatch` latches as a bug; `live-not-built` and `bad-request` are bugs for
+  their intent; `rent-unknown`, `p95-below-base-fee` and `stale-opening-has-order` warn; the rest
+  are quiet. An RngError keeps its intent (`rng-filter` and `rng-zero-key` warn, `rng-bad-bytes` is
+  a bug). `classify` reads only own data properties, so a look-alike error with a getter, or with a
+  code outside its list, is `error:unexpected`; it never throws.
+- The busy window counts three busy refusals within ten minutes (inclusive) and fires once per
+  process: the latch keeps `storage-busy`.
+- T2 refuses a buy token while latched, after KILL was seen, or while the KILL file is present (which
+  also marks KILL seen). That refusal is no fault and is not reported; risk's redeem answers
+  `store-error`. A storage throw inside T2 is reported (`t2`) and re-thrown.
+- The token store checks only that the database handle is an object: the architecture test lets a
+  handle reach a helper only through a parameter typed Reader, Tx or Db, and TypeScript types the
+  rest.
+- The authority has no mode assertion of its own: the mode is the literal `'paper'`, and risk's
+  tests pin that an authority serves its given mode. C64's start-up check stays with 6d-3's
+  `startPaperEngine`. The key is checked (a Uint8Array of at least 32 bytes, not all zero) before it
+  is registered, registered before `createApprovalAuthority` sees it, and wiped in a `finally`.
+- core/rng.ts: `drawKey(nextBytes)` is exported as the test door for the zero-key branch (like
+  `drawId`), and each array the source returned is wiped once it is copied. A wrong id kind or byte
+  count throws `rng-bad-bytes`.
+- The registry: the unpadded base64 form is registered (a substring check then also finds the padded
+  one), every form in lower case, each once; a registration that would pass 32 forms adds none of
+  its forms. Per process: one approval key is 4 forms; the bot token, the RPC key and the Anthropic
+  key of later steps add at most 5 each, 19 in all.
+- The slot feed: `toleranceSlots` and `agreeSlots` are bounded 0 to 1,000, and every bad option is a
+  TypeError. `unknownSinceMs()` gives the feed's creation time before the first accepted reading
+  (and when the clock cannot be read), `accepted.at + maxAgeMs + 1` once stale, and the first time
+  the clock was seen behind while it is. Its alerts (`slot-malformed`, `slot-implausible`,
+  `slot-clock-back`) are warnings, at most once a minute each.
+- The `positionExitBudget` import rule (C2) moves to 6d-2, with app/caps.ts and the review L tests.
+
+Written down, for the reviewers and Phase 8 (as corrected by review T, s.16.14): the feed trusts
+what its channels agree on. One channel alone at a cold start, or two channels lying together, can
+move it ahead; tokens then expire early, exits included, and the authority's ratchet keeps the
+higher slot until a restart: a loss of liveness, which slot-behind and slot-disagree report. As
+first built, the claim "never a token that should have expired" was wrong too: a slow or lagging
+source could keep an old token alive (review T, security 1). The floor of 1 slot a second and the
+15 s limit on a token's use (storage/repo-redeem.ts) now bound that. The second provider (`http-2`),
+the health loop's alert on an unknown slot and Phase 3's check of the cluster's genesis hash are
+what live trading needs (D4 of 16.11).
+
+The scratch runs (VERIFIED_FACTS s.8, 2026-11-19): V6 (randomBytes under the test flags in the main
+process, a worker and a child process), and for 6d-2's races: two handles in one thread give `busy`
+after the timeout without a deadlock, worker threads run node:sqlite under the flags, and a child
+process's KILL is seen by the parent's next read. V7 belongs to 6d-2's no-catch rule.
+
+Tests: TEST_PLAN.md s.3, "Done in step 6d-1". Planted bugs (scratchpad `mut/run27.py`): 106
+planted. The first run caught 102 and showed two weak tests: the test key's base64 had no '+' or
+'/', so its base64url form hid a missing unpadded base64 form; and the bound-edge report came from a
+second channel, whose agreement with the held reading hid a rate allowance rounded down. Both tests
+are fixed (a key whose base64 holds both characters; the report from the same channel), and both
+bugs are now caught: 104 of 106. The two left repeat a check made elsewhere: the engine's own
+zero-key check (risk's factory refuses the same key, with the same words) and the global-crypto
+rule in core/rng.ts (the pure rules refuse it there too).
+
+Conditions for 6d-2 and 6d-3 from this step:
+- 6d-2: the exit loop reports its quote's context slot as `http` just before T1 exit (C4); T1
+  reads `currentSlot()` once (C62); `onDiskTrouble` calls `persistHaltTx('disk-db')`; no function
+  called inside a transaction callback contains a `try` (the 16.7.4 rule; `classify` and the sink run
+  only after the rollback).
+- 6d-3: `startPaperEngine` is the only caller of `createEngineAuthority` (the import rule already
+  says so) and asserts the redeemer's mode; the KILL file implements `KillSentinel` (any error but
+  ENOENT reads as present).
+
+### 16.14 Review T: the fixes before the 6d-1 commit, and the conditions for 6d-2 and 6d-3
+
+Review T (REVIEWS.md T): risk-guardian BLOCKED the first version (findings 1 to 3 below);
+security-auditor APPROVED WITH NOTES, the K gate closed, with finding 1 to fix before 6d-2. Fixed
+before the commit, each with its tests and planted bugs:
+
+The slot feed (risk 1 and 2; security 1b, 4 and 5), as built:
+- The advance budget: an adopted advance spends it; it refills at `maxSlotsPerSecond` and never
+  holds more than `toleranceSlots` (150). Over any window W the slot rises by at most 150 + 10 x W,
+  so the tolerance no longer compounds. W1 (one channel walking in 151-slot or 150-slot steps 1 ms
+  apart) and W2 (+1 every 100 ms for an hour against a chain at 4.7 a second) are tests: the feed
+  never leads the chain by more than about 150 slots, and slot-behind is raised. A property test
+  (500 random runs of one channel) checks the bound itself: over any stretch in which the slot stays
+  known it rises by at most 150 + ceil(10 x the elapsed seconds), never goes down, and is always a
+  reading the channel gave.
+- The lead cap: the budget adopts no reading that leads another channel's fresh reading by more
+  than `agreeSlots`. A jump past the budget needs agreement: another channel's fresh reading above
+  the accepted slot, within `agreeSlots`; it spends the whole budget.
+- The floor (security 1b): the slot is unknown when it rose by less than 1 slot a second over a
+  window of at least 5 s, with slot-slow (F1, one slot every 1,900 ms, is a test). A chain at 2.5
+  slots a second stays known.
+- The clock: a reading below the last one restarts the cold start, with slot-clock-back; honest
+  readings make the slot known again within 1 s (test: one hour back, two channels or one). After
+  15 s of unknown, for any reason, the feed restarts the cold start too, so one channel recovers it
+  after an outage, and a forward jump of the clock cannot widen the bound past the budget (test: one
+  day ahead, where a reading 864,000 slots ahead is not adopted, and never while an honest channel
+  disputes it).
+- The cold start: a base reading older than 5 s no longer counts (risk 1d), and no single-channel
+  pair is adopted while another fresh channel disagrees by more than `agreeSlots` (slot-disagree).
+- slot-behind (risk 1c, security 4): a channel more than `agreeSlots` below the accepted slot alerts
+  at once; one more than 25 (a token's life, `HARD_CAPS.planFreshSlots`) below alerts after 10 s.
+- A feed is made only on a clock that gives whole milliseconds; a reading taken when the clock gives a
+  fraction or NaN is malformed, and its alert is not repeated while the clock stays unreadable.
+- The fixed numbers are `SLOT_FEED_RULES` (exported and pinned by a test).
+
+T2 reads the stops the database holds (risk 3, security 2): for a buy token, inside the T2
+transaction and before `redeemApproval`, the flags (KILL, the pause, the low-equity stop) and the
+halt rows of both modes. Any of them refuses the buy (`entries-latched`) with nothing written, and
+KILL is then marked seen in the latch. Exit tokens are untouched. The daily stop (optional in risk 3)
+stays with T1, which reads the day state.
+
+The clock's backstop on a token (security 1a): repo-redeem.ts refuses a redeem more than 15 s after
+the token's issue (the hard 25 slots at Solana's 400 ms target, half again of margin; a test pins
+the arithmetic). It also covers a long wait for the database. That refusal, and the one for a clock
+behind the issue, classify as warnings (their words: "a retry gets a new token"), not bugs.
+
+Every exit-path fault alerts (risk 4, the part that fits the sink now): a fault at `t1-exit` or
+`t2-exit` (T2 of an exit token, a new site) that would otherwise be quiet warns, at most once a
+minute per site and code. Bugs and warnings alert as before.
+
+The flaky test (security 8): the recheck property's "no fault is dead weight" check no longer rests
+on what a random run drew. Each fault is also put alone on every base case; the two that refuse only
+next to another (budgetLow, costBasisLow) get the one case where each bites; the two that widen what
+passes by design (an owner's exit, a cost basis that keeps the landing cap alive) must each turn a
+refused case into an accepted one, with the oracle's agreement. With the random run switched off,
+these checks alone pass the rule.
+
+Wording (risk 1f, security 1 and 6): s.16.7.3 is marked superseded and its wrong paragraph
+corrected, s.16.13's limit corrected, s.16.7.1's sentence on systemRng matches the import rule, and
+the slots.ts header says what the feed does and does not guarantee.
+
+Kept, as the reviewers accepted: D3 (complete now with the stored stops), D4's numbers (2 s, 10 a
+second, 150 and 150), D13 (anyone may register an own secret; both failure modes fail closed), D14.
+
+Conditions for 6d-2 (review T):
+- Risk 4: every refusal on the exit path alerts at least at warn, rate-limited per position and
+  code, and an exit-blocked alert after N refused exits in a row for one position. RiskErrors from
+  approve.ts's input checks that are impossible states (two active positions on one mint, more than
+  N positions) alert as bugs.
+- Risk 5: on the exit path, slot-unknown and any refusal before the position is read write nothing
+  (a not-run outcome and an alert), and the exit loop backs off per position: a test that an hour of
+  unknown slot with retries leaves `exit_seq` unchanged.
+- Risk 8 (D5 with D7): an alert when an automatic exit is refused for its fee budget.
+- Security 3: abandon only after the buy token's expiry slot has passed (an engine rule, with a
+  test), so a stale but valid token can never latch every entry as a bug.
+- Security on D1: a bug-storm latch (N bug-class intent faults within a window latch entries), and on
+  the exit path a secret-filter refusal of the inputs or reasons is retried at once with `inputs: {}`
+  and a fixed reason code.
+- Security on s.16.5: a test that a COMMIT failure never returns a token.
+
+Conditions for the exit loop and later steps:
+- Risk 6: the exit loop's HTTP reads use a commitment at least as fresh as the stream's (processed
+  or confirmed, never finalized), tested with the stream a few slots ahead of HTTP.
+- Risk 7: the reads and the boot accept 'stuck' before anything writes it; before Phase 8, an
+  exits-only start (entries latched) or the owner's manual exit steps for every BootRefusal.
+- Risk 8: the owner's /sell before any live exit path exists. Risk 9: the Telegram alert sink queues
+  and never throws (a throwing sink latches entries until a restart).
+- Security 4: the health loop alerts on `unknownSinceMs` (C63); Phase 3's chain clients check the
+  cluster's genesis hash. Security 5: contract 8's guarded clock is the feed's clock.
+
+Conditions for 6d-3:
+- Security on s.16.6: a hard-link check (`nlink` 1) for the database, its -wal and its -shm; the
+  anchor's id and hash in the boot alert; the anchor file 0600 in the 0700 run folder.
+- Security on D11: no cli/ start command before the ops step's real run lock (C13).
+
+Tests: TEST_PLAN.md s.3, "Done in step 6d-1", review T. Planted bugs (scratchpad `mut/run28.py`):
+34 planted. The first run caught 32 and showed two weak tests: the agreed jump's next step was
+blocked by the lead cap anyway, so the spent budget was never what stopped it; and the clock test's
+one expected alert came from its NaN reading, so a fractional reading time could pass unseen. Both
+tests are fixed, and all 34 are caught.

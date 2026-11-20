@@ -223,6 +223,61 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      81 again on the fixed code plus 28 for the fixes, 105 of 109 caught; the four left repeat a
      check another line makes (or, for the order's values after the consume, cannot throw there).
 
+   Done in step 6d-1 (the K gate in app/, STORAGE_DESIGN s.16.13):
+   - The encoders: hex, base64 and base64url equal to Node's Buffer on the RFC 4648 vectors and on
+     1,000 random byte strings; base58 on vectors from an independent implementation (leading
+     zeros, 32 zero bytes, 32 bytes of 0xff) and on 1,000 random strings against a second,
+     carry-based algorithm; bytes only, never changed.
+   - The own-secret list: a registered key found in hex, base64 with and without padding,
+     base64url and base58, in any case, inside JSON; a text secret as itself and in each encoding
+     of its bytes; 'own-secret' last among the kinds; a refusal never repeats the text; 15 or
+     1,025 bytes or characters refused; the same secret 40 times adds nothing; the forms past 32
+     refused whole, earlier ones kept.
+   - Randomness: a 32-byte key, a plain array of its own, new each call; an all-zero or short draw
+     drawn once more, then refused, each draw wiped; ids of each kind in shape, 1,000 all different,
+     never holding the key's forms; an id spelling a registered secret refused; the 8th refused draw
+     fails closed.
+   - The fault rules: every storage code, every app code, risk's hard-limit backstop, look-alike and
+     hostile errors, each to its code, scope and alerts; the latch sticky and sorted; the sink per
+     scope; the busy storm at the third refusal within ten minutes, once; a throwing alert sink or
+     callback contained.
+   - The slot feed: the cold start by two channels (whichever reports the higher first) and by one
+     channel twice 500 ms apart; a wild first or second reading never adopted; the bound at its edge
+     (from the same channel, so no agreement hides it); a held reading adopted only by another
+     fresh channel within 150 slots; malformed readings and the alert once a minute; stale at
+     2,001 ms; a clock behind; a smaller maxAgeMs; 1,000 random reports never throw; a throwing clock
+     or alert sink contained; every option outside its range refused.
+   - T2 and the authority, with risk's real verifier on SQLite: the order row from the snapshot and
+     the text; a replay; extra arguments ignored; the executor's plan object changed after redeem; a
+     token the database does not hold; a second exit in flight; buy tokens refused while latched,
+     after KILL, with the KILL file (exits still redeem); expiry against the feed; a stale feed; one
+     wild slot does not stop an exit; the stream stale and HTTP alive; a second authority's token
+     fails its MAC; the key registered and wiped; tokens expire 25 slots after the quote.
+   - The architecture rules: core/rng.ts pure, randomBytes its only import from node:crypto; core/rng.ts
+     importable only by app/ and cli/, the authority and the boot only by app/engine.ts, the engine
+     only by cli/; the key maker handed on (typed canary).
+   - Planted bugs: 106 planted, 104 caught (two weak tests the first run showed were fixed); the
+     two left repeat a check another rule makes.
+   - Review T (STORAGE_DESIGN s.16.14): the slot feed's advance budget (150 at once, refilled at 10
+     a second, never more); W1 (a walk in 151-slot and 150-slot steps) and W2 (an hour at 10 slots
+     a second against a chain at 4.7: never more than about 150 ahead, slot-behind raised); the lead
+     cap; agreement only from a channel above the accepted slot, spending the whole budget; the floor
+     (F1, one slot every 1,900 ms, and a source that turns slow after a healthy minute; a chain at
+     2.5 a second stays known); a clock one hour back (known again within 1 s, with two channels or
+     one) and one day ahead; 15 s of unknown back to a cold start; a cold-start base that expires
+     after 5 s and a pair a fresh channel disputes; slot-behind at once past 150 and after 10 s past
+     25 (not before, and not at 25); a clock without whole milliseconds. T2 refuses a buy token when
+     the database holds KILL (written by another connection, then remembered in the latch), a halt
+     of either mode, the pause or the low-equity stop, with nothing written; exit tokens still
+     redeem. A redeem 15,001 ms after the token's issue is refused, 15,000 ms passes, and the
+     arithmetic is pinned to the hard 25 slots. Exit-path faults alert once a minute per site and
+     code; late redeems and a clock behind the issue warn rather than alert as bugs. The recheck
+     property's coverage check no longer depends on its random draws. A slot-feed property (500
+     random runs of one channel): over any stretch the slot stays known it rises at most the budget
+     plus the rate, never goes down, and is always a reported reading. Planted bugs: 34, all caught
+     (two weak tests the first run showed were fixed); the property alone also catches both
+     budget bugs.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

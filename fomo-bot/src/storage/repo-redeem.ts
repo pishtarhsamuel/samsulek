@@ -4,8 +4,8 @@
 // and the order row comes from the verifier's validated snapshot and risk's own canonical text,
 // never from the executor's objects. Everything is checked before the first write: the stored
 // approval, the text (storage hashes it itself) and the snapshot agree field by field, the slot lies
-// within the token's range, the clock is not behind the token's issue, and the position still takes
-// the order. The database adds a consumed, matching token for every order, one buy per position
+// within the token's range, the clock is not behind the token's issue nor more than 15 s past it
+// (review T), and the position still takes the order. The database adds a consumed, matching token for every order, one buy per position
 // ever, and one exit in flight per position.
 import type { RedeemSnapshot } from '../risk/approval.ts';
 import { amountParam, boolCell, hex64Cell, idCell, idParam, lamportsCell, msCell, msCellOrNull, msParam, slotCell, slotParam } from './codec.ts';
@@ -22,6 +22,13 @@ const INSERT_ORDER =
   "INSERT INTO orders (id, intent_id, token_id, position_id, mode, kind, status, plan_hash, plan_json, in_amount, min_out, max_spend, quote_slot, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?)";
 
 const disagree = (what: string): StorageError => new StorageError('bad-param', `expected ${what}`);
+/**
+ * The clock's backstop on a token's life (review T, security 1): a slot feed that lags behind the
+ * chain, or a long wait for the database, could otherwise keep an old token usable. 15 s is the hard
+ * 25 slots (config/caps.ts planFreshSlots) at Solana's 400 ms slot target, with half again of margin;
+ * a test pins the arithmetic. Storage keeps its own copy: it imports core/ only at runtime (s.1).
+ */
+const MAX_USE_AFTER_ISSUE_MS = 15_000;
 
 /**
  * T2 inside the bound token store: true when the token was used now and its order recorded; false,
@@ -74,6 +81,9 @@ export function redeemApproval(tx: Tx, tokenId: string, snapshot: RedeemSnapshot
   }
   if (at < stored.issuedAt) {
     throw disagree('a redeem at or after the token was issued (a clock behind it: a retry gets a new token)');
+  }
+  if (at - stored.issuedAt > MAX_USE_AFTER_ISSUE_MS) {
+    throw disagree('a redeem within 15 s of the token issue (a slot feed behind the chain, or a long wait for the database: a retry gets a new token)');
   }
   const p = readPosition(tx, stored.positionId);
   const takes = p.mode === stored.mode && (stored.kind === 'buy' ? p.status === 'opening' : p.status === 'open' || p.status === 'exiting');

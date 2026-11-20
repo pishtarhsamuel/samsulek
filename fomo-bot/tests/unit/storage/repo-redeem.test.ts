@@ -9,6 +9,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { HARD_CAPS } from '../../../src/config/caps.ts';
 import { firstVersion } from '../../../src/config/changes.ts';
 import { DEFAULT_TUNABLES } from '../../../src/config/tunables.ts';
 import { lamports } from '../../../src/core/units.ts';
@@ -265,6 +266,15 @@ describe('T2 refuses, with nothing written, whatever does not agree', () => {
     withWorld((w) => {
       const token = approveBuy(w);
       assert.equal(w.db.transaction((tx) => redeemApproval(tx, token.id, snapshotOf(token, BUY, 1_025n), canonicalPlan(BUY), REDEEM_AT)), true);
+    });
+  });
+
+  it("a redeem more than 15 s after the token's issue is refused (review T, security 1): the clock bounds a token's life, whatever the slot feed says", () => {
+    assert.equal(15_000, HARD_CAPS.planFreshSlots * 400 * 1.5); // the hard 25 slots at Solana's 400 ms target, half again of margin
+    withWorld((w) => {
+      const token = approveBuy(w); // stored at T
+      refusedInside(w.db, (tx) => redeemApproval(tx, token.id, snapshotOf(token, BUY), canonicalPlan(BUY), T + 15_001), 'bad-param', /within 15 s of the token issue/);
+      assert.equal(w.db.transaction((tx) => redeemApproval(tx, token.id, snapshotOf(token, BUY), canonicalPlan(BUY), T + 15_000)), true);
     });
   });
 

@@ -176,13 +176,33 @@ can trade, and no key or account exists anywhere.
     (now at most 2 SOL, the hard sanity limit); and the rule on who may close a position is
     tighter. 105 of 109 planted bugs are caught; the four left repeat a check another line
     already makes. Their notes for the code that will record trade results are conditions in
-    STORAGE_DESIGN.md s.15.18.
+    STORAGE_DESIGN.md s.15.18. Your decision D7 is in: the paper bankroll stays fixed.
+- Step 6d connects the risk engine to the database, in three parts (the design is
+  STORAGE_DESIGN.md s.16). Part 6d-1 is built (tests first): the one-time approvals.
+  - The bot makes exactly one approval authority per run, with a fresh random key that is never
+    stored; the key is also put on the secret filter's own list, so no text the bot saves or sends
+    can contain it in any common encoding.
+  - Using an approval and recording its order happen in one database step, from what the risk
+    engine checked, never from the trading code's own objects. While new entries are stopped, or
+    after KILL (the KILL file included), no buy approval can be used; a sell always can.
+  - The bot's view of the chain's current slot (its clock for how old a quote is) accepts a new
+    reading only when it is plausible, or when two sources agree; one wild reading is ignored.
+  - Every failure is sorted into a fixed code: refuse this one trade, stop new entries until a
+    restart, or stop the bot. Alerts carry codes only, never data.
+  - 1,065 tests pass. Both Opus reviewers checked it (REVIEWS.md T). The security reviewer
+    approved with notes and confirmed that the trading code cannot misuse an approval. The risk
+    reviewer blocked it: the slot clock could be walked far ahead, or stalled by a clock that
+    steps back, and a buy approval ignored a KILL or halt written by another process. All of it is
+    fixed, and 34 of 34 planted bugs in the fixes are caught. Both reviewers then hit the weekly
+    usage limit before confirming the fixes; with your OK (decision D8) this part is saved as
+    "review pending", and the re-check comes after Nov 23. Nothing builds on it until both confirm.
 - For you to know before live: at 5% per trade, live trading needs at least 0.4 SOL in the
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: the rest of step 6 (6d the approval transactions, 6e the settings and day-state
-  transactions); then chain clients, the paper engine, Telegram and logging.
+- Next: the rest of step 6 (6d-2 the buy and sell transactions, 6d-3 the start-up checks, 6e the
+  settings and day-state transactions); then chain clients, the paper engine, Telegram and
+  logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
