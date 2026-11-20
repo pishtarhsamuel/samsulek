@@ -20,6 +20,7 @@ export const APP_ERROR_CODES = Object.freeze([
   'p95-below-base-fee',
   'entry-count-mismatch',
   'abandon-needs-settlement',
+  'abandon-token-valid',
   'entries-latched',
   'live-not-built',
   'bad-request',
@@ -124,6 +125,19 @@ const SECRET_REFUSAL = 'looks like one:';
 /** repo-redeem.ts's words for a token used too late or with a clock behind its issue: timing, not a bug. */
 const RETRY_WITH_NEW_TOKEN = 'a retry gets a new token';
 const HARD_LIMIT = 'the approval would break a hard limit';
+/**
+ * risk/approve.ts's words for a position list that the database and the snapshot make impossible
+ * (one position per mint, at most four, ids unique, each row's own number): a bug, not a refusal of
+ * this intent alone (review T, risk 4). The approve-tx tests pin these words against risk's throws.
+ */
+const IMPOSSIBLE_POSITIONS: readonly string[] = Object.freeze([
+  'active positions: not a real portfolio',
+  'a position has an unknown strategy',
+  'a position here must be opening, open, exiting or stuck',
+  'two positions share an id',
+  'two active positions share a mint',
+  'an opening position carries its maxSpend',
+]);
 const UNEXPECTED = fault('error:unexpected', 'latch', { bug: true });
 
 /** An own data property (a getter on a look-alike object is not read), or undefined. */
@@ -188,7 +202,8 @@ function classifyKnown(e: unknown): Fault {
   }
   if (e instanceof RiskError) {
     const message = ownValue(e, 'message');
-    return fault('error:risk', 'intent', { bug: typeof message === 'string' && message.startsWith(HARD_LIMIT) });
+    const bug = typeof message === 'string' && (message.startsWith(HARD_LIMIT) || IMPOSSIBLE_POSITIONS.some((words) => message.includes(words)));
+    return fault('error:risk', 'intent', { bug });
   }
   if (e instanceof AmountError) {
     return fault('error:amount', 'intent');
@@ -212,6 +227,23 @@ export function classify(e: unknown): Fault {
     return classifyKnown(e);
   } catch {
     return UNEXPECTED;
+  }
+}
+
+/**
+ * True when the secret filter refused text the bot was given (storage's bad-param in the filter's own
+ * words, read from own data properties): the exit path then retries at once without its inputs, so
+ * no secret-looking text can keep a position from being sold (review T, security on D1). Never throws.
+ */
+export function isSecretRefusal(e: unknown): boolean {
+  try {
+    if (!(e instanceof StorageError) || ownValue(e, 'code') !== 'bad-param') {
+      return false;
+    }
+    const detail = ownValue(e, 'detail');
+    return typeof detail === 'string' && detail.includes(SECRET_REFUSAL);
+  } catch {
+    return false;
   }
 }
 
@@ -262,6 +294,9 @@ export interface FaultSinkOptions {
 
 const BUSY_WINDOW_MS = 10 * 60_000;
 const BUSY_STORM = 3;
+/** Bug-class faults of single intents that repeat: entries latch as a bug (review T, security on D1). */
+const BUG_WINDOW_MS = 10 * 60_000;
+const BUG_STORM = 5;
 const EXIT_ALERT_EVERY_MS = 60_000;
 const isFn = (v: unknown): boolean => typeof v === 'function';
 
@@ -272,6 +307,8 @@ export function createFaultSink(o: FaultSinkOptions): FaultSink {
     throw new TypeError('a fault sink needs the latch, the alert sink, the clock, onFatal and onDiskTrouble');
   }
   let busyTimes: readonly number[] = [];
+  let bugTimes: readonly number[] = [];
+  let bugStorm = false;
   let fatalCalled = false;
   /** Runs an outside call; a throw latches entries as a bug instead of escaping. */
   const contained = (fn: () => void): void => {
@@ -330,6 +367,18 @@ export function createFaultSink(o: FaultSinkOptions): FaultSink {
         alert({ code: f.code, severity: f.bug ? 'bug' : 'warn', codes: where });
       } else if (exit) {
         exitAlert(f.code, where);
+      }
+      if (f.bug && f.scope === 'intent') {
+        // one bug may be one bad request; five in ten minutes is code that cannot be trusted to enter
+        contained(() => {
+          const now = clock.now();
+          bugTimes = [...bugTimes, now].filter((t) => t <= now && now - t <= BUG_WINDOW_MS);
+          if (bugTimes.length >= BUG_STORM && !bugStorm) {
+            bugStorm = true;
+            latch.set('bug');
+            alert({ code: 'bug-storm', severity: 'bug', codes: where });
+          }
+        });
       }
       if (f.disk) {
         contained(() => onDiskTrouble(f.code));
