@@ -28,6 +28,7 @@ import { hexOf } from '../../../src/core/encode.ts';
 import { lamports } from '../../../src/core/units.ts';
 import { approveBuy, type ActivePosition } from '../../../src/risk/approve.ts';
 import { readFlags, readHalts, setHalt, setKill, setPaused } from '../../../src/storage/repo-flags.ts';
+import { verifyAuditChain } from '../../../src/storage/repo-audit.ts';
 import { insertOpening, readPosition } from '../../../src/storage/repo-book.ts';
 import { StorageError, type Db, type Tx } from '../../../src/storage/sqlite.ts';
 import { count, dump } from '../storage/helpers.ts';
@@ -640,6 +641,24 @@ describe('the small writes: the refusal record, KILL and halts', () => {
       assert.ok(other.latch.blocked().includes('kill-write-failed'));
       assert.equal(other.latch.killSeen(), true);
       assert.ok(other.alerts.seen.some((a) => a.code === 'kill-write-failed' && a.severity === 'fatal'));
+    });
+  });
+
+  it('after a KILL or a halt the anchor moves to the newest audit row; already set writes nothing; a failed anchor only alerts (C36)', () => {
+    withWorld((w) => {
+      assert.equal(persistKillTx(w.store, 'sentinel'), 'set');
+      const chain = verifyAuditChain(w.db);
+      assert.deepEqual(w.anchors.written, [{ id: chain.newestId, hash: chain.newestHash, at: chain.newestAt }]);
+      assert.equal(persistKillTx(w.store, 'sentinel'), 'already');
+      assert.equal(w.anchors.written.length, 1);
+      w.clock.advance(5);
+      assert.equal(persistHaltTx(w.store, 'disk-db'), 'set');
+      assert.equal(w.anchors.written.at(-1)?.id, verifyAuditChain(w.db).newestId);
+      assert.equal(w.anchors.written.at(-1)?.at, T + 5);
+      w.anchors.failing = true;
+      assert.equal(persistHaltTx(w.store, 'peak-halt:paper'), 'set', 'the halt stands');
+      assert.ok(w.alerts.seen.some((a) => a.code === 'anchor-write-failed' && a.severity === 'warn'));
+      assert.deepEqual(w.latch.blocked(), [], 'a missed anchor latches nothing: an anchor behind still passes the boot');
     });
   });
 

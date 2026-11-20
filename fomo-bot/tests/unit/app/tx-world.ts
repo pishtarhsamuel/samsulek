@@ -8,6 +8,7 @@ import { entryIntentId, peekExitIntent, persistHaltTx, type EngineDeps, type Ent
 import { createEngineAuthority, type EngineAuthority } from '../../../src/app/authority.ts';
 import { createExitWatch } from '../../../src/app/exit-watch.ts';
 import { createEntryLatch, createFaultSink, type EntryLatch } from '../../../src/app/faults.ts';
+import type { AnchorStore, AuditAnchor } from '../../../src/app/run-files.ts';
 import { bps, lamports, microLamportsPerCu, type Lamports } from '../../../src/core/units.ts';
 import type { Mark } from '../../../src/portfolio/equity.ts';
 import type { OrderPlan } from '../../../src/risk/plan.ts';
@@ -68,6 +69,28 @@ export interface TxWorld {
   readonly authority: EngineAuthority;
   readonly deps: EngineDeps;
   readonly store: StoreDeps;
+  readonly anchors: MemoryAnchors;
+}
+
+/** The audit anchor in memory: what was written, and a switch that makes the next write fail. */
+export interface MemoryAnchors extends AnchorStore {
+  readonly written: AuditAnchor[];
+  failing: boolean;
+}
+
+export function memoryAnchors(): MemoryAnchors {
+  const m: MemoryAnchors = {
+    written: [],
+    failing: false,
+    read: () => m.written.at(-1) ?? null,
+    write: (a) => {
+      if (m.failing) {
+        throw new Error('disk full');
+      }
+      m.written.push(a);
+    },
+  };
+  return m;
 }
 
 /** `setUp: false` for a second handle on a database another world set up already (the race tests). */
@@ -96,7 +119,8 @@ export function txWorld(db: Db = setUpDb(), options: { readonly setUp?: boolean 
       }
     },
   });
-  const store: StoreDeps = Object.freeze({ db, clock, slots, latch, faults, alerts });
+  const anchors = memoryAnchors();
+  const store: StoreDeps = Object.freeze({ db, clock, slots, latch, faults, alerts, anchors });
   late.store = store;
   const authority = createEngineAuthority({ db, clock, slots, rng: testRng(), faults, latch, sentinel });
   const deps: EngineDeps = Object.freeze({
@@ -114,8 +138,9 @@ export function txWorld(db: Db = setUpDb(), options: { readonly setUp?: boolean 
     faults,
     alerts,
     exitWatch: createExitWatch({ alerts, clock, latch }),
+    anchors,
   });
-  return { db, clock, slot, rent, marks, latch, alerts, sentinel, fatal, authority, deps, store };
+  return { db, clock, slot, rent, marks, latch, alerts, sentinel, fatal, authority, deps, store, anchors };
 }
 
 /** A paper buy that passes everything: momentum, MintA, a 0.055 SOL plan for the request's own ids. */

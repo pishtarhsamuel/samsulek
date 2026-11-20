@@ -9,7 +9,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { AUDIT_GENESIS, auditHash } from '../../../src/storage/audit-chain.ts';
-import { ENGINE_AUDIT_ACTIONS, appendEngineAudit, newestAuditId, verifyAuditChain, type EngineAuditAction } from '../../../src/storage/repo-audit.ts';
+import * as auditFile from '../../../src/storage/repo-audit.ts';
+import { ENGINE_AUDIT_ACTIONS, appendEngineAudit, newestAuditId, readAuditRow, verifyAuditChain, type EngineAuditAction } from '../../../src/storage/repo-audit.ts';
 import type { Db } from '../../../src/storage/sqlite.ts';
 import { TEST_NOW, count, migratedDb, removeDir, storageError, tamper, tempDir } from './helpers.ts';
 
@@ -27,6 +28,28 @@ function withDb(fn: (db: Db) => void): void {
 
 const rows = (db: Db): Record<string, unknown>[] =>
   db.all('SELECT id, at, actor, action, detail_json, prev_hash, hash FROM audit_log ORDER BY id').map((r) => ({ ...r }));
+
+describe('the audit readers of step 6d-3: one row by id, and the newest time (s.16.3)', () => {
+  it('exports the engine writer, the readers and the action list, and nothing else', () => {
+    assert.deepEqual(Object.keys(auditFile).sort(), ['ENGINE_AUDIT_ACTIONS', 'appendEngineAudit', 'newestAuditId', 'readAuditRow', 'verifyAuditChain']);
+  });
+
+  it('reads one row as stored: its id, time, actor, action, detail and hash; null for an id it does not hold', () => {
+    withDb((db) => {
+      assert.equal(readAuditRow(db, 1), null);
+      db.transaction((tx) => appendEngineAudit(tx, TEST_NOW, 'engine:kill-set', { source: 'sentinel' }));
+      db.transaction((tx) => appendEngineAudit(tx, TEST_NOW + 7, 'engine:halt-set', { reason: 'disk-db' }));
+      const second = readAuditRow(db, 2);
+      assert.deepEqual(second, { id: 2, at: TEST_NOW + 7, actor: 'engine', action: 'engine:halt-set', detail: { reason: 'disk-db' }, hash: rows(db)[1]?.['hash'] });
+      assert.ok(second !== null && Object.isFrozen(second) && Object.isFrozen(second.detail));
+      assert.equal(readAuditRow(db, 3), null);
+      assert.equal(verifyAuditChain(db).newestAt, TEST_NOW + 7);
+      for (const bad of [0, -1, 1.5, Number.NaN]) {
+        storageError(() => readAuditRow(db, bad), 'bad-param');
+      }
+    });
+  });
+});
 
 describe('the audit chain: ids in order, each row linked to the one before, its own sha256', () => {
   it('appends rows 1, 2, 3, each naming the hash before it (zeros first) and a hash of exactly its own fields', () => {
@@ -48,7 +71,7 @@ describe('the audit chain: ids in order, each row linked to the one before, its 
         assert.equal(auditHash(prev, Number(r['id']), Number(r['at']), String(r['actor']), String(r['action']), String(r['detail_json'])), expected);
         prev = expected;
       }
-      assert.deepEqual(verifyAuditChain(db), { rows: 3, newestId: 3, newestHash: prev });
+      assert.deepEqual(verifyAuditChain(db), { rows: 3, newestId: 3, newestHash: prev, newestAt: TEST_NOW });
     });
   });
 
@@ -159,7 +182,7 @@ describe('verifyAuditChain: a broken log is found, naming the row and never a va
 
   it('an empty log is a whole chain of no rows', () => {
     withDb((db) => {
-      assert.deepEqual(verifyAuditChain(db), { rows: 0, newestId: 0, newestHash: AUDIT_GENESIS });
+      assert.deepEqual(verifyAuditChain(db), { rows: 0, newestId: 0, newestHash: AUDIT_GENESIS, newestAt: null });
     });
   });
 });
