@@ -28,7 +28,7 @@ import { hexOf } from '../../../src/core/encode.ts';
 import { lamports } from '../../../src/core/units.ts';
 import { approveBuy, type ActivePosition } from '../../../src/risk/approve.ts';
 import { readFlags, readHalts, setHalt, setKill, setPaused } from '../../../src/storage/repo-flags.ts';
-import { readPosition } from '../../../src/storage/repo-book.ts';
+import { insertOpening, readPosition } from '../../../src/storage/repo-book.ts';
 import { StorageError, type Db, type Tx } from '../../../src/storage/sqlite.ts';
 import { count, dump } from '../storage/helpers.ts';
 import { T, testKeyBytes } from './world.ts';
@@ -462,6 +462,63 @@ describe('T1 exit', () => {
     });
   });
 
+  it('a malformed exit request runs nothing; a live position is refused (paper only) and uses up its number', () => {
+    withWorld((w) => {
+      openPosition(w.db, 'ps_1');
+      const good = exitRequest(w.deps, 'ps_1');
+      for (const req of [null, { ...good, origin: null }, { ...good, market: null }]) {
+        assert.deepEqual({ ...approveExitTx(w.deps, req as never) }, { kind: 'not-run', code: 'error:bad-request' });
+      }
+      assert.equal(readPosition(w.db, 'ps_1').exitSeq, 0);
+      // a live position (a position never changes its mode, so it is opened live and settled by hand)
+      w.db.transaction((tx) => insertOpening(tx, { id: 'ps_9', mint: 'MintL', strategy: 'momentum', mode: 'live', openedAt: T - 10_000, maxSpend: lamports(30_000_000n) }, lamports(125_000n)));
+      w.db.transaction((tx) => tx.run("UPDATE positions SET status = 'open', max_spend = NULL, token_units = '400000', tokens_bought = '400000' WHERE id = 'ps_9'"));
+      const live = approveExitTx(w.deps, exitRequest(w.deps, 'ps_9', {}, { mint: 'MintL', tokenAccount: 'AtaOfMintL', mode: 'live' }));
+      assert.deepEqual({ ...live }, { kind: 'error', code: 'error:live-not-built', scope: 'intent', recorded: true });
+      assert.equal(readPosition(w.db, 'ps_9').exitSeq, 1);
+    });
+  });
+
+  it('an alert sink that throws latches entries as a bug and never stops the exit', () => {
+    withWorld((w) => {
+      openPosition(w.db, 'ps_1');
+      w.db.transaction((tx) => tx.run("UPDATE positions SET exit_seq = 9999 WHERE id = 'ps_1'"));
+      const loud: EngineDeps = {
+        ...w.deps,
+        alerts: {
+          alert: () => {
+            throw new Error('telegram down');
+          },
+        },
+      };
+      exitApproved(approveExitTx(loud, exitRequest(w.deps, 'ps_1')));
+      assert.deepEqual(w.latch.blocked(), ['bug']);
+    });
+  });
+
+  it('a sale whose sell simulation did not pass is refused (RISK_POLICY s.3a)', () => {
+    withWorld((w) => {
+      openPosition(w.db, 'ps_1');
+      const o = approveExitTx(w.deps, exitRequest(w.deps, 'ps_1', { origin: { kind: 'automatic', sellSimPassed: false } }));
+      assert.ok(o.kind === 'refused' && o.problems.includes('sell-sim-not-passed'), JSON.stringify(o.kind));
+    });
+  });
+
+  it('an approved exit ends the run of refusals: no exit-blocked after it (review T, risk 4)', () => {
+    withWorld((w) => {
+      openPosition(w.db, 'ps_1');
+      for (let i = 0; i < 4; i += 1) {
+        approveExitTx(w.deps, exitRequest(w.deps, 'ps_1', {}, { slippageBps: 600 as never }));
+      }
+      exitApproved(approveExitTx(w.deps, exitRequest(w.deps, 'ps_1', {}, { orderId: 'order-7' })));
+      w.slot.value = 1_026n; // the token expired unused: the next exit is no longer in flight
+      const market = { ...EXIT_MARKET, quote: { ...EXIT_MARKET.quote, slot: 1_026n, feeConfigSlot: 1_020n } };
+      const again = approveExitTx(w.deps, exitRequest(w.deps, 'ps_1', { market }, { slippageBps: 600 as never, quoteSlot: 1_026n, feeConfigSlot: 1_020n }));
+      assert.equal(again.kind, 'refused');
+      assert.equal(w.alerts.seen.filter((a) => a.code === 'exit-blocked').length, 0);
+    });
+  });
+
   it('exit number 10,000 warns (C53)', () => {
     withWorld((w) => {
       openPosition(w.db, 'ps_1');
@@ -556,6 +613,24 @@ describe('the small writes: the refusal record, KILL and halts', () => {
         w.alerts.seen.filter((a) => a.code === 'halt-write-failed').map((a) => a.codes),
         [['error:storage-closed']],
       );
+    });
+  });
+
+  it('a full disk while the disk-db halt is written asks for it once, never again and again', () => {
+    withWorld((w) => {
+      let attempts = 0;
+      const full = {
+        transaction: () => {
+          attempts += 1;
+          throw new StorageError('full', 'database or disk is full');
+        },
+      } as unknown as Db;
+      const store = { ...w.store, db: full };
+      // a sink wired as the engine wires it: a disk fault asks for the halt
+      const deps = { ...store, faults: { report: (_site: string, f: { disk: boolean }) => (f.disk ? persistHaltTx(store, 'disk-db') : undefined) } } as unknown as typeof w.store;
+      assert.equal(persistHaltTx(deps, 'disk-db'), 'failed');
+      assert.equal(attempts, 1);
+      assert.ok(w.latch.blocked().includes('halt-write-failed'));
     });
   });
 

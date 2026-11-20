@@ -425,11 +425,24 @@ export function checkSource(rel: string, text: string): string[] {
 
   const isCrypto = (spec: ts.Expression | undefined): boolean =>
     spec !== undefined && ts.isStringLiteral(spec) && (spec.text === 'node:crypto' || spec.text === 'crypto');
+  // C2 (review L): the reserve's per-position exit budget is what the reserve HOLDS, never an allowance
+  // to spend, so only risk/ may import it; app/caps.ts has its own failed-fee budget (6d-2)
+  const isReserve = (spec: string): boolean =>
+    folder !== 'risk' && spec.startsWith('.') && path.relative(SRC, path.resolve(SRC, path.dirname(rel), spec)).split(path.sep).join('/').toLowerCase() === 'risk/reserve.ts';
+  const BUDGET_RULE = 'positionExitBudget stays inside risk/ (C2): the reserve holds it, nothing spends it';
 
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
       const clause = node.importClause;
       checkSpecifier(node.moduleSpecifier.text, clause?.isTypeOnly === true);
+      if (clause !== undefined && !clause.isTypeOnly && isReserve(node.moduleSpecifier.text)) {
+        const named = clause.namedBindings;
+        if (clause.name !== undefined || (named !== undefined && ts.isNamespaceImport(named))) {
+          problems.push(`${rel}: import risk/reserve.ts by name outside risk/: ${BUDGET_RULE}`);
+        } else if (named !== undefined && ts.isNamedImports(named) && named.elements.some((e) => !e.isTypeOnly && (e.propertyName ?? e.name).text === 'positionExitBudget')) {
+          problems.push(`${rel}: ${BUDGET_RULE}`);
+        }
+      }
       if (isCrypto(node.moduleSpecifier) && clause !== undefined && !clause.isTypeOnly) {
         const bindings = clause.namedBindings;
         if (clause.name !== undefined || (bindings !== undefined && ts.isNamespaceImport(bindings))) {
@@ -460,6 +473,9 @@ export function checkSource(rel: string, text: string): string[] {
           checkSpecifier(arg.text, false, false, true);
           if (isCrypto(arg)) {
             problems.push(`${rel}: node:crypto may not be imported dynamically`);
+          }
+          if (isReserve(arg.text)) {
+            problems.push(`${rel}: risk/reserve.ts is not imported dynamically outside risk/: ${BUDGET_RULE}`);
           }
         } else {
           problems.push(`${rel}: dynamic import with a non-literal specifier`);
@@ -1358,6 +1374,155 @@ export function sqlProblems(program: ts.Program, srcRoot: string): TypedRuleResu
     visit(sf);
   }
   return { problems, calls, writes, uses, restrictedCalls, auditCalls };
+}
+
+export interface NoCatchResult {
+  readonly problems: string[];
+  /** Transaction callbacks found in app/ and cli/. */
+  readonly callbacks: number;
+  /** Function bodies followed from them. */
+  readonly followed: number;
+}
+
+/**
+ * No catch inside a transaction (C32; STORAGE_DESIGN s.16.7.4), with the type checker, over app/ and
+ * cli/. A repository's precondition refusal is thrown before its statement runs, so the runtime
+ * backstop (a statement that threw sinks its transaction even if caught) cannot see it being
+ * swallowed; this rule can:
+ * 1. the argument of every call of Db.transaction (resolved to storage/sqlite.ts) is an arrow function
+ *    or a function expression written in place;
+ * 2. its body, nested functions included, has no try statement and calls no member named catch, then
+ *    or finally;
+ * 3. every call (or `new`) in it of a function, method or class declared in app/ or cli/ is followed,
+ *    with a visited set, and that body is held to rules 2 to 4;
+ * 4. a value typed Reader, Tx or Db of storage/sqlite.ts, or a function literal, is passed only to a
+ *    function declared in storage/, app/ or cli/ (followed by rule 3) or in TypeScript's own lib files
+ *    (Promise's members excepted): an interface method, a parameter or a variable of function type
+ *    never receives the transaction or a closure over it;
+ * 5. in storage/ (sqlite.ts and migrations.ts excepted) every catch block ends with a throw.
+ * LIMIT, written down: code behind an interface or reached through `this` is not followed (rule 4
+ * keeps the transaction from it; app/ has no classes with such methods); review is the guard there.
+ */
+export function noCatchProblems(program: ts.Program, srcRoot: string): NoCatchResult {
+  const checker = program.getTypeChecker();
+  const relOf = (sf: ts.SourceFile): string => path.relative(srcRoot, sf.fileName).split(path.sep).join('/');
+  const inSrc = (rel: string): boolean => !rel.startsWith('..') && !path.isAbsolute(rel);
+  const problems: string[] = [];
+  let callbacks = 0;
+  let followed = 0;
+  const visited = new Set<ts.Node>();
+
+  const declarationOf = (callee: ts.Expression): ts.Declaration | undefined => {
+    const at = ts.isPropertyAccessExpression(callee) ? callee.name : callee;
+    let symbol = checker.getSymbolAtLocation(at);
+    if (symbol !== undefined && (symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      symbol = checker.getAliasedSymbol(symbol);
+    }
+    return symbol?.valueDeclaration ?? symbol?.declarations?.[0];
+  };
+  /** The body a call of this declaration runs, when it is one the rule can follow. */
+  const bodyOf = (d: ts.Declaration): ts.Node | undefined => {
+    if ((ts.isFunctionDeclaration(d) || ts.isMethodDeclaration(d)) && d.body !== undefined) {
+      return d.body;
+    }
+    if (ts.isVariableDeclaration(d) && d.initializer !== undefined && (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer))) {
+      return d.initializer.body;
+    }
+    if (ts.isClassDeclaration(d)) {
+      return d.members.find((m): m is ts.ConstructorDeclaration => ts.isConstructorDeclaration(m))?.body;
+    }
+    return undefined;
+  };
+  const folderOf = (rel: string): string => rel.split('/')[0] ?? '';
+  const isPromiseMember = (d: ts.Declaration): boolean => {
+    for (let n: ts.Node | undefined = d.parent; n !== undefined; n = n.parent) {
+      if ((ts.isInterfaceDeclaration(n) || ts.isClassDeclaration(n)) && n.name !== undefined && n.name.text.includes('Promise')) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const isHandleType = (type: ts.Type): boolean =>
+    (type.isUnion() ? type.types : [type]).some((t) => {
+      const symbol = t.getSymbol() ?? t.aliasSymbol;
+      return symbol !== undefined && HANDLE_TYPES.has(symbol.name) && (symbol.declarations ?? []).some((d) => relOf(d.getSourceFile()) === SQLITE_FILE);
+    });
+  const isTransactionCall = (call: ts.CallExpression): boolean => {
+    if (!ts.isPropertyAccessExpression(call.expression) || call.expression.name.text !== 'transaction') {
+      return false;
+    }
+    const d = declarationOf(call.expression);
+    return d !== undefined && relOf(d.getSourceFile()) === SQLITE_FILE;
+  };
+
+  const checkBody = (rel: string, where: string, root: ts.Node): void => {
+    const visit = (node: ts.Node): void => {
+      if (ts.isTryStatement(node)) {
+        problems.push(`${rel}: no try inside a transaction callback (${where})`);
+      }
+      if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+        const callee = node.expression;
+        if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(callee) && ['catch', 'then', 'finally'].includes(callee.name.text)) {
+          problems.push(`${rel}: no .${callee.name.text}( inside a transaction callback (${where})`);
+        }
+        const d = declarationOf(callee);
+        const dRel = d === undefined ? '' : relOf(d.getSourceFile());
+        const body = d === undefined ? undefined : bodyOf(d);
+        const carries = (node.arguments ?? []).some((a) => ts.isArrowFunction(a) || ts.isFunctionExpression(a) || isHandleType(checker.getTypeAtLocation(a)));
+        if (carries) {
+          const ours = d !== undefined && body !== undefined && inSrc(dRel) && ['storage', 'app', 'cli'].includes(folderOf(dRel));
+          const lib = d !== undefined && program.isSourceFileDefaultLibrary(d.getSourceFile()) && !isPromiseMember(d);
+          if (!ours && !lib) {
+            problems.push(`${rel}: the transaction, or a function literal, goes only to a function of storage/, app/ or cli/, or of TypeScript's own lib (${where})`);
+          }
+        }
+        if (body !== undefined && inSrc(dRel) && ['app', 'cli'].includes(folderOf(dRel)) && !visited.has(body)) {
+          visited.add(body);
+          followed += 1;
+          checkBody(dRel, `followed from ${rel}`, body);
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(root);
+  };
+
+  for (const sf of program.getSourceFiles()) {
+    const rel = relOf(sf);
+    if (!inSrc(rel) || sf.isDeclarationFile) {
+      continue;
+    }
+    const folder = folderOf(rel);
+    if (folder === 'storage' && rel !== SQLITE_FILE && rel !== 'storage/migrations.ts') {
+      const visitCatch = (node: ts.Node): void => {
+        if (ts.isCatchClause(node)) {
+          const last = node.block.statements.at(-1);
+          if (last === undefined || !ts.isThrowStatement(last)) {
+            problems.push(`${rel}: a catch block in storage/ ends with a throw (a repository never swallows a refusal)`);
+          }
+        }
+        ts.forEachChild(node, visitCatch);
+      };
+      visitCatch(sf);
+    }
+    if (folder !== 'app' && folder !== 'cli') {
+      continue;
+    }
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && isTransactionCall(node)) {
+        callbacks += 1;
+        const fn = node.arguments[0];
+        if (fn === undefined || !(ts.isArrowFunction(fn) || ts.isFunctionExpression(fn))) {
+          problems.push(`${rel}: a transaction callback is written in place (an arrow function or a function expression)`);
+        } else {
+          checkBody(rel, 'a transaction callback', fn.body);
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+  }
+  return { problems, callbacks, followed };
 }
 
 /** A program over virtual source files (for the canaries), checked with the project's options. */
@@ -2343,5 +2508,84 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('architecture: the approval transactions of step 6d-2 (STORAGE_DESIGN s.16.7.4)', () => {
+  it('CANARY: positionExitBudget stays inside risk/ (C2, review L): by name, by namespace, by default or dynamically', () => {
+    const why = 'positionExitBudget stays inside risk/';
+    flaggedFor([
+      ['app/x.ts', "import { positionExitBudget } from '../risk/reserve.ts';", why],
+      ['app/x.ts', "import { positionExitBudget as budget } from '../risk/reserve.ts';", why],
+      ['app/x.ts', "import * as reserve from '../risk/reserve.ts';", why],
+      ['app/x.ts', "import reserve from '../risk/reserve.ts';", why],
+      ['app/x.ts', "export const f = (): unknown => import('../risk/reserve.ts');", why],
+      ['app/x.ts', "import { positionExitBudget } from '../risk/RESERVE.ts';", why],
+    ]);
+    for (const [rel, text] of [
+      ['risk/x.ts', "import { positionExitBudget } from './reserve.ts';"],
+      ['app/x.ts', "import { BASE_FEE_PER_SIGNATURE, RiskError, attemptCost } from '../risk/reserve.ts';"],
+      ['app/x.ts', "import type { ReserveCaps } from '../risk/reserve.ts';"],
+    ] as const) {
+      assert.deepEqual(checkSource(rel, text), [], text);
+    }
+  });
+
+  it('no catch inside a transaction: every app/ transaction callback is written in place and followed, and nothing in it catches (C32)', () => {
+    const files = sourceFiles().map((rel) => path.join(SRC, rel));
+    const { problems, callbacks, followed } = noCatchProblems(ts.createProgram(files, compilerOptions()), SRC);
+    assert.deepEqual(problems, []);
+    // non-vacuity: the token store's T2 and the seven of app/approve-tx.ts, and the helpers they call
+    assert.ok(callbacks >= 8, `the rule saw ${callbacks} transaction callbacks`);
+    assert.ok(followed >= 8, `the rule followed ${followed} function bodies`);
+  });
+
+  it('CANARY: each way to catch inside a transaction is caught for its own reason (C32; V7)', () => {
+    const STUB = [
+      'export type SqlParam = string | bigint | null;',
+      'export interface Reader { get(sql: string, ...p: SqlParam[]): unknown; all(sql: string, ...p: SqlParam[]): readonly unknown[]; }',
+      'export interface Tx extends Reader { run(sql: string, ...p: SqlParam[]): number; script(sql: string): void; }',
+      'export interface Db extends Reader { readonly file: string; transaction<T>(fn: (tx: Tx) => T): T; close(): void; }',
+    ].join('\n');
+    const HEAD = "import type { Db, Tx } from '../storage/sqlite.ts';\nimport { write } from '../storage/repo-ok.ts';\n";
+    const tryIn = 'no try inside a transaction callback';
+    const handed = 'goes only to a function of storage/, app/ or cli/';
+    const bad: Record<string, readonly [string, ...string[]]> = {
+      'app/c1.ts': [`${HEAD}export const f = (db: Db): number => db.transaction(() => { try { return 1; } catch { return 2; } });`, tryIn],
+      'app/c2.ts': [`${HEAD}export const f = (db: Db): number => db.transaction(() => { const g = (): number => { try { return 1; } catch { return 2; } }; return g(); });`, tryIn],
+      'app/c3.ts': [`${HEAD}const step = (tx: Tx): number => tx.run('UPDATE t SET x = 1');\nexport const f = (db: Db): number => db.transaction(step);`, 'a transaction callback is written in place'],
+      'app/c4.ts': [`${HEAD}const helper = (): number => { try { return 1; } catch { return 2; } };\nexport const f = (db: Db): number => db.transaction(() => helper());`, `${tryIn} (followed from app/c4.ts)`],
+      'app/c5.ts': [
+        `${HEAD}function inner(): number { try { return 1; } catch { return 2; } }\nconst outer = (): number => inner();\nexport const f = (db: Db): number => db.transaction(() => outer());`,
+        tryIn,
+      ],
+      'app/c6.ts': [`${HEAD}export const f = (db: Db, g: (t: Tx) => void): void => db.transaction((tx) => g(tx));`, handed],
+      'app/c7.ts': [`${HEAD}interface Each { each(fn: () => void): void }\nexport const f = (db: Db, e: Each): void => db.transaction((tx) => e.each(() => write(tx, 'x')));`, handed],
+      'app/c8.ts': [`${HEAD}export const f = (db: Db): number => db.transaction(() => { void Promise.resolve(1).catch(() => 0); return 1; });`, 'no .catch( inside a transaction callback', handed],
+      'app/c9.ts': [`${HEAD}export const f = (db: Db): void => db.transaction(() => { void Promise.resolve(1).then(() => 0).finally(() => undefined); });`, 'no .then(', 'no .finally('],
+      'app/c10.ts': [`${HEAD}class Swallow { constructor() { try { void 0; } catch { void 0; } } }\nexport const f = (db: Db): Swallow => db.transaction(() => new Swallow());`, tryIn],
+      // a variable of function type: what it holds is not known, so it never receives the transaction
+      'app/c11.ts': [`${HEAD}const send = (x: unknown): void => { void x; };\nexport const f = (db: Db): void => db.transaction((tx) => { const sink: (t: Tx) => void = send; sink(tx); });`, handed],
+      'storage/repo-c12.ts': ["export function f(): number { try { return 1; } catch { return 2; } }", 'a catch block in storage/ ends with a throw'],
+    };
+    const ok: Record<string, string> = {
+      'storage/repo-ok.ts': [
+        "import type { Tx } from './sqlite.ts';",
+        "export function write(tx: Tx, x: string): void { tx.run('INSERT INTO t VALUES (?)', x); }",
+        "export function read(text: string): unknown { try { return JSON.parse(text); } catch { throw new Error('bad'); } }",
+      ].join('\n'),
+      'app/ok.ts': [
+        HEAD,
+        // a try around the whole transaction call is how errors are handled: after the rollback
+        'export const a = (db: Db, rows: readonly string[]): void => { try { db.transaction((tx) => { rows.forEach((x) => write(tx, x)); }); } catch (e) { void e; } };',
+        'const helper = (tx: Tx, x: string): void => write(tx, x);',
+        'export const b = (db: Db): void => db.transaction((tx) => helper(tx, \'y\'));',
+        'export const c = (db: Db): string[] => db.transaction(() => [1, 2].map((n) => String(n)));',
+      ].join('\n'),
+    };
+    const { program, srcRoot } = virtualProgram({ 'storage/sqlite.ts': STUB, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])), ...ok });
+    const { problems } = noCatchProblems(program, srcRoot);
+    typedFlaggedFor(problems, bad);
+    assert.deepEqual(problems.filter((p) => p.startsWith('app/ok.ts:') || p.startsWith('storage/repo-ok.ts:')), []);
   });
 });

@@ -145,7 +145,14 @@ describe('isSecretRefusal: the secret filter refused the text the bot was given 
     const forged = new StorageError('bad-param', 'x');
     Object.defineProperty(forged, 'detail', { get: () => 'it looks like one: own-secret' });
     const otherCode = new StorageError('constraint', 'it looks like one: own-secret');
+    // a look-alike that passes instanceof and throws when its fields are read: still false, never a throw
+    const hostile = new Proxy(new StorageError('bad-param', 'x'), {
+      getOwnPropertyDescriptor: () => {
+        throw new Error('trap');
+      },
+    });
     for (const e of [
+      hostile,
       new StorageError('bad-param', 'expected a redeem within 15 s of the token issue (a retry gets a new token)'),
       new StorageError('bad-param', 'expected a code'),
       otherCode,

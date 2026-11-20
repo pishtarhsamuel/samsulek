@@ -500,6 +500,9 @@ function exitOnce(deps: EngineDeps, req: ExitRequest, retried: boolean): ExitOut
       return exitOnce(deps, { ...parts, reasons: [INPUTS_REFUSED], inputs: {} }, true);
     }
     deps.exitWatch.failed(p.id);
+    if (f.busy) {
+      return Object.freeze({ kind: 'error', code: f.code, scope: f.scope, recorded: false }); // a retry may succeed: no number used
+    }
     const answer = recordRefusalTx(deps, { kind: 'exit', req: parts }, f.code, read.slot);
     return Object.freeze({ kind: 'error', code: f.code, scope: f.scope, recorded: answer === 'recorded' });
   }

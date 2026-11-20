@@ -8,7 +8,7 @@ import { entryIntentId, peekExitIntent, persistHaltTx, type EngineDeps, type Ent
 import { createEngineAuthority, type EngineAuthority } from '../../../src/app/authority.ts';
 import { createExitWatch } from '../../../src/app/exit-watch.ts';
 import { createEntryLatch, createFaultSink, type EntryLatch } from '../../../src/app/faults.ts';
-import { bps, lamports, type Lamports } from '../../../src/core/units.ts';
+import { bps, lamports, microLamportsPerCu, type Lamports } from '../../../src/core/units.ts';
 import type { Mark } from '../../../src/portfolio/equity.ts';
 import type { OrderPlan } from '../../../src/risk/plan.ts';
 import { insertOpening } from '../../../src/storage/repo-book.ts';
@@ -36,6 +36,17 @@ export const MARKET: EntryRequest['market'] = Object.freeze({
   liveRampHalf: false,
 }) as EntryRequest['market'];
 
+/** A 0.025 SOL buy (for the exposure races): 2% slippage, and landing fees inside 0.2% of its input. */
+export const SMALL_PLAN: Partial<OrderPlan> = Object.freeze({
+  inAmount: 25_000_000n,
+  expectedOut: 450_000_000n,
+  minOut: 441_000_000n,
+  cuPrice: microLamportsPerCu(100_000n),
+});
+
+/** Risk's own quote for the small plan's input. */
+export const SMALL_MARKET: EntryRequest['market'] = Object.freeze({ ...MARKET, quotedOut: 450_000_000n });
+
 export const EXIT_MARKET: ExitRequest['market'] = Object.freeze({
   quote: Object.freeze({ slot: 1_000n, feeBps: bps(125), feeConfigSlot: 995n }),
   quotedOut: 1_000_000_000n,
@@ -59,8 +70,11 @@ export interface TxWorld {
   readonly store: StoreDeps;
 }
 
-export function txWorld(db: Db = setUpDb()): TxWorld {
-  db.transaction((tx) => setStrategyMode(tx, T - 1, 'owner-telegram', 'momentum', 'paper'));
+/** `setUp: false` for a second handle on a database another world set up already (the race tests). */
+export function txWorld(db: Db = setUpDb(), options: { readonly setUp?: boolean } = {}): TxWorld {
+  if (options.setUp !== false) {
+    db.transaction((tx) => setStrategyMode(tx, T - 1, 'owner-telegram', 'momentum', 'paper'));
+  }
   const clock = testClock();
   const slot: { value: bigint | null } = { value: SLOT };
   const slots = { currentSlot: (): bigint | null => slot.value };
