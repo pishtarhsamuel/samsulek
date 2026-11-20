@@ -21,6 +21,7 @@ export const APP_ERROR_CODES = Object.freeze([
   'entry-count-mismatch',
   'abandon-needs-settlement',
   'abandon-token-valid',
+  'position-not-sellable',
   'entries-latched',
   'live-not-built',
   'bad-request',
@@ -369,10 +370,11 @@ export function createFaultSink(o: FaultSinkOptions): FaultSink {
         exitAlert(f.code, where);
       }
       if (f.bug && f.scope === 'intent') {
-        // one bug may be one bad request; five in ten minutes is code that cannot be trusted to enter
+        // one bug may be one bad request; five in ten minutes is code that cannot be trusted to enter.
+        // A fault the clock now puts in the future (it stepped back) is recent in real time: it stays.
         contained(() => {
           const now = clock.now();
-          bugTimes = [...bugTimes, now].filter((t) => t <= now && now - t <= BUG_WINDOW_MS);
+          bugTimes = [...bugTimes, now].filter((t) => now - t <= BUG_WINDOW_MS);
           if (bugTimes.length >= BUG_STORM && !bugStorm) {
             bugStorm = true;
             latch.set('bug');

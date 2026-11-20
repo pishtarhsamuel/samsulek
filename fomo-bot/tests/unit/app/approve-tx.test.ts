@@ -31,6 +31,7 @@ import { readFlags, readHalts, setHalt, setKill, setPaused } from '../../../src/
 import { insertOpening, readPosition } from '../../../src/storage/repo-book.ts';
 import { StorageError, type Db, type Tx } from '../../../src/storage/sqlite.ts';
 import { count, dump } from '../storage/helpers.ts';
+import { CLOSE } from '../storage/money-fixtures.ts';
 import { T, testKeyBytes } from './world.ts';
 import { EXIT_MARKET, MARKET, RENT, SLOT, WINDOW, entryRequest, exitRequest, openPosition, txWorld, type TxWorld } from './tx-world.ts';
 
@@ -501,6 +502,47 @@ describe('T1 exit', () => {
       openPosition(w.db, 'ps_1');
       const o = approveExitTx(w.deps, exitRequest(w.deps, 'ps_1', { origin: { kind: 'automatic', sellSimPassed: false } }));
       assert.ok(o.kind === 'refused' && o.problems.includes('sell-sim-not-passed'), JSON.stringify(o.kind));
+    });
+  });
+
+  it('errors after the position was read count toward exit-blocked too (planted bug, run29)', () => {
+    withWorld((w) => {
+      openPosition(w.db, 'ps_1');
+      for (let i = 0; i < 5; i += 1) {
+        const o = approveExitTx(w.deps, exitRequest(w.deps, 'ps_1', { plan: null as never }));
+        assert.equal(o.kind, 'error');
+      }
+      assert.deepEqual(
+        w.alerts.seen.filter((a) => a.code === 'exit-blocked').map((a) => a.codes),
+        [['ps_1']],
+      );
+    });
+  });
+
+  it('an exiting position (every token sold) gets its account close approved (planted bug, run30)', () => {
+    withWorld((w) => {
+      openPosition(w.db, 'ps_1');
+      // what T3 will do once the last token is sold, written by hand: the account close is what is left
+      w.db.transaction((tx) => tx.run("UPDATE positions SET status = 'exiting', token_units = '0', tokens_sold = '400000' WHERE id = 'ps_1'"));
+      const { intentId: _intent, positionId: _position, ...close } = CLOSE;
+      const o = exitApproved(approveExitTx(w.deps, exitRequest(w.deps, 'ps_1', { market: { ...EXIT_MARKET, quotedOut: 0n } }, close)));
+      assert.equal(o.token.kind, 'close-account');
+    });
+  });
+
+  it('an exit of a position that cannot be sold (opening or closed) runs nothing and latches nothing', () => {
+    withWorld((w) => {
+      assert.equal(approveBuyTx(w.deps, entryRequest()).kind, 'approved');
+      const before = dump(w.db);
+      const opening = approveExitTx(w.deps, exitRequest(w.deps, 'ps_new1'));
+      assert.deepEqual({ ...opening }, { kind: 'not-run', code: 'error:position-not-sellable' });
+      assert.equal(dump(w.db), before);
+      w.slot.value = 1_026n;
+      assert.equal(abandonOpeningTx(w.store, 'ps_new1').kind, 'abandoned');
+      const closed = approveExitTx(w.deps, exitRequest(w.deps, 'ps_new1'));
+      assert.deepEqual({ ...closed }, { kind: 'not-run', code: 'error:position-not-sellable' });
+      assert.deepEqual(w.latch.blocked(), []);
+      assert.ok(w.alerts.seen.some((a) => a.code === 'error:position-not-sellable' && a.severity === 'warn'), 'the exit path warns');
     });
   });
 

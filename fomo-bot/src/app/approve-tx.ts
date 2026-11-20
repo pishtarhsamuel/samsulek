@@ -425,6 +425,11 @@ function exitOnce(deps: EngineDeps, req: ExitRequest, retried: boolean): ExitOut
       }
       read.slot = slot;
       const p = readPosition(tx, x.positionId);
+      if (p.status !== 'open' && p.status !== 'exiting') {
+        // an opening or closed position takes no exit number (repo-book.ts): nothing is written, and
+        // an exit loop that raced a settlement or asked too early is told, never latched as a bug
+        throw new AppError('position-not-sellable', 'only an open or exiting position is sold');
+      }
       read.position = p;
       if (p.mode !== 'paper') {
         throw new AppError('live-not-built', 'only paper positions exist until Phase 8');

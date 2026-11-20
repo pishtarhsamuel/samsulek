@@ -2567,6 +2567,14 @@ describe('architecture: the approval transactions of step 6d-2 (STORAGE_DESIGN s
       // a variable of function type: what it holds is not known, so it never receives the transaction
       'app/c11.ts': [`${HEAD}const send = (x: unknown): void => { void x; };\nexport const f = (db: Db): void => db.transaction((tx) => { const sink: (t: Tx) => void = send; sink(tx); });`, handed],
       'storage/repo-c12.ts': ["export function f(): number { try { return 1; } catch { return 2; } }", 'a catch block in storage/ ends with a throw'],
+      // V7: the callee is found through an aliased import, a namespace member and an object's method
+      'app/c13-lib.ts': ['export function risky(): number { try { return 1; } catch { return 2; } }', `${tryIn} (followed from app/c13.ts)`],
+      'app/c14-lib.ts': ['export function risky(): number { try { return 1; } catch { return 2; } }', `${tryIn} (followed from app/c14.ts)`],
+      'app/c15.ts': [`${HEAD}const o = { m(): number { try { return 1; } catch { return 2; } } };\nexport const f = (db: Db): number => db.transaction(() => o.m());`, `${tryIn} (followed from app/c15.ts)`],
+    };
+    const callers: Record<string, string> = {
+      'app/c13.ts': `${HEAD}import { risky as r } from './c13-lib.ts';\nexport const f = (db: Db): number => db.transaction(() => r());`,
+      'app/c14.ts': `${HEAD}import * as lib from './c14-lib.ts';\nexport const f = (db: Db): number => db.transaction(() => lib.risky());`,
     };
     const ok: Record<string, string> = {
       'storage/repo-ok.ts': [
@@ -2583,7 +2591,7 @@ describe('architecture: the approval transactions of step 6d-2 (STORAGE_DESIGN s
         'export const c = (db: Db): string[] => db.transaction(() => [1, 2].map((n) => String(n)));',
       ].join('\n'),
     };
-    const { program, srcRoot } = virtualProgram({ 'storage/sqlite.ts': STUB, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])), ...ok });
+    const { program, srcRoot } = virtualProgram({ 'storage/sqlite.ts': STUB, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])), ...callers, ...ok });
     const { problems } = noCatchProblems(program, srcRoot);
     typedFlaggedFor(problems, bad);
     assert.deepEqual(problems.filter((p) => p.startsWith('app/ok.ts:') || p.startsWith('storage/repo-ok.ts:')), []);

@@ -76,6 +76,7 @@ describe('classify: each throw to its code, scope and alerts', () => {
       'slot-unknown': fault('error:slot-unknown', 'intent'),
       'abandon-needs-settlement': fault('error:abandon-needs-settlement', 'intent'),
       'abandon-token-valid': fault('error:abandon-token-valid', 'intent'),
+      'position-not-sellable': fault('error:position-not-sellable', 'intent'),
       'entries-latched': fault('error:entries-latched', 'intent'),
       'rent-unknown': fault('error:rent-unknown', 'intent', { warn: true }),
       'p95-below-base-fee': fault('error:p95-below-base-fee', 'intent', { warn: true }),
@@ -376,13 +377,13 @@ describe('the bug storm (review T, security on D1): bug-class intent faults latc
     assert.equal(latched.alerts.filter((a) => a.code === 'bug-storm').length, 0, 'a latch fault latches on its own');
   });
 
-  it('a clock that steps back neither counts old faults twice nor throws', () => {
+  it('a clock that steps back does not wipe the faults it just saw (run29): they still count, and nothing throws', () => {
     const w = sinkWorld();
-    w.sink.report('t1-buy', bug);
-    w.advance(-3_600_000);
-    for (let i = 0; i < 3; i += 1) {
+    for (let i = 0; i < 4; i += 1) {
       w.sink.report('t1-buy', bug);
     }
-    assert.deepEqual(w.latch.blocked(), [], 'a fault from the future is not in the window');
+    w.advance(-3_600_000); // the four are seconds old in real time, an hour "ahead" of the clock
+    w.sink.report('t1-buy', bug);
+    assert.deepEqual(w.latch.blocked(), ['bug'], 'the fifth makes the storm');
   });
 });

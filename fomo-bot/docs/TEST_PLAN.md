@@ -278,6 +278,62 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      (two weak tests the first run showed were fixed); the property alone also catches both
      budget bugs.
 
+   Done in step 6d-2 (the approval transactions, STORAGE_DESIGN s.16.15; UNREVIEWED, owner decision
+   D9, on its own branch until both reviewers approve):
+   - The caps: every field of the buy, plan and day caps from its tunable or its hard value; every
+     tunable at both bounds stays inside the hard values; the chain rent changes the reserve and
+     nothing else, and no tunable can change it (review L); the failed-fee budget 3,375,000, below
+     the reserve's 3,380,000; paper's bankroll from the stored deposit, refused for a withdrawal, a
+     zero deposit, a deposit over 2 SOL, the live account and the live mode.
+   - The snapshot: each entry flag from its row (KILL stored or seen, every halt row of either mode,
+     each mode's streak halt, the recovery wait after a cleared KILL, the pause, the low-equity stop,
+     the paper day's daily stop and held jump, the modes, the five kinds of ban, the day's count, the
+     active config's limits); openings at their held-back spend, open positions at a fresh mark; a
+     missing, stale or wrong-holding mark makes equity unknown (30 s exactly is fresh); a live
+     position, a live mode, a stuck row, a missing account or config refused.
+   - T1 buy: exactly the intent, the opening, the count, the decision and the approval, the stored
+     p95 the market's, the token after COMMIT and redeemable; the identity over a market's wallet;
+     a duplicate and a latched entry write nothing (the database untouched when latched); the KILL
+     file stores KILL first; KILL from another connection marks the latch; each refusal stage
+     recorded; a live request, an unknown rent, a p95 of 4,999 (5,000 passes), an unknown slot (slot
+     0) and a throw after the slot read (the slot kept) recorded with no inputs; a malformed request
+     unrecorded; a secret-looking input recorded without it; a count that moved latches as a bug;
+     a COMMIT of unknown outcome returns no token and calls onFatal once; risk's words for
+     impossible position lists are bugs, pinned against risk's own throws.
+   - T1 exit: the number used up when approved and when refused, mint and mode from the position; a
+     plan for a stale number refused wrong-intent; an unused unexpired exit token blocks, an expired
+     one does not, a used one counts as its order; no flag (KILL, a halt, the pause, the latch, the
+     KILL file) stops an exit; an owner exit, a malformed request, an unknown slot (an hour of
+     retries) and a missing position run nothing; the fee budget at its edge (3,375,000 over the
+     position's life), automatic exits stopped, the fee-budget alert; a failed sell simulation
+     refused; a secret-looking planner input retried without it, with a bug alert; a live position
+     refused and recorded; exit number 10,000 warns; a throwing alert sink latches as a bug; an
+     approved exit ends the run of refusals.
+   - Abandon: only after the buy token's expiry slot (at the expiry slot still refused), at
+     max(now, opened_at), never with a buy order of any status, never without a known slot.
+   - The small writes: the refusal record (one code, no inputs, slot 0 only when unknown, a
+     duplicate, its own failure latches); KILL and halts set and already; a failed write latches and
+     alerts; a full disk while the halt is written asks for it once.
+   - The exit watch: refusals warn once a minute per position and codes; fee-budget refusals say so;
+     five in a row raise exit-blocked once in ten minutes; an approval ends the run; a throwing sink
+     latches as a bug. The bug storm: five bug-class intent faults in ten minutes latch entries once.
+   - Fault injection: every statement of a successful T1 buy, T1 exit, T2, abandon, refusal record
+     and KILL write failed in turn with full, io, constraint, bad-param and busy.
+   - Races: on two connections, for the position cap, the entry count and the exposure cap; 50
+     seeded rounds of two to six processes (exactly one approved, none busy: V3); KILL from another
+     process; a process killed inside T1; a second connection's read does not wait (V8).
+   - Invariants 1, 2 and 17 on SQLite after every step of 200 random runs, with counts that prove
+     the runs approved, redeemed and sold.
+   - The architecture rules: no catch inside a transaction (12 canaries and a no-false-positive
+     file; the real src/ with at least 8 callbacks and 8 followed bodies); positionExitBudget only
+     inside risk/.
+   - An exit of an opening or closed position runs nothing and latches nothing; an exiting position
+     gets its account close; errors after the position was read count toward exit-blocked; the bug
+     window keeps faults the clock puts in the future; the no-catch rule follows an aliased import, a
+     namespace member and an object's method (V7).
+   - Planted bugs: 130 in two runs, every one caught in the end; the first runs caught 126 and showed
+     four weak tests (fixed) and one rule to make stricter (the bug window, changed).
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

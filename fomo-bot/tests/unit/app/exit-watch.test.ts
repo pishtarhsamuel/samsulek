@@ -47,7 +47,7 @@ describe('app/exit-watch.ts', () => {
   it('a refusal for the fee budget, or because automatic exits stopped, says so (risk 8)', () => {
     const w = world();
     w.watch.refused('ps_a', ['exit-fee-budget']);
-    w.watch.refused('ps_b', ['auto-exits-stopped', 'exit-fee-budget']);
+    w.watch.refused('ps_b', ['auto-exits-stopped']); // alone, so the other problem cannot raise it
     assert.deepEqual(
       w.alerts.seen.filter((a) => a.code === 'exit-fee-budget'),
       [
