@@ -16,7 +16,7 @@ import { lamports } from '../../../src/core/units.ts';
 import { insertOpening, readPosition } from '../../../src/storage/repo-book.ts';
 import { buyOrderOf } from '../../../src/storage/repo-orders.ts';
 import { readFlags, setHalt, setKill } from '../../../src/storage/repo-flags.ts';
-import { verifyAuditChain } from '../../../src/storage/repo-audit.ts';
+import { appendEngineAudit, verifyAuditChain } from '../../../src/storage/repo-audit.ts';
 import { setUpConfig } from '../../../src/storage/repo-server.ts';
 import type { Db } from '../../../src/storage/sqlite.ts';
 import { firstVersion } from '../../../src/config/changes.ts';
@@ -267,6 +267,16 @@ describe('the boot: a healthy start', { skip: !POSIX }, () => {
     });
   });
 
+  it('the boot itself makes each folder 0700 and each database file present 0600 (openDb only does the main file)', () => {
+    withBoot(bootWorld(), (w) => {
+      writeFileSync(`${w.file}-wal`, '', { mode: 0o644 }); // an empty -wal left behind, after the clean close
+      const calls: string[] = [];
+      const fs: FsProbe = { ...nodeFsProbe, chmod: (p, mode) => void calls.push(`${path.relative(w.dir, p) || '.'} ${mode.toString(8)}`) };
+      bootStorage({ ...w.options, fs }).db.close();
+      assert.deepEqual(calls, ['. 700', 'db-copies 700', 'run 700', 'bot.sqlite 600', 'bot.sqlite-wal 600']);
+    });
+  });
+
   it('an alert sink that throws latches entries as a bug; the start goes on, and a refusal still throws its BootError', () => {
     withBoot(bootWorld(), (w) => {
       const alerts = { alert: (): never => assert.fail('the sink is down') };
@@ -345,6 +355,7 @@ describe('the boot: every refusal on its own', { skip: !POSIX }, () => {
       assert.equal(refusal(w, { fs: other({ uid: 12_345 }) }), 'path', 'a database owned by someone else');
       assert.equal(refusal(w, { fs: other({ uid: 12_345 }, path.join(w.dir, 'run')) }), 'path', 'a run folder owned by someone else');
       assert.equal(refusal(w, { fs: other({ isDirectory: false }, path.join(w.dir, 'db-copies')) }), 'path', 'a copy folder that is not a folder');
+      assert.equal(refusal(w, { fs: other({ isSymbolicLink: true }, path.join(w.dir, 'run')) }), 'path', 'a run folder that is a link (a probe that reports both)');
       assert.equal(refusal(w, { fs: { ...nodeFsProbe, chmod: () => assert.fail('EPERM') } }), 'path', 'a chmod that fails');
       assert.equal(refusal(w, { uid: null }), 'path', 'no uid to check owners with');
       if (process.platform === 'linux') {
@@ -390,11 +401,17 @@ describe('the boot: every refusal on its own', { skip: !POSIX }, () => {
     );
   });
 
-  it('migrations: a migration changed after it ran', () => {
+  it('migrations: a migration changed after it ran; a bot file that was never migrated (never made fresh at a start, C12)', () => {
     withBoot(bootWorld(), (w) => {
       underTriggers(w.file, 'schema_migrations', "UPDATE schema_migrations SET sha256 = '00' || substr(sha256, 3) WHERE version = 1");
       assert.equal(refusal(w), 'migrations');
     });
+    withBoot(
+      bootWorld(() => undefined, (file) => fileDb(file)),
+      (w) => {
+        assert.equal(refusal(w), 'migrations');
+      },
+    );
   });
 
   it('required-rows: no ledger accounts (the owner setup was not finished, C19)', () => {
@@ -406,6 +423,20 @@ describe('the boot: every refusal on its own', { skip: !POSIX }, () => {
     withBoot(bootWorld(() => undefined, setUpConfigOnly), (w) => {
       assert.equal(refusal(w), 'required-rows');
     });
+  });
+
+  it('required-rows: the flags row, a strategy mode or a day-state row gone (a damaged file)', () => {
+    for (const [table, sql] of [
+      ['flags', 'DELETE FROM flags'],
+      ['strategy_modes', "DELETE FROM strategy_modes WHERE strategy = 'momentum'"],
+      ['day_state', "DELETE FROM day_state WHERE mode = 'paper'"],
+      ['day_state', "DELETE FROM day_state WHERE mode = 'live'"],
+    ] as const) {
+      withBoot(bootWorld(), (w) => {
+        underTriggers(w.file, table, sql);
+        assert.equal(refusal(w), 'required-rows', sql);
+      });
+    }
   });
 
   it('config: a stored version that does not decode', () => {
@@ -466,6 +497,19 @@ describe('the boot: every refusal on its own', { skip: !POSIX }, () => {
         assert.equal(refusal(w), 'kill-link');
       },
     );
+    // an engine row with the KILL's own detail but another action
+    withBoot(
+      bootWorld((db) => {
+        db.transaction((tx) => setKill(tx, T, 'cli'));
+        db.transaction((tx) => appendEngineAudit(tx, T, 'engine:demote', { source: 'cli' }));
+      }),
+      (w) => {
+        underTriggers(w.file, 'flags', 'UPDATE flags SET kill_audit_id = (SELECT max(id) FROM audit_log)');
+        assert.equal(refusal(w), 'kill-link', 'another action');
+      },
+    );
+    // (a row with the action engine:kill-set by another actor cannot exist: the schema's CHECK on
+    // audit_log ties engine: actions to the engine, so the boot's actor check is a backstop)
   });
 
   it('halt-link: a halt naming another audit row, or one of another reason (C35)', () => {
@@ -487,6 +531,16 @@ describe('the boot: every refusal on its own', { skip: !POSIX }, () => {
         assert.equal(refusal(w), 'halt-link');
       },
     );
+    withBoot(
+      bootWorld((db) => {
+        db.transaction((tx) => setHalt(tx, 'disk-db', T));
+        db.transaction((tx) => appendEngineAudit(tx, T, 'engine:kill-set', { reason: 'disk-db' }));
+      }),
+      (w) => {
+        underTriggers(w.file, 'halt_reasons', 'UPDATE halt_reasons SET set_audit_id = (SELECT max(id) FROM audit_log)');
+        assert.equal(refusal(w), 'halt-link', 'another action');
+      },
+    );
   });
 
   it('book: a stuck position', () => {
@@ -506,6 +560,10 @@ describe('the boot: every refusal on its own', { skip: !POSIX }, () => {
       underTriggers(w.file, 'ledger_accounts', "UPDATE ledger_accounts SET sol = '550000001' WHERE mode = 'paper'");
       assert.equal(refusal(w), 'conservation');
     });
+    withBoot(bootWorld(), (w) => {
+      underTriggers(w.file, 'ledger_accounts', "UPDATE ledger_accounts SET sol = '5' WHERE mode = 'live'");
+      assert.equal(refusal(w), 'conservation', 'the live book is checked too');
+    });
   });
 
   it("paper-account and live-account: a paper withdrawal; live money before Phase 8 (D7)", () => {
@@ -513,10 +571,30 @@ describe('the boot: every refusal on its own', { skip: !POSIX }, () => {
       underTriggers(w.file, 'ledger_accounts', "UPDATE ledger_accounts SET sol = '549999999', total_withdrawals = '1' WHERE mode = 'paper'");
       assert.equal(refusal(w), 'paper-account');
     });
+    // no deposit at all, and one above the 2 SOL bankroll cap (both conserve; no schema rule holds the cap)
+    for (const amount of ['0', '2000000001']) {
+      withBoot(bootWorld(), (w) => {
+        underTriggers(w.file, 'ledger_accounts', `UPDATE ledger_accounts SET sol = '${amount}', total_deposits = '${amount}' WHERE mode = 'paper'`);
+        assert.equal(refusal(w), 'paper-account', amount);
+      });
+    }
+    withBoot(bootWorld(), (w) => {
+      underTriggers(w.file, 'ledger_accounts', "UPDATE ledger_accounts SET sol = '2000000000', total_deposits = '2000000000' WHERE mode = 'paper'");
+      bootStorage(w.options).db.close(); // exactly 2 SOL passes
+    });
     withBoot(bootWorld(), (w) => {
       underTriggers(w.file, 'ledger_accounts', "UPDATE ledger_accounts SET sol = '1', total_deposits = '1' WHERE mode = 'live'");
       assert.equal(refusal(w), 'live-account');
     });
+    // a live position, with the live account all zero
+    withBoot(
+      bootWorld((db) => {
+        db.transaction((tx) => insertOpening(tx, { id: 'ps_live', mint: 'MintL', strategy: 'momentum', mode: 'live', openedAt: T, maxSpend: lamports(30_000_000n) }, lamports(125_000n)));
+      }),
+      (w) => {
+        assert.equal(refusal(w), 'live-account');
+      },
+    );
   });
 
   it('abandon: a stale opening that storage will not close (a clock past the year 2200)', () => {
@@ -573,6 +651,20 @@ describe('checkDataPath on Windows, through a fake probe (V4 on a real Windows m
   it('a folder under the profile passes, a name starting with two dots included', () => {
     checkDataPath(win(`${profile}\\fomo-bot\\data`));
     checkDataPath(win(`${profile}\\..fomo`));
+  });
+
+  it('refuses a data folder on a network share even when the profile itself is there (a redirected profile), with either slash', () => {
+    const everywhere: FsProbe = {
+      lstat: (p) => ({ isSymbolicLink: false, isDirectory: !/\.sqlite(-wal|-shm)?$/.test(p), mode: 0o666, uid: 0, nlink: 1 }),
+      realpath: (p) => p,
+      fsType: () => null,
+      chmod: () => assert.fail('no chmod on Windows'),
+    };
+    for (const share of ['\\\\server\\profiles\\Owner', '//server/profiles/Owner']) {
+      const o = { ...win(`${share}\\fomo`), windows: { userProfile: share, oneDriveRoots: [] }, fs: everywhere };
+      checkDataPath({ ...o, dataDir: `${profile}\\fomo`, windows: { userProfile: profile, oneDriveRoots: [] } }); // the same probe passes a local folder
+      assert.ok(refused(o), share);
+    }
   });
 
   it('refuses a profile next door, and two names for one folder where case does not count', () => {

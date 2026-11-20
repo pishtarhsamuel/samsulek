@@ -58,20 +58,9 @@ export function readAuditRow(r: Reader, id: number): AuditRow | null {
     at: msCell(row, 'at'),
     actor: cellOneOf(row, 'actor', ACTORS),
     action: codeCell(row, 'action'),
-    detail: deepFrozen(jsonCell(row, 'detail_json')),
+    detail: jsonCell(row, 'detail_json'), // frozen all the way down by jsonCell, so a reader cannot change it
     hash: hex64Cell(row, 'hash'),
   });
-}
-
-/** A parsed detail, frozen all the way down, so a reader cannot change what it was handed. */
-function deepFrozen(v: unknown): unknown {
-  if (typeof v === 'object' && v !== null) {
-    for (const inner of Object.values(v)) {
-      deepFrozen(inner);
-    }
-    Object.freeze(v);
-  }
-  return v;
 }
 
 const broken = (detail: string): StorageError => new StorageError('audit-broken', detail);

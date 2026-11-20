@@ -44,7 +44,8 @@ const MAX_ANCHOR_ID = Number.MAX_SAFE_INTEGER;
 const HASH = /^[0-9a-f]{64}$/;
 const MAX_TIME_MS = 7_258_118_400_000; // core/time.ts MAX_TIMESTAMP_MS: the year 2200
 
-const errnoOf = (e: unknown): unknown => (typeof e === 'object' && e !== null ? (e as { readonly code?: unknown }).code : undefined);
+/** The errno name of a thrown error ("ENOENT"); undefined for anything else (Object() boxes a thrown primitive, and null). */
+const errnoOf = (e: unknown): unknown => (Object(e) as { readonly code?: unknown }).code;
 
 function checked(v: unknown): AuditAnchor {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) {

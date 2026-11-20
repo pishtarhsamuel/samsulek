@@ -11,9 +11,12 @@
 // 6. the audit chain holds; the anchor of the last run names a row that is still there, with its hash
 //    (s.16.11 Q1: a log cut short or an older copy refuses); a clock behind the newest row only warns;
 // 7. KILL and every halt name the engine's own audit row of their source or reason;
-// 8. each book conserves its SOL; paper has its one deposit and no withdrawal (D7); live holds nothing;
-// 9. an opening with no buy order is abandoned (an old buy token cannot be used any more: its key died
-//    with the old process, and the run lock keeps a second one out); one with an order stays counted;
+// 8. each book conserves its SOL; paper has its one deposit and no withdrawal (D7); live holds nothing
+//    (no SOL, deposit, withdrawal or position) until Phase 8;
+// 9. an opening with no buy order is abandoned without a slot (an old buy token cannot be used any more:
+//    its key died with the old process, the run lock keeps a second one out, and if one were still
+//    alive, the database refuses its token once the position is closed); one with an order stays
+//    counted;
 // 10. the KILL file stores KILL; 11. the anchor moves to the newest row.
 // Only app/engine.ts may import this file (the architecture test): the boot runs once, before the
 // authority exists.
@@ -256,7 +259,9 @@ export function bootStorage(o: BootOptions): Booted {
       readModes(handle);
       readDayState(handle, 'paper');
       readDayState(handle, 'live');
-      return { flags: readFlags(handle), halts: readHalts(handle), paper: readAccount(handle, 'paper'), live: readAccount(handle, 'live') };
+      readAccount(handle, 'paper');
+      readAccount(handle, 'live');
+      return { flags: readFlags(handle), halts: readHalts(handle) };
     });
     step('config', () => readActiveConfig(handle));
 
@@ -298,20 +303,22 @@ export function bootStorage(o: BootOptions): Booted {
       }
     });
 
-    for (const mode of ['paper', 'live'] as const) {
-      const book = step('book', () => readBook(handle, mode));
+    const paperBook = step('book', () => readBook(handle, 'paper'));
+    const liveBook = step('book', () => readBook(handle, 'live'));
+    for (const book of [paperBook, liveBook]) {
       step('conservation', () => checkConservation(ledgerOf(book)));
     }
     step('paper-account', () => {
-      const { totalDeposits, totalWithdrawals } = rows.paper;
+      const { totalDeposits, totalWithdrawals } = paperBook.account;
       if (totalWithdrawals !== 0n || totalDeposits < 1n || totalDeposits > HARD_CAPS.equitySanityLamports) {
         throw new Error("paper's bankroll is its one deposit, 1 lamport to 2 SOL, with nothing withdrawn");
       }
     });
     step('live-account', () => {
-      const { sol, totalDeposits, totalWithdrawals } = rows.live;
-      if (sol !== 0n || totalDeposits !== 0n || totalWithdrawals !== 0n) {
-        throw new Error('the live account holds nothing until Phase 8');
+      // with conservation, any one of the four would do; each is kept so no single slip lets live money in
+      const { sol, totalDeposits, totalWithdrawals } = liveBook.account;
+      if (sol !== 0n || totalDeposits !== 0n || totalWithdrawals !== 0n || liveBook.positions.length > 0) {
+        throw new Error('the live book holds nothing until Phase 8: no SOL, no deposit, no withdrawal, no position');
       }
     });
 
