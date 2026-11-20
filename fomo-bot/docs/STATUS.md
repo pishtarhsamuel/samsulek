@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-11-17
+Updated: 2026-11-20
 
 **Phase 2 (foundations, tests first): in progress.** Paper-only building blocks; nothing
 can trade, and no key or account exists anywhere.
