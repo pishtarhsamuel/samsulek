@@ -2026,6 +2026,8 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['app/x.ts', "import { confirmJumpTx } from './jump-tx.ts'; export function f(): void { confirmJumpTx(); }", `${only} cli/`],
       ['strategies/x.ts', "import { confirmJumpTx } from '../app/jump-tx.ts'; export function f(): void { confirmJumpTx(); }", `${only} cli/`],
       ['app/day-tx.ts', "export { confirmJumpTx } from './jump-tx.ts';", only],
+      // 6e-3: the engine's config step holds no owner writer (s.17.3): the owner's commands are app/owner-tx.ts (6e-4)
+      ['app/config-tx.ts', "import { writeOwnerConfig } from '../storage/repo-owner.ts'; export function f(): number | null { return writeOwnerConfig(); }", only],
     ]);
     // the typed rule (below) checks that what is imported is only called; these are the import rules alone
     const fine: [string, string][] = [
@@ -2044,6 +2046,7 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['app/engine.ts', "import { createEngineAuthority } from './authority.ts'; import { bootStorage } from './storage-boot.ts'; export function f(): void { bootStorage(); createEngineAuthority(); }"],
       ['cli/start.ts', "import { startPaperEngine } from '../app/engine.ts'; import { systemRng } from '../core/rng.ts'; export function f(): void { startPaperEngine(systemRng); }"],
       ['cli/confirm.ts', "import { confirmJumpTx } from '../app/jump-tx.ts'; export function f(): void { confirmJumpTx(); }"],
+      ['app/x.ts', "import { applyDueTx, readConfigState } from './config-tx.ts'; export function f(): void { readConfigState(); applyDueTx(); }"], // unrestricted: no owner writer in it
       ['app/x.ts', "import { newId } from '../core/rng.ts'; export function f(): string { return newId('token'); }"],
       ['app/faults.ts', "import { RngError } from '../core/rng.ts'; export const isRng = (e: unknown): boolean => e instanceof RngError;"],
       ['execution/x.ts', "import type { Rng } from '../core/rng.ts'; export const x = (r: Rng): string => r.orderId();"],

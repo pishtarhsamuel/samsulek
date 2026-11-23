@@ -5357,3 +5357,47 @@ the first run; the two left showed two weak tests (no test read the clock twice 
 none checked that its faults reach the sink). Both are fixed: 18 of 18 caught. Coverage: every line and
 branch of app/jump-tx.ts and of the freshness rule.
 
+### 17.14 As built in step 6e-3 (the engine's config step), and what changed
+
+Status: UNREVIEWED (owner decision D11), on the same branch.
+
+Built, tests first: `app/config-tx.ts` (`readConfigState`, `ConfigState`, `commandTime`, `applyDueTx`,
+`DueDeps`, `DueOutcome`, `LIVE_ARMED_IN_PAPER`), `planCancel` and the refusal reason `nothing-to-cancel`
+in `config/changes.ts`, the `config-due` fault site in `app/faults.ts`, and a canary: app/config-tx.ts may
+not import repo-owner.ts (the file itself stays unrestricted: it holds no owner writer).
+
+Differences from 17.4, 17.5.3 and 17.5.6:
+- `DueOutcome`'s `applied` case gains `applied`, the tunables the new versions moved (in the versions'
+  order), so the alert after COMMIT can name them.
+- An untrusted clock alerts nothing here. The day watch already alerts `day-clock-untrusted` from the
+  same guard on every 5 s observation, at most once per 10 minutes; a second alert from this step, once
+  a minute, would only repeat it. 17.5.6 said "warn" for both not-run outcomes: `clock-behind-pending`
+  keeps its warn (`config-clock-behind`), on every call.
+- A demotion alerts `strategy-demoted` (warn, with the strategies), which 17.5.3 did not name: a live
+  strategy going back to paper is a decision the owner must hear about. It cannot happen in paper.
+- `readConfigState` refuses a stored version whose `changed` list names something that is no tunable
+  (ConfigError), as well as values that do not decode. It reads the versions, the modes and the waiting
+  rows, in that order, and hands everything back frozen.
+
+Written down, for the reviewers:
+- In paper this step always answers `nothing-due`: no strategy is live and nothing is armed, so no
+  planner makes a waiting row (`LIVE_ARMED_IN_PAPER` is pinned false by a test). Every test with waiting
+  rows makes them through the owner's writer (with a strategy set live through repo-owner's
+  `setStrategyMode`, tests only) or plants them past it (a stale or out-of-bounds row: a stand-in for a
+  later release's new bounds).
+- A stored waiting row that no planner would make (a planted paper-model loosening, say) is applied when
+  due like any other: `applyDuePending` checks only that it is due, still made from the stored value and
+  inside its bounds, and storage's `applyDueStep` that the version is exactly the queued one. Only the
+  owner's writer makes rows; whoever can write the database file can write a version as well, so the
+  code cannot defend against that file being edited: the file's owner and permissions, which the boot
+  checks (s.16.16), protect it.
+- A malformed stored row (a whole-number amount past 2^53 - 1, a name that is no tunable, a version that
+  does not decode) is `error:config`: entries latch as a bug, and each later call (once a minute) reports
+  it again. Nothing is repaired or skipped.
+- The race "applyDueTx and /cancel on the same due row" waits for 6e-4's `cancelPendingTx`.
+
+Tests: TEST_PLAN.md s.3, "Done in step 6e-3". Planted bugs (scratchpad `mut/run35.py`): 35, 34 caught in
+the first run; the one left (a paper strategy counted as live) showed that no test had a strategy in
+paper mode. Fixed: 35 of 35 caught. Coverage: every line and branch of app/config-tx.ts and of
+`planCancel`.
+

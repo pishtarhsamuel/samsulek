@@ -428,6 +428,31 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    - The import rule: only cli/ imports app/jump-tx.ts (three canaries, one allowed import).
    - Planted bugs: 18, every one caught after two weak tests were fixed.
 
+   Done in step 6e-3 (the engine's config step, STORAGE_DESIGN s.17.14; UNREVIEWED, D11):
+   - `readConfigState`: the setup read back (version 1 active, nothing waiting, nothing live, all frozen);
+     the newest version active; a lamport amount kept as a bigint (up to the u64 maximum) and any other
+     made a number up to 2^53 - 1, one past it refused in `from` or `to`; a paper or off strategy never
+     counted as live; ConfigError for a waiting row that names no tunable, values that do not decode and a
+     `changed` list with a name that is no tunable (each on a database file changed behind the bot's back).
+   - `commandTime`: the latest of now, the active version's time and every waiting row's request time.
+   - `applyDueTx`: nothing waiting and a row 1 ms before its time write nothing; one row applied at its
+     time exactly as queued (the next version by the row's source, undoing to the active one, the row
+     gone, the engine's row, the anchor, an info alert); two rows chained in the order they fall due,
+     then the tunables' order, each undoing to the one before, every stored version decoding to the
+     plan's values; a clock behind the active version dates the step as that version; a stale row and an
+     out-of-bounds row dropped with the engine's row; an exit value demotes every live strategy (not a
+     paper one) and restarts every gate, a risk value neither; the clock read once; an untrusted clock
+     and a waiting row asked for after now write nothing (the second warns, neither latches); a version
+     that does not decode and an amount past 2^53 - 1 are `error:config` with entries latched as a bug; a
+     failed anchor write only warns; `LIVE_ARMED_IN_PAPER` is false.
+   - Fault injection: every statement of the richest step (two versions, a dropped row, a demotion, every
+     gate, a waiting row kept) failed in each of full, io, constraint, bad-param and busy: the database as
+     before (plus only the disk-db halt for full and io), no anchor moved, the latch and the alerts as
+     s.17.5.6 says.
+   - `planCancel`: an unknown name, nothing to cancel, the row returned, malformed rows and context throw.
+   - The import rule: app/config-tx.ts cannot import repo-owner.ts (a canary); app/ may import it.
+   - Planted bugs: 35, every one caught after one missing test (a paper strategy) was added.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |
