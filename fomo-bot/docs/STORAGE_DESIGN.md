@@ -2703,7 +2703,7 @@ Planted bugs worth planting (each must be caught by a test):
    another person's wallet address. So no FOMO user's wallet, and no token creator's address, can
    end up in the database. Explanations will name the token and the numbers. (The orders hold the
    bot's own public wallet, pool and token-account addresses: public, and needed to explain a
-   trade; review S.) Recommended: yes.
+   trade; review S.) Recommended: yes. Decided: yes (owner decision D13, 2026-11-23).
 
 ### 15.17 Decisions the reviewers should challenge
 
@@ -4415,8 +4415,8 @@ Written down, for the reviewers:
   default ACL is the defense (V4).
 - The run lock is still only a token (D11), and nothing in cli/ starts the engine.
 - The anchor stays a tripwire (D10): deleting its file passes as a first start, with a warning alert.
-- s.16.11 Q1 (refuse to start on a shorter log) is built with the recommended answer; the owner has not
-  confirmed it yet.
+- s.16.11 Q1 (refuse to start on a shorter log) is built with the recommended answer, which the owner
+  confirmed on 2026-11-23 (owner decision D12).
 
 Conditions for later steps from this one:
 - The cli/ start command (the ops step): the run lock (V9), the process flags of C7, `systemRng`, the
@@ -4438,3 +4438,832 @@ CHECK lets only the engine write `engine:` actions; with conservation and the po
 SOL, deposit and withdrawal checks each follow from the others; a null boot option throws a TypeError
 anyway; the authority's mode is a literal. Coverage: every line of the new files, and every branch but
 the non-Linux side of the probe's `fsType` (run-files.ts), which only runs off Linux.
+
+## 17. Step 6e design: the day-state and config transactions
+
+Status: PROPOSED by the architect (2026-11-23), for the reviewers before any code (owner decision
+D11: built on `claude/exciting-hamilton-2d7lto-6d2-unreviewed`, each commit marked UNREVIEWED). Paper
+only. Nothing in migration 1 changes. No new dependency. No network code: the marks, the time check
+and the alerts are interfaces with test fakes. Nothing here can sign, send or move funds, and no limit
+or hard cap is loosened.
+
+Files read: fomo-bot/CLAUDE.md, docs/DECISIONS.md (D1-D11), docs/STATUS.md, this file (s.3.4, s.3.5,
+s.7, s.10, s.12.1, s.13.1, s.14, s.14.1, s.15.18, s.16), docs/RISK_POLICY.md (s.4 and its contracts,
+s.6, s.8, s.12), docs/REVIEWS.md (P, Q, R), src/risk/{daystate,sizing,approve}.ts,
+src/config/{changes,tunables}.ts, src/portfolio/equity.ts, src/storage/{repo-day,repo-config,
+repo-owner,repo-flags,repo-audit,repo-server,schema-v1}.ts, src/app/{approve-tx,snapshot,caps,faults}.ts,
+tests/architecture/import-graph.test.ts, tests/unit/app/{world,tx-world}.ts.
+
+### 17.0 In plain English
+
+- Step 6e writes down, in the database, what the bot learns about your money each few seconds: the
+  account value, the day's starting value, the highest value so far, and the stops. If the account
+  falls 30% in a day, 50% from its high, or twice in two days, the stop is saved at once, in the same
+  locked step as the value that caused it.
+- It also stores your setting changes (/set, /rollback, /cancel) and your /resume after a halt. Each
+  one is a single all-or-nothing step, with your own record first.
+- New, stricter than before: the bot refuses a new buy if its last money check is more than 30 seconds
+  old. So a stop can never be missed between two checks.
+- If anything in the day's money check fails or looks wrong, the bot halts new buys and tells you.
+  Selling is never blocked by any of this.
+- Your setting commands are built now but cannot be used yet: they need the Telegram owner check
+  (Phase 3) or the server commands (Phase 7). Until then only the tests call them.
+- Still paper only. Nothing here can touch real money.
+
+### 17.1 Facts from the code, and where the docs differ
+
+The code wins where it differs; each difference is resolved as stated.
+
+- risk/daystate.ts is complete for 6e: `observeEquity` (daystate.ts:315-370, the daily stop, the peak
+  halt, the sticky two-day halt, the +50% hold, the sanity and clock trips, Athens days through
+  core/day.ts), `confirmEquityJump` (386-402), `resumePeak` (443-452), `resumeStreak` (458-460),
+  `dailyStopActive` (468-475). Trips are level-triggered (contract 2, RISK_POLICY.md lines 153-167).
+- There is no pure low-equity-stop function. The rule lives inside `sizeEntry`: `perTrade <
+  accountMinimum` gives `equity-below-minimum` (sizing.ts:242-251), with the sizing equity of
+  approve.ts:515 (the day's baseline when it is above zero and below the current equity, else the
+  current equity). `capsInEffect` (sizing.ts:137) and `tradeMinimum` (sizing.ts:188) are exported.
+  6e reuses them in app/caps.ts (17.4), with an agreement test against `sizeEntry`.
+- config/changes.ts has `planSet` (362), `planAiApproval` (495), `planRollback` (526),
+  `applyDuePending` (564) and `nextVersion` (219), but no planner for /cancel. 6e adds `planCancel`
+  (17.4). `checkHistory` stays private; every planner that needs it calls it.
+- `checkPending` refuses a stored row asked for after `now` (changes.ts:181-183). So with a clock that
+  stepped back, every config command throws, the owner's tightening included. 6e dates owner commands
+  at `commandTime` (17.4), never earlier than anything stored.
+- In paper no waiting loosening can ever be made: the planners queue a row only while `liveArmed` is
+  true or a strategy is live (changes.ts:148, 333), and neither can happen before Phase 8. So
+  `applyDueTx` has nothing to apply in paper; it is built and tested with rows the tests make.
+- storage/repo-day.ts `snapshotNear` (242-246, SQL at 220) neither limits rows to `at <= now` nor
+  returns the row's time, so C42 (only rows at or before now, an alert when the base is far from an
+  hour ago) cannot be met as it is. 6e changes this reader (read-only, 17.3).
+- storage/repo-owner.ts `writeOwnerConfig` (175-272) does every write of s.3.4's `writeChangePlan`
+  itself (the owner's row first, the deletes, the version, the new rows) and re-checks the dating rule
+  `active.createdAt <= createdAt <= max(at, active.createdAt)` (208). `resumeHalt` (63-82) restarts
+  the paper peak or streak in the same step; its peak check throws StorageError `row-count`
+  (repo-day.ts:207-215), which `classify` treats as a bug (faults.ts:87-97). So 6e checks those
+  conditions itself before calling it (17.5.6).
+- repo-config.ts `applyDueStep` (130-165) requires `undoTo === active.id` and a date between the
+  active version and `max(now, active.createdAt)` (149). `nextVersion` with its default `undoTo` makes
+  exactly that.
+- repo-flags.ts `setHalt` (124-133) writes the `engine:halt-set` audit row and then the halt, and the
+  schema forces that order: a halt must name the newest audit id (schema-v1.ts:403-405). C28 is
+  therefore already fixed by the schema; 6e pins it with a test.
+- `setEntriesStopped` (repo-flags.ts:90-98) has no caller yet; `pruneBans` (270-273) has none either.
+- approve-tx.ts: `persistHaltTx` (287-299) is exported; `anchorAfter` (252-260) and `alertSafely`
+  (188-194) are private. 6e needs both, so it exports them (no other change).
+- faults.ts: `classify` has no ConfigError branch, so a config that does not decode is
+  `error:unexpected` (faults.ts:142, 222). FaultSite has no site for the day or config transactions
+  (faults.ts:60).
+- There is no core/clock.ts. The architecture test reserves it (import-graph.test.ts:147, 153), but
+  contract 8 (the guarded clock, RISK_POLICY.md lines 191-196) is not built. 6e adds only a small
+  `TimeGuard` interface (17.4, 17.6).
+- Import rules: `storage/repo-owner.ts` may be imported only by app/owner.ts and cli/
+  (import-graph.test.ts:105), and app/owner.ts by nobody yet (107). The owner's config transactions
+  need a home under that restriction (17.3).
+- Where the docs differ: s.1 put `applyTransferTx`, `resumePeakTx` and `resumeStreakTx` in day-tx.ts.
+  Transfers wait for Phase 8 (s.15.18 M1), and the resumes are the owner's (`resumeHalt`, owner-only
+  file), so they go to app/owner-tx.ts as one `resumeTx`. s.3.5 passed `equity` and `stopEquity` from
+  the caller; 6e values the book inside the transaction, as T1 does (stricter: the caller cannot
+  choose the equity). s.3.5 named `INSERT OR IGNORE` for halts; the code uses `setHalt` (no conflict
+  clause, s.12.1). s.3.4's `ConfigDeps.liveArmed` becomes a constant `false` in paper (C60).
+
+### 17.2 Every condition routed to 6e, and where it goes
+
+"6e-1" to "6e-4" are the sub-steps of 17.9.
+
+From s.12.1 (reviews P):
+- The code is the gate for times; a tightening must pass a clock fault (C27). 6e-3/6e-4: owner
+  commands run at `commandTime = max(now, active.createdAt, newest pending requestedAt)`; versions are
+  made by `nextVersion` at that time; due steps at `max(now, active.createdAt)` for the chained active
+  version. The ledger half (`eventTime`) is T3's.
+- One order for a halt and its audit row (C28). 6e-1: the audit row first, immediately before its halt
+  (forced by the trigger; `setHalt` does it). A test sets two halts in one observation and checks the
+  ids interleave (audit, halt, audit, halt) and that each halt names its own `engine:halt-set` row.
+- Snapshot pruning keeps at least an hour (C20). 6e-1: `pruneSnapshots` (keeps a day) runs in every
+  trusted observation, never after a `clock-backwards` trip.
+- The audit chain checked at start-up: done in 6d-3. 6e: every transaction that appends an audit row
+  writes the anchor after COMMIT (`anchorAfter`), so the boot's tail check stays current.
+- A clock behind the newest audit row only alerts (6d-3, s.16.11 D2). 6e keeps it: `commandTime` may
+  date an owner row ahead of a clock that stepped back; ids, not times, decide every gate.
+
+From s.13.1 (review Q):
+- No catch inside a transaction callback (C32). 6e: every new callback is written in place and catches
+  nothing; every app/ helper called inside one (`readConfigState`, `commandTime`, `lowEquityStopOf`,
+  `ledgerOf`, `readActiveConfig`) has no `try`. The rule of 16.7.4 covers the new files unchanged.
+- app/owner.ts with the Telegram owner check (Phase 3); the cli/ commands with the terminal (Phase 7).
+  Unchanged. 6e builds the owner's transactions in a new restricted file, app/owner-tx.ts, with no
+  runtime caller (17.3); Phase 3's app/owner.ts and Phase 7's cli/ will call it.
+- The low-equity stop is derived from equity on every tick (C33). 6e-1: every accepted observation
+  sets `entries_stopped` from `lowEquityStopOf`; an observation whose equity is unknown, held or
+  anomalous leaves it as stored (entries are blocked by those anyway).
+- `pruneBans` only while the clock guard is healthy (C34). 6e never calls `pruneBans`: the guard does
+  not exist, and an ended ban changes nothing (`activeBans` skips it). It moves to contract 8's step.
+- Phase 3 and Phase 8 items (pause and mode triggers, /golive checks, the gate N1 rule, ALTER):
+  unchanged. 6e builds no /pause, /unpause, /paper, /off or /golive.
+
+From s.14.1 (review R):
+- `setTx`, `rollbackTx`, `cancelPendingTx` through `writeOwnerConfig` with the planner's own plan;
+  versions dated as above; rows asked for at the command time; cancelled rows include every waiting
+  row of an addressed tunable, a /set to the current value included. 6e-4. The planners already
+  cancel by "addressed" (changes.ts:345), and /rollback addresses every tunable.
+- The AI approval through `writeOwnerConfig`. Stays for Phase 5: the engine contract "approves only an
+  AI proposal it stored from a review, each at most once" (RISK_POLICY s.12) needs the `ai_proposals`
+  table of migration 2. Building it now would take the proposal from the caller. The signature is
+  reserved (17.4).
+- `applyDueTx`: `applyDueStep` for each step, `dropDuePending` for each stale row, then `demote` and
+  `restartGate`, in one transaction. 6e-3.
+- `checkTunables` or `nextVersion` before every write, and a decode test (security 4). 6e-3/6e-4:
+  every version comes from `nextVersion`, every value set from a planner (which runs `checkTunables`);
+  tests decode every stored version with `decodeTunables` and compare.
+- `observeDayTx` with `snapshotNear`, `writeDayState`, a snapshot and pruning, one transaction, one
+  day-state write per step, the write's `at` equal to the observation's clock reading (C38). 6e-1.
+- The owner's /resume is `resumeHalt`. 6e-4 (`resumeTx`). Paper: at once (D4). Live: at the server
+  only, with the 24 h wait (Phase 8).
+- A held jump blocks the server's reset and the peak resume, so jump verification runs while halted,
+  or the server gets a confirm command (C41). 6e-2: `confirmJumpTx` reads no flag, halt or KILL, so it
+  works while halted. Its callers are the verification routine (Phase 3, with the chain reads) and the
+  server's confirm command (Phase 7).
+- `snapshotNear` only at or before now; an alert when the base is far from an hour ago;
+  `insertSnapshot` never beyond the run's now (C42). 6e-1: the reader change, `at = now` of the same
+  reading, and the day watch's `jump-base-missing` / `jump-base-far` alerts.
+- A `writeDayState` refusal becomes `day-state-error:paper` and an alert, never a retry with an edited
+  state (C40). 6e-1 (17.6).
+- The next accepted observation sets a reset baseline again (C39). 6e-1: tested on the first
+  observation after the setup (day null, baseline 0), and on a planted same-day baseline of 0.
+- Phase 8 items (the withdrawal writer, the live peak rebase with the 24 h wait): unchanged.
+
+From s.15.18 (review S):
+- The day-state policy's paper bankroll is the stored deposit (C49). 6e-1: `observeDayTx` builds the
+  policy with `dayPolicyOf('paper', tunables, readAccount(tx, 'paper'))` inside its transaction.
+- No transfer writer until Phase 8 (M1). So no `applyTransferTx` in 6e.
+- T3 items (settlement, order status, a landed-but-unbooked sell): unchanged.
+
+From s.16.2:
+- C60: `liveArmed` is the server's flag; pending rows fall due by the guarded clock. 6e-3: in paper
+  `liveArmed` is the constant `false` (`LIVE_ARMED_IN_PAPER`); Phase 8 replaces it with the server's
+  arm flag. `applyDueTx` runs only on a reading the `TimeGuard` trusts, and never applies anything
+  while a stored row is dated after now.
+- C20, C27, C28, C33, C34, C38, C39, C40, C41, C42, C49: as above.
+
+### 17.3 Files
+
+New files ("Imported by" is the proposed import rule; runtime imports; types are always fine). All
+TypeScript with erasable syntax only.
+
+| File | Sub-step | Exports | Imports (runtime) | Imported by |
+|---|---|---|---|---|
+| `app/day-tx.ts` | 6e-1 | `observeDayTx`, `createDayWatch`, `DayWatch`, `DayDeps`, `TimeGuard`, `ObserveOutcome`, `JumpBase`, `DAY_HALT_TRIPS`, `DAY_STATE_ERROR_HALT`, `JUMP_BASE_TOLERANCE_MS`, `DAY_ALERT_EVERY_MS` | `storage/repo-day.ts`, `repo-book.ts`, `repo-flags.ts` (`setHalt`, `setEntriesStopped`), `risk/daystate.ts`, `portfolio/equity.ts`, `core/units.ts`, `app/caps.ts`, `app/snapshot.ts` (`readActiveConfig`, `ledgerOf`), `app/faults.ts`, `app/approve-tx.ts` (`persistHaltTx`, `anchorAfter`, `alertSafely`) | app/ (not restricted: the run loop is app/ code) |
+| `app/jump-tx.ts` | 6e-2 | `confirmJumpTx`, `ConfirmOutcome` | `storage/repo-day.ts`, `repo-book.ts`, `risk/daystate.ts`, `app/caps.ts`, `app/snapshot.ts`, `app/faults.ts`, `app/approve-tx.ts` | cli/ only (new entry; Phase 3 adds its verification file by name). Contract 3: no strategy, Telegram or AI path |
+| `app/config-tx.ts` | 6e-3 | `readConfigState`, `ConfigState`, `commandTime`, `applyDueTx`, `DueDeps`, `DueOutcome`, `LIVE_ARMED_IN_PAPER` | `storage/repo-config.ts`, `repo-flags.ts` (`readModes`, `demote`, `restartGate`), `config/changes.ts`, `config/tunables.ts`, `core/ids.ts`, `app/faults.ts`, `app/approve-tx.ts` | app/ (not restricted: it holds no owner writer) |
+| `app/owner-tx.ts` | 6e-4 | `setTx`, `rollbackTx`, `cancelPendingTx`, `resumeTx`, `OwnerDeps`, `OwnerConfigOutcome`, `ResumeOutcome`, `RESUME_FRESH_MS` | `storage/repo-owner.ts` (`writeOwnerConfig`, `resumeHalt`), `repo-flags.ts` (`readHalts`, `demote`, `restartGate`), `repo-day.ts` (`readDayState`, `newestSnapshot`), `config/changes.ts`, `app/config-tx.ts`, `app/faults.ts`, `app/approve-tx.ts` | app/owner.ts (Phase 3) and cli/ (Phase 7) only (new entry); no runtime importer until then |
+
+Why four files: the owner's writers must stay out of the engine's reach (review Q, security 1). If
+`setTx` lived in config-tx.ts, any app/ file could import it and call it with `actor:
+'owner-telegram'`, which is exactly the forgery the restriction exists to stop. So everything that
+writes an owner row is in app/owner-tx.ts, restricted like repo-owner.ts. The engine's own config step
+(`applyDueTx`) and the shared reads stay in the unrestricted app/config-tx.ts. `confirmJumpTx` clears a
+hold that blocks entries, so contract 3 limits its callers; its own restricted file enforces that.
+
+Changes to existing files (each needed by a condition; nothing else changes):
+- `storage/repo-day.ts` (6e-1, C42), read-only:
+  - `snapshotNear(r, mode, target, now)` returns `{ equity, at } | null`: the known equity nearest
+    `target` among rows with `at <= now`, the older one on a tie. Two constant indexed SELECTs on the
+    primary key (mode, at): the newest known row at or before `target`, and the oldest known row after
+    `target` and at or before `now`; the nearer wins in code (17.11 U1).
+  - `newestSnapshot(r, mode, now)` returns `{ at, equity, stopEquity } | null`: `SELECT at, equity,
+    stop_equity FROM equity_snapshots WHERE mode = ? AND at <= ? ORDER BY at DESC LIMIT 1`.
+  - The pinned export list gains `newestSnapshot`. No caller in src/ today, so no other change.
+- `app/caps.ts` (6e-1, C33): `lowEquityStopOf(dayStart, equity, t)`.
+- `app/faults.ts` (6e-1): FaultSite gains `'day' | 'jump' | 'config-due' | 'owner'`; `APP_ERROR_CODES`
+  gains `'day-state-stale'` (quiet, intent); `classify` maps ConfigError to `error:config` (scope
+  latch, bug), so a broken stored config is named. It imports ConfigError from config/tunables.ts.
+- `app/approve-tx.ts` (6e-1): `anchorAfter` and `alertSafely` become exports. No behaviour change.
+- `app/snapshot.ts` (6e-2): T1's freshness rule (17.6): `readBuySnapshot` throws AppError
+  `day-state-stale` when the newest paper snapshot at or before now is missing, older than
+  `DAY_STATE_MAX_AGE_MS` (30,000) or holds no equity. Stricter than 6d-2; T1's tests get a fresh
+  snapshot in `tests/unit/app/tx-world.ts`.
+- `config/changes.ts` (6e-3): `planCancel` and the refusal reason `'nothing-to-cancel'`.
+- `tests/architecture/import-graph.test.ts` (6e-2, 6e-4): `RESTRICTED_FILES` gains
+  `'app/jump-tx.ts'` (cli/ only) and `'app/owner-tx.ts'` (app/owner.ts and cli/ only);
+  `'storage/repo-owner.ts'` also allows `'app/owner-tx.ts'`. Canaries: app/x.ts importing either new
+  file; `export const s = setTx` in owner-tx.ts (a restricted function handed on); app/config-tx.ts
+  importing repo-owner.ts.
+- `tests/tools/check-coverage.ts`: no change if it already covers app/, config/ and storage/ (UNVERIFIED
+  until 6e-1 runs it; 16.13 says the gate covers app/).
+- No change to risk/, portfolio/, core/, other storage/ files or migration 1.
+
+### 17.4 Interfaces and types
+
+```ts
+// app/day-tx.ts
+/** Contract 8's verdict on one clock reading. The guarded clock (core/clock.ts) is a later step. */
+export interface TimeGuard { trusted(now: number): boolean }
+
+/** The day transactions' dependencies: the small-write deps of 6d plus the marks, the guard and the watch. */
+export type DayDeps = StoreDeps & Pick<EngineDeps, 'marks'> & {
+  readonly time: TimeGuard;
+  readonly watch: DayWatch;
+};
+
+/** The trips that become a halt row `<trip>:paper` (contract 2); equity-jump and daily-stop live in day_state. */
+export const DAY_HALT_TRIPS: readonly EquityTrip[] =
+  ['equity-zero', 'sanity-max', 'sanity-bankroll', 'clock-backwards', 'peak-halt', 'daily-stop-twice'];
+export const DAY_STATE_ERROR_HALT = 'day-state-error:paper';
+/** The jump test's base should be about an hour old; further than this from the target alerts (C42). */
+export const JUMP_BASE_TOLERANCE_MS = 600_000;
+/** Each day-watch alert code at most once in this time. */
+export const DAY_ALERT_EVERY_MS = 600_000;
+
+export interface JumpBase {
+  readonly state: 'ok' | 'missing' | 'far';
+  readonly at: number | null;           // the base row's own time
+}
+export type ObserveOutcome =
+  | { readonly kind: 'observed'; readonly at: number; readonly trips: readonly EquityTrip[];
+      readonly haltsSet: readonly string[]; readonly entriesStopped: boolean | null;  // null: left as stored
+      readonly base: JumpBase; readonly equityKnown: boolean }
+  | { readonly kind: 'not-run'; readonly code: 'clock-untrusted' }     // nothing written
+  | { readonly kind: 'error'; readonly code: string; readonly scope: FaultScope;
+      readonly halt: 'set' | 'already' | 'failed' | 'not-tried' };     // not-tried only for busy
+/** Paper only: the mode is the engine's (contract 9); a live observation is a Phase 8 function. */
+export function observeDayTx(deps: DayDeps): ObserveOutcome;
+
+/** In memory, one per engine: rate-limited alerts about the observations (never throws). */
+export interface DayWatch { note(o: ObserveOutcome, now: number): void }
+export function createDayWatch(o: { readonly alerts: AlertSink; readonly latch: EntryLatch;
+  readonly startedAt: number }): DayWatch;
+// Alerts (codes only): 'day-clock-untrusted', 'jump-base-missing' and 'jump-base-far' (after the first
+// hour from startedAt, contract 6), 'equity-unknown' (no known equity for over 5 minutes),
+// 'equity-jump-held' (on the hold's first tick), 'day-halt-set' (codes: the reasons),
+// 'equity-below-minimum' (when the low-equity stop turns on: "tell the owner once"),
+// 'day-state-error' (severity bug, codes: the fault's code). Each code at most once per DAY_ALERT_EVERY_MS,
+// except 'day-halt-set' and 'equity-below-minimum', which fire on every transition.
+
+// app/jump-tx.ts
+export type ConfirmOutcome =
+  | { readonly kind: 'confirmed'; readonly at: number; readonly ackEquity: Lamports }
+  | { readonly kind: 'refused'; readonly code: 'error:risk' }           // confirmEquityJump refused: the hold stays
+  | { readonly kind: 'not-run'; readonly code: 'clock-untrusted' }
+  | { readonly kind: 'error'; readonly code: string; readonly scope: FaultScope;
+      readonly halt: 'set' | 'already' | 'failed' | 'not-tried' };
+/** Contract 3: the verification routine's fresh, fully valued read; never the held observation. */
+export function confirmJumpTx(deps: DayDeps, verifiedEquity: Lamports): ConfirmOutcome;
+
+// app/caps.ts
+/**
+ * RISK_POLICY s.6 step 4: entries stop when the per-trade share of the sizing equity is below the
+ * account minimum. Exactly sizeEntry's rule (sizing.ts:242) on capsInEffect(buyCapsOf(t, 0n).sizing,
+ * 'paper', null), with the sizing equity of approve.ts:515 and tradeMinimum(0n, ...) as the account
+ * minimum. Pure.
+ */
+export function lowEquityStopOf(dayStart: Lamports, equity: Lamports, t: Tunables): boolean;
+
+// app/config-tx.ts
+export const LIVE_ARMED_IN_PAPER = false;             // C60: the server's arm flag replaces it in Phase 8
+export interface ConfigState {
+  readonly history: readonly ConfigVersion[];         // decodeTunables of each stored version, oldest first
+  readonly active: ConfigVersion;                     // the newest
+  readonly pending: readonly PendingChange[];         // each amount converted to its tunable's kind
+  readonly liveStrategies: readonly StrategyId[];     // from strategy_modes
+}
+/** Reads and converts; a malformed row throws ConfigError (latch, bug). No try. */
+export function readConfigState(r: Reader): ConfigState;
+/** An owner command's time: never earlier than anything stored, so a clock fault cannot refuse a tightening. */
+export function commandTime(now: number, s: ConfigState): number;
+  // = max(now, s.active.createdAt, max of s.pending[i].requestedAt)
+export type DueDeps = StoreDeps & { readonly time: TimeGuard };
+export type DueOutcome =
+  | { readonly kind: 'applied'; readonly versionIds: readonly number[]; readonly dropped: readonly TunablePath[];
+      readonly demoted: readonly StrategyId[]; readonly restarted: readonly StrategyId[] }
+  | { readonly kind: 'nothing-due' }
+  | { readonly kind: 'not-run'; readonly code: 'clock-untrusted' | 'clock-behind-pending' }
+  | { readonly kind: 'error'; readonly code: string; readonly scope: FaultScope };
+export function applyDueTx(deps: DueDeps): DueOutcome;
+
+// config/changes.ts (pure, new)
+export type CancelResult = ({ readonly ok: true; readonly cancelled: PendingChange }) | Refusal;
+/** /cancel <tunable>: its waiting loosening is removed; refused 'unknown-parameter' or 'nothing-to-cancel'. */
+export function planCancel(pendingRaw: readonly PendingChange[], pathRaw: unknown, contextRaw: ChangeContext): CancelResult;
+// RefusalReason gains 'nothing-to-cancel'.
+
+// app/owner-tx.ts (restricted)
+export type OwnerDeps = Pick<EngineDeps, 'db' | 'clock' | 'latch' | 'faults' | 'alerts' | 'anchors'>;
+export type OwnerConfigOutcome =
+  | { readonly kind: 'done'; readonly at: number; readonly clockBehind: boolean; readonly versionId: number | null;
+      readonly applied: readonly FieldChange[]; readonly pending: readonly PendingChange[];
+      readonly cancelled: readonly TunablePath[]; readonly kept: readonly TunablePath[];
+      readonly demoted: readonly StrategyId[] }
+  | { readonly kind: 'refused'; readonly reason: RefusalReason }        // nothing written
+  | { readonly kind: 'error'; readonly code: string; readonly scope: FaultScope };  // rolled back
+export function setTx(deps: OwnerDeps, actor: OwnerActor, path: unknown, value: unknown): OwnerConfigOutcome;
+export function rollbackTx(deps: OwnerDeps, actor: OwnerActor): OwnerConfigOutcome;
+export function cancelPendingTx(deps: OwnerDeps, actor: OwnerActor, path: unknown): OwnerConfigOutcome;
+/** Contract 4: the peak restarts only right after a tick that valued everything. */
+export const RESUME_FRESH_MS = 60_000;
+export type ResumeOutcome =
+  | { readonly kind: 'resumed'; readonly which: 'peak' | 'streak'; readonly at: number }
+  | { readonly kind: 'refused'; readonly reason: 'not-halted' | 'jump-held' | 'equity-unknown' | 'observe-first' }
+  | { readonly kind: 'error'; readonly code: string; readonly scope: FaultScope };
+export function resumeTx(deps: OwnerDeps, actor: OwnerActor, which: 'peak' | 'streak'): ResumeOutcome;
+// Phase 5, reserved: aiApproveTx(deps: OwnerDeps, actor: OwnerActor, proposalId: string): OwnerConfigOutcome,
+// reading the stored proposal and marking it approved in the same transaction.
+
+// storage/repo-day.ts (changed readers)
+export function snapshotNear(r: Reader, m: LedgerMode, target: number, now: number):
+  { readonly equity: Lamports; readonly at: number } | null;
+export function newestSnapshot(r: Reader, m: LedgerMode, now: number):
+  { readonly at: number; readonly equity: Lamports | null; readonly stopEquity: Lamports | null } | null;
+
+// app/snapshot.ts
+export const DAY_STATE_MAX_AGE_MS = 30_000;
+```
+
+`OwnerActor` is repo-owner.ts's type. `StoreDeps`, `EngineDeps` and `persistHaltTx` are 6d's
+(approve-tx.ts:70-92, 287). `readActiveConfig` and `ledgerOf` are snapshot.ts's (33, 65);
+`dayPolicyOf` is caps.ts's (95); `MARK_POLICY` too (38).
+
+The conversion in `readConfigState`: a stored version's values through `decodeTunables`; `changed`
+must be tunable paths; a pending row's path must pass `isTunablePath`, and its amounts keep bigint for
+a lamport tunable (`typeof boundsOf(path)[0] === 'bigint'`) or become a number only when at most
+`Number.MAX_SAFE_INTEGER`; anything else throws ConfigError. The planners then re-check everything
+(`checkHistory`, `checkPending`, `checkTunables`).
+
+### 17.5 The transactions, step by step
+
+Shared rules, as in 16.5:
+- One `deps.db.transaction` each (BEGIN IMMEDIATE). Phase R (reads and pure calls) runs to its end
+  before phase W (writes). Any throw rolls everything back.
+- The callback is an inline arrow with no try. Errors are caught only around the whole
+  `db.transaction(...)` call, after the rollback, and classified there (`classify`).
+- Everything from outside is read once before BEGIN (the marks map, the request values). Inside, only
+  the clock is read, once; the guard judges that same reading.
+- Alerts, the anchor write and replies happen after COMMIT.
+
+#### 17.5.1 `observeDayTx(deps)`
+
+Before BEGIN: `marks = deps.marks.marks()` (read once; contract: `now` is read after the marks).
+
+Phase R:
+1. `now = deps.clock.now()`. `deps.time.trusted(now)` false: return `not-run: clock-untrusted` (no
+   write; the empty transaction commits nothing).
+2. `state = readDayState(tx, 'paper')`; `paper = readAccount(tx, 'paper')`; `readAccount(tx, 'live')`
+   (required); `active = readActivePositions(tx)`; any live position throws `live-not-built`;
+   `{ tunables } = readActiveConfig(tx)`; `policy = dayPolicyOf('paper', tunables, paper)` (C49).
+3. `{ equity, stopEquity } = valueEquity(ledgerOf({ account: paper, positions: active }), marks, now,
+   MARK_POLICY)`: the same valuation T1 uses, one freshness rule.
+4. `base = snapshotNear(tx, 'paper', now - 3_600_000, now)` (C42: rows at or before now only).
+   `JumpBase`: `missing` when null, `far` when `|base.at - (now - 3_600_000)| > JUMP_BASE_TOLERANCE_MS`,
+   else `ok`.
+5. `r = observeEquity(state, { now, equity, stopEquity, equityAnHourAgo: base?.equity ?? null },
+   policy)`.
+6. `halts` = the reasons `<trip>:paper` for each trip of `r.trips` in `DAY_HALT_TRIPS`, sorted.
+   `backwards = r.trips includes 'clock-backwards'`; `anomaly = backwards or any of equity-zero,
+   sanity-max, sanity-bankroll`.
+7. `low = equity !== null && !anomaly && !r.state.jumpPending ? lowEquityStopOf(r.state.dayStart,
+   equity, tunables) : null`.
+
+Phase W, in this order:
+1. `writeDayState(tx, 'paper', r.state, now)`: the one day-state write of this step, at the
+   observation's own reading (C38).
+2. Unless `backwards`: `insertSnapshot(tx, 'paper', now, anomaly ? null : equity, anomaly ? null :
+   stopEquity)`, then `pruneSnapshots(tx, now)`. An anomalous reading is stored as unknown, so it can
+   never become the jump test's base; a known-bad clock stores nothing and prunes nothing.
+3. For each reason in `halts`: `setHalt(tx, reason, now)` (its own `engine:halt-set` row first, C28);
+   keep the ones it newly set. Level-triggered: a halt already set writes nothing.
+4. `low !== null`: `setEntriesStopped(tx, low, now)`; remember whether it changed.
+
+After COMMIT: `anchorAfter(deps)` when a halt was newly set; `deps.watch.note(outcome, now)`; return
+`observed`.
+
+On a throw (outside the callback): `f = classify(e)`; `deps.faults.report('day', f)`. If `f.busy`:
+return `error` with `halt: 'not-tried'` (the next tick observes again; the busy window counts it).
+Otherwise `persistHaltTx(deps, DAY_STATE_ERROR_HALT)` (C40), the watch alerts `day-state-error` with
+`f.code`, and return `error` with the halt's answer. Never a retry with an edited state: the next tick
+is a new observation from the stored state.
+
+```mermaid
+sequenceDiagram
+  participant Eng as Engine tick (later step)
+  participant Day as app/day-tx
+  participant DB as SQLite
+  participant Risk as risk/daystate (pure)
+  Eng->>Day: observeDayTx(deps)
+  Day->>Day: marks read once
+  Day->>DB: BEGIN IMMEDIATE
+  Day->>Day: now = clock.now(); time.trusted(now)?
+  alt untrusted
+    Day-->>Eng: not-run (nothing written)
+  end
+  Day->>DB: R: day state, both accounts, active positions, config; snapshotNear(now - 1 h, now)
+  Day->>Risk: observeEquity(state, equity, stopEquity, base, policy)
+  Risk-->>Day: next state, trips
+  Day->>DB: W: writeDayState(at = now); snapshot and prune (not on clock-backwards); setHalt per trip; low-equity stop
+  Day->>DB: COMMIT
+  Note over Day,DB: any throw: ROLLBACK; classify; not busy: persistHaltTx(day-state-error:paper) in its own transaction, alert
+  Day-->>Eng: observed (anchor written if a halt was set; watch alerts)
+```
+
+#### 17.5.2 `confirmJumpTx(deps, verifiedEquity)`
+
+Before BEGIN: `level = lamports(verifiedEquity)` (a non-lamport value throws before BEGIN and is an
+`error:amount`).
+
+Phase R: `now`; untrusted: `not-run`. `state = readDayState(tx, 'paper')`; `paper = readAccount`;
+config; `policy = dayPolicyOf(...)`; `next = confirmEquityJump(state, level, now, policy)` (throws
+RiskError when there is no held jump, the window of 5 minutes is missed, or the level is above the
+sanity limits). No flag, halt or KILL is read (C41).
+
+Phase W: `writeDayState(tx, 'paper', next, now)` (its guard accepts only this exact move:
+repo-day.ts:130-135).
+
+After COMMIT: alert `equity-jump-confirmed` (info). The caller observes again right after (contract 3).
+
+On a throw: a RiskError is `refused` (alert warn `jump-confirm-refused`, no halt: the hold keeps
+blocking entries, which fails closed). `busy`: `error`, no halt. Anything else: `persistHaltTx(deps,
+DAY_STATE_ERROR_HALT)` and the alert, as in 17.5.1.
+
+#### 17.5.3 `applyDueTx(deps)`
+
+Phase R:
+1. `now`; untrusted: `not-run: clock-untrusted` (a loosening never applies on a doubtful clock).
+2. `s = readConfigState(tx)`. No pending row: `nothing-due`.
+3. Any `s.pending[i].requestedAt > now`: `not-run: clock-behind-pending` (the clock stepped back;
+   nothing applies; alert warn). Without this check `applyDuePending` would throw ConfigError and latch
+   entries as a bug for a clock fault.
+4. `r = applyDuePending(s.active.values, s.pending, { now, liveArmed: LIVE_ARMED_IN_PAPER,
+   liveStrategies: s.liveStrategies })`. No step and no stale row: `nothing-due`.
+5. The versions, chained: `active = s.active`; for each step, `v = nextVersion(active, step.values,
+   step.change.source, max(now, active.createdAt))` (default `undoTo = active.id`, which
+   `applyDueStep` requires); `active = v`.
+
+Phase W: `applyDueStep(tx, now, v)` for each version in order (the engine's `engine:apply-due` row,
+the version, the row deleted); `dropDuePending(tx, now, row.path)` for each stale row; `demote(tx,
+strategy, now)` for each of `r.demote`; `restartGate(tx, strategy, now)` for each of `r.restartGate`.
+
+After COMMIT: `anchorAfter`; alerts (info) `loosening-applied` and `loosening-dropped` with the paths.
+On a throw: classify, report `config-due`, return `error`. Nothing to record: there is no intent.
+
+```mermaid
+sequenceDiagram
+  participant Eng as Engine (later step)
+  participant Cfg as app/config-tx
+  participant DB as SQLite
+  participant Plan as config/changes (pure)
+  Eng->>Cfg: applyDueTx(deps)
+  Cfg->>DB: BEGIN IMMEDIATE
+  Cfg->>Cfg: now; time.trusted(now)?
+  Cfg->>DB: R: history, pending rows, strategy modes
+  Cfg->>Plan: applyDuePending; nextVersion per step (chained)
+  Cfg->>DB: W: applyDueStep per version; dropDuePending per stale row; demote; restartGate
+  Cfg->>DB: COMMIT
+  Cfg-->>Eng: applied / nothing-due / not-run (anchor, alerts after COMMIT)
+```
+
+#### 17.5.4 `setTx`, `rollbackTx` and `cancelPendingTx`
+
+Before BEGIN: the actor is checked against `OWNER_ACTORS` (a wrong one is a TypeError: a programming
+error of the caller). The path and value stay raw: the planner parses them.
+
+Phase R: `now`; `s = readConfigState(tx)`; `t = commandTime(now, s)`; `ctx = { now: t, liveArmed:
+LIVE_ARMED_IN_PAPER, liveStrategies: s.liveStrategies }`; then:
+- set: `p = planSet(s.active.values, path, value, ctx, s.pending)`;
+- rollback: `p = planRollback(s.history, s.active.id, ctx, s.pending)`;
+- cancel: `p = planCancel(s.pending, path, ctx)`.
+A refusal returns `refused` with nothing written. Otherwise `version = p.applied.length > 0 ?
+nextVersion(s.active, p.values, author, t, undoTo) : null`, with `author` 'owner' or 'rollback' and
+`undoTo` the default for /set or `p.undoTo` for /rollback (s.3.4); /cancel has no version.
+
+Phase W: `writeOwnerConfig(tx, t, actor, action, { version, pending: p.pending, cancelled: the paths
+of p.cancelled })` (the owner's row first, then the deletes, the version, the new rows; action
+`owner:set`, `owner:rollback` or `owner:cancel-pending`); then `demote(tx, x, t)` for each of
+`p.demote` and `restartGate(tx, x, t)` for each of `p.restartGate` (set and rollback only).
+
+After COMMIT: `anchorAfter`; `clockBehind = t > now` alerts warn `config-clock-behind`; return `done`.
+The reply to the owner and the notice of a new waiting loosening (Telegram and email) belong to
+Phase 3; the outcome carries what they need. On a throw: classify, report `owner`, return `error`. A
+storage refusal of a planner's plan is a bug (planner and storage disagree) and alerts as one; the
+config stays exactly as it was.
+
+```mermaid
+sequenceDiagram
+  participant Own as app/owner.ts (Phase 3) or cli/ (Phase 7)
+  participant OT as app/owner-tx
+  participant DB as SQLite
+  participant Plan as config/changes (pure)
+  Own->>OT: setTx(deps, actor, path, value)
+  OT->>DB: BEGIN IMMEDIATE
+  OT->>DB: R: history, pending, modes
+  OT->>OT: t = max(now, active.createdAt, newest requestedAt)
+  OT->>Plan: planSet(active, path, value, ctx at t, pending); nextVersion(active, values, owner, t)
+  alt refused
+    OT-->>Own: refused (nothing written)
+  end
+  OT->>DB: W: writeOwnerConfig (owner row, deletes, version, rows); demote; restartGate
+  OT->>DB: COMMIT
+  OT-->>Own: done (anchor after COMMIT; reply and notices in Phase 3)
+```
+
+#### 17.5.5 `resumeTx(deps, actor, which)`
+
+Phase R: `now`; `reason = which === 'peak' ? 'peak-halt:paper' : 'daily-stop-twice:paper'`; not in
+`readHalts(tx)`: `refused: not-halted`. For the peak: `state = readDayState(tx, 'paper')`;
+`state.jumpPending`: `refused: jump-held`; `state.lastEquity < 1`: `refused: equity-unknown`;
+`n = newestSnapshot(tx, 'paper', now)`; `n === null || n.equity === null || now - n.at >
+RESUME_FRESH_MS`: `refused: observe-first` (contract 4). These are the conditions `checkPeakRestart`
+throws on, checked first so that an expected refusal is never classified as a bug.
+
+Phase W: `resumeHalt(tx, now, actor, which)` must answer true (the halt was read in this
+transaction); false throws AppError `bad-request` (a bug).
+
+After COMMIT: `anchorAfter`; `resumed`. The 15-minute recovery wait starts at the recorded clear time
+(repo-owner.ts:80). Live halts are never lifted here (D4).
+
+#### 17.5.6 Classification and what each outcome does
+
+| Outcome | Recorded | Alerted | Latch / halt / stop |
+|---|---|---|---|
+| observe: `not-run: clock-untrusted` | nothing | `day-clock-untrusted` (warn, rate-limited) | none here; T1 refuses after 30 s (`day-state-stale`), and contract 8's CLOCK breaker later |
+| observe: a halt trip | the halt row and its audit row, in the observation's transaction | `day-halt-set` | the halt (owner lifts it: /resume for peak and streak in paper, the server for the rest) |
+| observe: low-equity stop on | `entries_stopped = 1` | `equity-below-minimum` once | entries stop until an accepted observation clears it |
+| observe or confirm: `busy` | nothing | the busy storm only | 3 in 10 minutes: latch `storage-busy` and the disk-db halt (6d) |
+| observe or confirm: any other throw (a RiskError, a `writeDayState` refusal, a bad cell, a constraint, a full disk) | `day-state-error:paper` and its audit row, in a second transaction | `day-state-error` (bug) plus the fault sink's own alert | the halt (server reset); a failed halt write latches `halt-write-failed` (6d); full and io also try `disk-db` |
+| confirm: RiskError | nothing | `jump-confirm-refused` (warn) | none: the hold keeps blocking entries |
+| applyDue: `clock-behind-pending` or `clock-untrusted` | nothing | warn | none: the loosening waits |
+| applyDue: ConfigError | nothing | `error:config` (bug) | latch (`bug`) |
+| owner command refused by its planner | nothing | none (the reply says why, Phase 3) | none |
+| owner command throws | nothing | per `classify` (a storage refusal is a bug) | per `classify`; the config is unchanged |
+| any `poisoned`, `async-in-transaction`, `nested-transaction`, `tx-closed` | nothing | fatal | latch, `onFatal` once (6d) |
+
+### 17.6 How and when the engine calls them
+
+The run loop does not exist yet (16.16, conditions for later steps). 6e fixes what it must do, and
+tests each rule against the transactions now:
+- The observation tick: `observeDayTx` every 5 s, and immediately before every `approveBuyTx` (two
+  transactions, in that order). Proposed numbers, for the run-loop step (17.10 R12).
+- T1's freshness (6e-2, stricter than 6d): `readBuySnapshot` refuses with `day-state-stale` unless the
+  newest paper snapshot at or before now is at most 30 s old and holds a known equity. So a missed or
+  failed observation, a stopped tick or an untrusted clock stops entries within 30 s, with no new
+  latch. Exits do not read it.
+- The clock reading: one `deps.clock.now()` inside each transaction, after the lock is taken; the
+  guard, the day, the snapshot's `at`, the state's `at`, each halt's `at` and the prune all use it.
+- Unknown equity (a stale or missing mark): `observeEquity` gets `equity: null`; the stops still run on
+  `stopEquity` when it is known (a mark older than 5 minutes counts 0). The state otherwise stays, the
+  snapshot stores unknown, the low-equity stop is left as stored, and T1 refuses (its own valuation
+  is null, and the newest snapshot has no equity). The watch alerts `equity-unknown` after 5 minutes.
+- A clock that steps back: within the same Athens day `observeEquity` accepts it, and `snapshotNear`
+  ignores rows after now. Across midnight it reports `clock-backwards`: the halt is set, the state is
+  written unchanged, and no snapshot or prune happens. A confirmation before its held observation is
+  refused (the hold stays). A stored config row dated after now stops `applyDueTx` (`not-run`), while
+  owner commands still run at `commandTime`.
+- A clock that jumps forward: the risk is that the day rolls early and a daily stop ends early.
+  `TimeGuard` is the seam for contract 8. No production `TimeGuard` exists in 6e: only test fakes. The
+  cli/ start command (the ops step) must not be written before contract 8's guard exists (a new
+  condition, beside the run lock of D11). When the clock returns, `observeEquity` reports
+  `clock-backwards` and halts, so a forward jump is never silent.
+- A `writeDayState` refusal: it is a StorageError `bad-param` thrown before the UPDATE, so the whole
+  observation rolls back (state, snapshot, halts, stop). Outside the callback, `classify` gives
+  `error:storage-bad-param`; the sink alerts it as a bug; then `persistHaltTx(deps,
+  'day-state-error:paper')` writes the halt with its `engine:halt-set` row in its own transaction and
+  moves the anchor (C40). The next tick observes again from the stored state. If the refusal repeats,
+  the halt is already set (`already`), and the watch keeps the alert to once per 10 minutes.
+- `applyDueTx` is called once a minute (proposed). In paper it always answers `nothing-due`.
+- The owner's transactions are called by Phase 3's app/owner.ts after the Telegram owner check, and by
+  Phase 7's cli/ at the server. They take no latch: a tightening or a /resume must work while entries
+  are latched.
+
+### 17.7 Failure modes
+
+| What fails | Who notices | What the bot does |
+|---|---|---|
+| Daily stop, peak halt, two-day halt | `observeEquity` trips | halt row (peak, streak) or day-state flag (daily stop) in the same transaction; alert; entries blocked; exits go on |
+| +50% in an hour | `equity-jump` trip | hold in day_state; entries blocked; alert; the verification routine (Phase 3) confirms or the server does (Phase 7) |
+| Confirmation later than 5 minutes, or above the held level | `confirmEquityJump` RiskError | refused, hold stays, warn |
+| Zero equity, over 2 SOL, over 3x bankroll | anomaly trips | halt; snapshot stored as unknown; baseline and peak unchanged |
+| Clock back across midnight | `clock-backwards` | halt; no snapshot, no prune |
+| Clock back within a day | nothing in daystate | observation accepted; future rows ignored by `snapshotNear`; a stored config row in the future stops `applyDueTx` |
+| Clock forward | (contract 8, later) | the day may roll early until the guard exists; on return `clock-backwards` halts; no start command before the guard |
+| Clock untrusted (guard) | `TimeGuard` | no observation, no due step; T1 refuses after 30 s |
+| Observation stops (tick dead, busy) | T1's freshness check | entries refused `day-state-stale` after 30 s |
+| Equity unknown | `valueEquity` null | stops on stop equity only; T1 refuses; alert after 5 minutes |
+| No base an hour ago, or far from it | `JumpBase` | alert after the first hour (contract 6); the jump test runs on what exists |
+| `writeDayState` refuses | StorageError `bad-param` | rollback; `day-state-error:paper` halt; bug alert; no retry with an edited state |
+| A halt or the stop write fails inside the observation | its StorageError | the whole observation rolls back; `day-state-error` halt in a second transaction |
+| The `day-state-error` halt write fails too | `persistHaltTx` | latch `halt-write-failed`, fatal alert outside the database (6d) |
+| Busy (another writer over 5 s) | `busy` at BEGIN | nothing written; next tick; storm: latch and disk-db halt |
+| Disk full or I/O error | `full` / `io` | rollback; latch; disk-db halt tried; day-state-error halt tried; alert directly |
+| Low equity (10% below 0.02 SOL) | `lowEquityStopOf` | `entries_stopped` on, alert once; cleared by an accepted observation above it |
+| Stored config does not decode | ConfigError | `error:config`; latch as a bug; T1 latches too |
+| Owner /set, /rollback or /cancel refused | its planner | nothing written; the reason goes back |
+| Planner and storage disagree | StorageError in `writeOwnerConfig` | rollback; bug alert; config unchanged |
+| Clock behind the active version or a waiting row | `commandTime` | the command runs at the later stored time; alert `config-clock-behind` |
+| A due row whose value changed or is out of bounds | `applyDuePending` stale | dropped with `engine:drop-pending`; alert |
+| /resume of the peak with a held jump, unknown equity or no fresh valuation | `resumeTx` phase R | refused with the reason; nothing written |
+| The anchor write fails after an audit row | `anchorAfter` | warn; the next boot's check still passes (the chain only grows) |
+| A caller passes a live mode | type (paper only) and a live position read | `live-not-built`; the live day state is never observed (a zero live account would halt paper, D5.4) |
+
+### 17.8 Tests to write first
+
+All on `':memory:'` or temp files from `tempDir()`, never under fomo-bot/data/. The world helper gains a
+fake `TimeGuard` (a switch), a `DayWatch` on recording alerts, and `observe(world)` that runs
+`observeDayTx`. Open positions come from `openPosition` (tests/unit/app/tx-world.ts:172), their marks
+from the world's map. "Nothing written" means `dump(db)` is unchanged.
+
+Unit tests:
+- app/caps.ts `lowEquityStopOf`: the edges (10% of the sizing equity at 20,000,000 and 19,999,999
+  lamports; a baseline below and above the equity); an agreement property over 1,000 random equities,
+  baselines and tunable values: true exactly when `sizeEntry` answers `equity-below-minimum`.
+- storage/repo-day.ts: `snapshotNear` ignores rows after now, takes the older on a tie, returns the
+  row's time, skips unknown rows; `newestSnapshot` includes unknown rows; both agree with a brute-force
+  oracle on random row sets (property).
+- app/day-tx.ts `observeDayTx`:
+  - writes exactly the day state, one snapshot, the prune, each new halt (audit row immediately
+    before it) and the stop, in that order; `at` is the one clock reading everywhere (a clock that
+    answers differently on a second call is used once);
+  - every trip: the halt reasons for the six halting trips, none for daily-stop and equity-jump;
+    level-triggered (a second tick writes no second halt or audit row);
+  - two halts in one tick: audit, halt, audit, halt; each `set_audit_id` names its own
+    `engine:halt-set` row with the reason in its detail (the boot's link check passes) (C28);
+  - first observation after the setup sets the baseline and the peak (C39); a planted same-day
+    baseline of 0 is set again from the higher of the last equity and the observation;
+  - the base: the hour-ago row is used, a row after now is not, `missing` and `far` reported, the
+    alert only after the first hour;
+  - anomalies store an unknown snapshot; `clock-backwards` stores none and prunes nothing;
+  - unknown equity: the stops on stop equity, the stop flag left as stored;
+  - the low-equity stop turns on and off with the equity; the alert once per transition;
+  - untrusted clock: `not-run`, nothing written;
+  - a live position: `live-not-built` and the day-state-error halt; the live day state never changes;
+  - a planted refusal of `writeDayState` (a stored state changed by hand so the step looks looser):
+    nothing of the observation stays, `day-state-error:paper` is set with its row, the anchor moves,
+    the alert names `error:storage-bad-param`; the next tick does not retry an edited state;
+  - Athens midnight on 2026-03-29 (23 hours) and 2026-10-25 (25 hours): the daily stop ends at local
+    midnight, never an hour early or late.
+- app/jump-tx.ts: confirms at 0 ms and 5 minutes after the hold, refuses 5 minutes + 1 ms, refuses a
+  confirmation before the hold, records the lower of the verified and the held level, works while KILL,
+  a halt and the pause are set; a refusal writes nothing and sets no halt.
+- app/config-tx.ts: `readConfigState` converts both kinds and refuses a number past 2^53 - 1, an unknown
+  path and a version that does not decode (ConfigError); `commandTime` takes the latest of the three;
+  `applyDueTx`: one row, two rows chained (version ids, dates `max(now, active.createdAt)`, undoTo the
+  previous one), a stale row dropped, an out-of-bounds row dropped, a row not yet due kept, a demotion
+  and a gate restart, `clock-behind-pending` and `clock-untrusted` write nothing; every stored version
+  decodes and equals the plan's values.
+- config/changes.ts `planCancel`: unknown path, nothing to cancel, the row returned, malformed rows throw.
+- app/owner-tx.ts:
+  - setTx: applied at once in paper; a /set to the current value with a waiting row cancels it;
+    refusals write nothing; a paper-model loosening refused; the owner's row first, then deletes,
+    version, rows; `clockBehind` with the clock behind the active version and behind a waiting row;
+    the stored version decodes;
+  - rollbackTx: one step, two steps (undoTo chain), an all-kept rollback refused, an all-waiting
+    rollback (a strategy set live by the test) makes no version and only rows;
+  - cancelPendingTx: the row deleted with `owner:cancel-pending`;
+  - resumeTx: each refusal (not halted, jump held, equity unknown, no snapshot, a snapshot 60,001 ms
+    old, a newest snapshot with unknown equity) writes nothing and is never classified as a bug; peak
+    and streak resumed exactly as `resumePeak` and `resumeStreak` compute; the clear time recorded.
+- app/snapshot.ts: T1 refused `day-state-stale` with no snapshot, one 30,001 ms old, one with unknown
+  equity, one only after now; accepted at 30,000 ms.
+- app/faults.ts: ConfigError is `error:config`, latch, bug; the four new sites; `day-state-stale` quiet.
+
+Properties (fast-check; 1,000 runs where the time allows, else 200 with the edge cases on every run):
+- Day sequences: random steps (advance the clock 1 ms to 26 h, across both DST nights; step it back
+  1 ms to 2 days; set the one open position's mark, including zero, above 2 SOL, +60% in an hour, falls
+  of 31% and 51%; let a mark go stale past 30 s and past 5 minutes; confirm a held jump in and out of
+  its window; the owner's resumes through `resumeTx`). Each step runs through the transactions on
+  SQLite and, beside them, through the pure functions on a model state with the base taken from the
+  model's own snapshot list by the same rule. After every step: `readDayState` equals the model state;
+  the halt rows equal the model's halts (set on first trip, lifted only by a resume); `entries_stopped`
+  equals the oracle; the snapshot rows equal the model's (unknown on anomalies, none on clock-backwards,
+  pruned past a day); `verifyAuditChain` passes and every halt links to its row; no honest step ever
+  ends in `day-state-error`.
+- Command sequences: random /set (valid and invalid paths and values of both kinds, paper-model
+  values), /rollback, /cancel, `applyDueTx`, clock advances (over 24 h too) and steps back, and a
+  strategy set live by the test (through repo-owner's `setStrategyMode`, tests only) so that rows wait.
+  The same commands run on a model: the pure planners on an in-memory history and pending list at the
+  same `commandTime`. After every step: the decoded history, the pending rows, the modes and the gate
+  starts equal the model; every stored version decodes; storage never refuses a planner's plan; the
+  owner's row precedes each command's writes. Invariant 11 is checked on rollback sequences once the
+  risk-guardian has ruled on due rollback rows (17.10 R15).
+
+Fault injection (the `faulty(real, k, code)` wrapper of tests/unit/app/fault-injection.test.ts:25): for
+every statement k of a successful call and each of `full`, `io`, `constraint`, `bad-param` and `busy`:
+- `observeDayTx` (about 10 reads and up to 8 writes with two halts), `confirmJumpTx`, `applyDueTx`
+  (two steps, one drop, one demotion), `setTx`, `rollbackTx`, `cancelPendingTx`, `resumeTx`;
+- after each: for the day transactions the dump equals the dump before plus exactly the
+  `day-state-error:paper` halt and its audit row (nothing for `busy`); for the config and owner
+  transactions, the dump is unchanged; the latch and the alerts are as 17.5.6 says.
+- A crash test: a child process runs `observeDayTx` with a marks reader that calls `process.exit(1)`
+  after BEGIN (through the clock); on reopen nothing is persisted and quick_check is clean.
+
+Races (child processes, as 6d-2's harness):
+- Connection A's `observeDayTx` trips the daily stop while B's `approveBuyTx` waits on the lock: B is
+  then refused `blocked: daily-stop`. The same with the peak halt (`blocked: halt`).
+- B's T1 holds the lock (the slot-source trick of 16.9) while A's `observeDayTx` runs with a 100 ms
+  busy timeout: `error` with `halt: 'not-tried'`, nothing written; after B commits, A observes.
+- A's `setTx` lowers `risk.openPositions` to 1; B's next T1 with one position open is refused
+  `blocked: max-positions`.
+- A's `applyDueTx` and B's `cancelPendingTx` on the same due row, both orders: exactly one wins; the
+  other sees no row (`nothing-due` or `nothing-to-cancel`).
+
+Planted bugs (scratchpad `mut/run33.py`), at least: the snapshot inserted before `snapshotNear` (the
+base becomes now's own equity: the jump test never fires); `snapshotNear` without `at <= now`;
+`writeDayState` at a second clock reading; a halting trip with no halt row; a halt written without its
+audit row first; prune on clock-backwards; an anomaly stored as a known snapshot; `lowEquityStopOf` on
+the current equity instead of the sizing equity; the stop left on when equity recovers; the
+day-state-error halt skipped on a refusal; a retry with an edited state; busy treated as a refusal (a
+halt on busy); `commandTime` without the pending rows; a version dated `now`; a /set to the current
+value that does not cancel; demote or restartGate skipped; a stale row applied instead of dropped;
+`applyDueTx` proceeding past a row dated after now; `LIVE_ARMED_IN_PAPER` true; `resumeTx` without the
+freshness check, or with 60,001 ms; T1's freshness at 30,001 ms; `confirmJumpTx` reading a flag; the
+anchor not written; the watch's rate limit off by one.
+
+Architecture: the canaries of 17.3, each caught for its own reason; the real src/ shows every new
+transaction callback followed by the no-catch rule.
+
+### 17.9 The split
+
+Each sub-step's Definition of Done is that of s.7 (tests shown, typecheck, architecture test, coverage
+gate at 100% of lines and branches for its files, both Opus reviews in REVIEWS.md, STATUS.md, the
+owner's summary, a commit marked UNREVIEWED under D11, no new dependency), plus its own:
+
+- **6e-1, the observation** (2 new or changed files plus 3 small changes): app/day-tx.ts, the
+  storage/repo-day.ts readers, `lowEquityStopOf` in app/caps.ts, the faults.ts additions, the
+  approve-tx.ts exports. Extra DoD: the day-sequence property; fault injection on `observeDayTx`; the
+  DST tests; the C28 interleaving test; planted bugs for every rule of 17.5.1; the scratch runs U1, U2
+  and U5.
+- **6e-2, the jump confirmation and T1's freshness** (2 files and an import rule): app/jump-tx.ts,
+  app/snapshot.ts, the `app/jump-tx.ts` restriction. Extra DoD: every 6d-2 T1 test still passes with a
+  fresh snapshot in the world; the race "observation trips the stop while T1 waits"; the freshness
+  edges; planted bugs.
+- **6e-3, the engine's config step** (2 files): app/config-tx.ts and `planCancel` in config/changes.ts.
+  Extra DoD: fault injection on `applyDueTx`; the decode test; the clock-behind cases; the race with
+  /cancel (after 6e-4).
+- **6e-4, the owner's commands** (1 file and the import rules): app/owner-tx.ts, the repo-owner.ts and
+  owner-tx.ts restrictions. Extra DoD: the command-sequence property; fault injection on the four
+  owner transactions; the canaries; a test that no file in src/ imports app/owner-tx.ts at runtime.
+
+6e-2 uses 6e-1's observation in T1's tests; 6e-4 uses 6e-3's `readConfigState` and `commandTime`. Each
+review reads one sub-step; the reviewers' round of D11 takes them after 6d-1, 6d-2 and 6d-3.
+
+### 17.10 Questions for the owner, and decisions to challenge
+
+Owner question (plain English, one at a time):
+- Q1. **If the bot's daily money check itself breaks (a bug, not a loss), should only you at the
+  server be able to restart buying?** The bot stops buying and tells you at once. Selling still
+  works. Recommended: yes, the server only. A broken check means the stops cannot be trusted, so a
+  quick tap in Telegram should not be enough; you look first, then restart it with one command I
+  will give you. (Today the code already works this way; a "no" would add a Telegram path for paper.)
+
+Decided since this design was written: s.16.11 Q1 (refuse to start when the safety log is shorter than
+its bookmark), yes (owner decision D12); s.15.16 question 2 (no other person's wallet in the trade
+records), yes (D13). Q1 above is not asked yet.
+
+Decisions the reviewers should challenge:
+- R1. The equity is valued inside `observeDayTx` from the stored book and the marks, never passed by
+  the caller (stricter than s.3.5).
+- R2. T1 refuses entries when the newest snapshot is older than 30 s or has no equity
+  (`day-state-stale`): a change to 6d-2's T1, stricter, closing the gap between ticks.
+- R3. An anomalous reading is stored as an unknown snapshot; a `clock-backwards` tick stores none and
+  prunes nothing.
+- R4. `pruneBans` is never called until contract 8's guard exists (C34).
+- R5. Owner commands run at `commandTime = max(now, active.createdAt, newest requestedAt)`; due steps
+  use the raw clock, so a stored time can never make a loosening due early.
+- R6. `applyDueTx` with a row dated after now is `not-run` and alerts, without latching entries.
+- R7. A refused confirmation sets no halt (the hold keeps blocking entries).
+- R8. Every other day-transaction failure but `busy` becomes the `day-state-error:paper` halt, not only
+  a `writeDayState` refusal or a RiskError (C40 read widely).
+- R9. `lowEquityStopOf` lives in app/caps.ts, built from risk's exported `capsInEffect` and
+  `tradeMinimum` and pinned to `sizeEntry` by an agreement property, instead of a new export from
+  risk/sizing.ts. The alternative (a risk/ export used by `sizeEntry` itself) gives one definition at
+  the cost of a risk/ change.
+- R10. `planCancel` is a new pure planner in config/changes.ts (a config/ change).
+- R11. Two new restricted files: app/owner-tx.ts (app/owner.ts and cli/) and app/jump-tx.ts (cli/ only).
+- R12. The numbers: a 5 s tick plus one before every buy, 30 s freshness for T1, 60 s freshness for the
+  peak resume, 10 minutes for a far base and for each alert's repeat, 1 minute for `applyDueTx`.
+- R13. The AI approval waits for Phase 5's proposal store.
+- R14. The live day state is never observed in paper (a zero live account would trip `equity-zero` and,
+  by D5.4, halt paper entries too).
+- R15. Open since s.10, needs a risk-guardian ruling before Phase 8: a due row of a /rollback applies
+  with `undoTo = active.id` (applyDueStep requires it), so invariant 11 ("restores the earlier values
+  exactly") holds only for a rollback whose rows all apply; a later /rollback then undoes the due step
+  alone. Paper never makes such rows.
+- R16. `ConfigError` is classified `error:config` (latch, bug) instead of `error:unexpected`.
+- R17. No production `TimeGuard` in 6e, and no cli/ start command before contract 8.
+
+### 17.11 UNVERIFIED, each with a scratch test before code depends on it
+
+- U1. The two `snapshotNear` SELECTs use the (mode, at) primary key, and each takes under 2 ms at
+  200,000 rows on Node 26.13.0. Scratch: EXPLAIN QUERY PLAN through a raw handle, and a timing loop on
+  a temp WAL file.
+- U2. Node 26.13.0's ICU gives Europe/Athens the EU rule (last Sunday of March and October, 01:00 UTC)
+  for 2026-2030, so `athensDay` rolls at local midnight on 23- and 25-hour days. Scratch: `athensDay`
+  at each transition minus and plus 1 ms, and at local midnight on both nights, against the rule.
+- U3. `verifyAuditChain` (called by `anchorAfter` after every audit-writing transaction) at 10,000 and
+  100,000 rows. Scratch timing. If it is slow, the anchor takes the newest row through `newestAuditId`
+  and `readAuditRow` instead (no behaviour change for the boot).
+- U4. The no-catch rule follows the new helpers called inside callbacks and does not flag an
+  interface method called with a number (`deps.time.trusted(now)`). Scratch: the canaries of 17.3.
+- U5. A 5 s tick makes about 17,280 snapshot rows a day per mode: the WAL size and the time of a
+  `pruneSnapshots` that deletes a day's rows at once (after a long stop) inside one tick. Scratch on a
+  temp file; if over 50 ms, the prune deletes at most a bounded batch per tick (a reviewed change).
+- U6. repo-day.ts's guard accepts every honest step with `at` equal to an earlier clock reading within
+  the same day (a clock stepped back). Scratch: the 6c-2b-1 property (tests/property/storage/
+  repo-day.property.test.ts) with backward steps added.
+- U7. Contract 8's independent time source (the RPC's block time within about a minute) is a chain
+  fact for Phase 3; nothing in 6e depends on its value.
