@@ -5401,3 +5401,49 @@ the first run; the one left (a paper strategy counted as live) showed that no te
 paper mode. Fixed: 35 of 35 caught. Coverage: every line and branch of app/config-tx.ts and of
 `planCancel`.
 
+### 17.15 As built in step 6e-4 (the owner's commands), and what changed
+
+Status: UNREVIEWED (owner decision D11), on the same branch.
+
+Built, tests first: `app/owner-tx.ts` (`setTx`, `rollbackTx`, `cancelPendingTx`, `resumeTx`, `OwnerDeps`,
+`OwnerConfigOutcome`, `ResumeOutcome`, `RESUME_FRESH_MS`), the `owner` fault site, the import rules
+(app/owner-tx.ts from app/owner.ts and cli/ only; repo-owner.ts also from app/owner-tx.ts) with their
+canaries, and a test that nothing in src/ imports app/owner-tx.ts at runtime yet. The 6e-1 day-sequence
+property now runs the owner's resumes through `resumeTx`, its refusals modelled by the same rules.
+
+Differences from 17.4, 17.5.4 and 17.5.5:
+- `OwnerConfigOutcome`'s `done` case gains `restarted` (the go-live counts the command restarted), so
+  Phase 3's reply can say so.
+- `anchorAfter` (app/approve-tx.ts) takes only what it uses (`db`, `latch`, `alerts`, `anchors`), so the
+  owner's commands, whose deps hold no slot source, can call it. No behaviour change.
+- A `which` other than peak or streak is a TypeError before BEGIN, like an actor that is not the owner.
+- The demotions and gate restarts of /set and /rollback are dated the command's time, like every row the
+  command writes.
+- The no-catch rule (C32, 16.7.4) gains a clause: a function value of app/ or cli/ that it cannot follow
+  (a parameter, or a variable that holds no function written in place) is never called inside a
+  transaction callback. The first draft of this step handed each command's planner to the shared
+  transaction as a closure, which the rule could not follow, so a `try` there would have gone unseen;
+  the planners now run in one named function (`planOf`) that the rule follows. Four canaries pin the
+  clause, and it flags nothing else in src/. An interface method (the clock, the guard) is still called
+  without being followed, as 16.7.4's limit says; the rule keeps the transaction from it.
+
+Written down, for the reviewers:
+- These commands take no latch and read no KILL, halt or pause, so a tightening, a /cancel or a /resume
+  works while entries are blocked. They do not consult the TimeGuard either: an owner command runs at
+  `commandTime` whatever the clock says (C27), while the engine's due step needs a trusted clock.
+- They alert only `config-clock-behind` (warn) themselves. The reply to the owner (what applied, what
+  waits, what was cancelled, kept, demoted and restarted) is Phase 3's, from the outcome.
+- `resumeTx` refuses `observe-first` unless the newest paper money check at or before now is at most
+  60 s old and valued everything; the streak resume has no such check (it does not use the equity).
+- The race of 17.8 (the due step and /cancel on one due row) is deterministic, in one process with two
+  connections, in both orders: the inner one is busy and writes nothing; after the commit it finds no
+  row (`nothing-to-cancel` or `nothing-due`).
+- No file in src/ calls these yet (a test pins it): Phase 3's app/owner.ts, after the Telegram owner
+  check, and Phase 7's cli/. The AI approval (`aiApproveTx`) stays reserved for Phase 5 (R13).
+
+Tests: TEST_PLAN.md s.3, "Done in step 6e-4". Planted bugs (scratchpad `mut/run36.py` on the first
+draft, `mut/run36b.py` on the final code): on the first draft 37, 36 caught; the one left (a demotion
+dated by the raw clock instead of the command's time) showed that no test demoted a strategy with the
+clock behind, and that test was added. On the final code 42, two of them for the rule's new clause:
+42 of 42 caught. Coverage: every line and branch of app/owner-tx.ts.
+

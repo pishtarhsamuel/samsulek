@@ -102,7 +102,13 @@ const RESTRICTED_FILES: Readonly<Record<string, { readonly allows: (rel: string)
     allows: (rel) => ['storage/repo-audit.ts', 'storage/repo-owner.ts', 'storage/repo-server.ts'].includes(rel),
     who: 'storage/repo-audit.ts, repo-owner.ts and repo-server.ts',
   },
-  'storage/repo-owner.ts': { allows: (rel) => rel === 'app/owner.ts' || rel.startsWith('cli/'), who: 'app/owner.ts (Telegram, after the owner check) and cli/' },
+  'storage/repo-owner.ts': {
+    allows: (rel) => rel === 'app/owner.ts' || rel === 'app/owner-tx.ts' || rel.startsWith('cli/'),
+    who: 'app/owner.ts (Telegram, after the owner check), app/owner-tx.ts (the owner\'s transactions) and cli/',
+  },
+  // the owner's transactions write the owner's rows, so they are restricted like the writer itself
+  // (6e-4, STORAGE_DESIGN s.17.3): if any app/ file could call them, the engine could forge an owner command
+  'app/owner-tx.ts': { allows: (rel) => rel === 'app/owner.ts' || rel.startsWith('cli/'), who: 'app/owner.ts (Telegram, after the owner check) and cli/' },
   'storage/repo-server.ts': { allows: (rel) => rel.startsWith('cli/'), who: 'cli/ (the owner at the server)' },
   'app/owner.ts': { allows: () => false, who: 'its one Telegram wiring file (Phase 3 names it; none until then)' },
   // the money path (6c-2b-2, STORAGE_DESIGN s.15.11): T1 lives in app/; only the token store bound into
@@ -1397,7 +1403,9 @@ export interface NoCatchResult {
  * 2. its body, nested functions included, has no try statement and calls no member named catch, then
  *    or finally;
  * 3. every call (or `new`) in it of a function, method or class declared in app/ or cli/ is followed,
- *    with a visited set, and that body is held to rules 2 to 4;
+ *    with a visited set, and that body is held to rules 2 to 4; a function value of app/ or cli/ that
+ *    cannot be followed (a parameter, or a variable that holds no function written in place) is never
+ *    called there (6e-4: a planner handed in as a closure would run unseen);
  * 4. a value typed Reader, Tx or Db of storage/sqlite.ts, or a function literal, is passed only to a
  *    function declared in storage/, app/ or cli/ (followed by rule 3) or in TypeScript's own lib files
  *    (Promise's members excepted): an interface method, a parameter or a variable of function type
@@ -1471,6 +1479,10 @@ export function noCatchProblems(program: ts.Program, srcRoot: string): NoCatchRe
         const d = declarationOf(callee);
         const dRel = d === undefined ? '' : relOf(d.getSourceFile());
         const body = d === undefined ? undefined : bodyOf(d);
+        const unfollowable = d !== undefined && body === undefined && (ts.isParameter(d) || ts.isVariableDeclaration(d) || ts.isBindingElement(d));
+        if (ts.isIdentifier(callee) && unfollowable && inSrc(dRel) && ['app', 'cli'].includes(folderOf(dRel))) {
+          problems.push(`${rel}: a function value of app/ or cli/ (a parameter or a variable) is called inside a transaction callback, where the rule cannot follow it (${where})`);
+        }
         const carries = (node.arguments ?? []).some((a) => ts.isArrowFunction(a) || ts.isFunctionExpression(a) || isHandleType(checker.getTypeAtLocation(a)));
         if (carries) {
           const ours = d !== undefined && body !== undefined && inSrc(dRel) && ['storage', 'app', 'cli'].includes(folderOf(dRel));
@@ -1983,6 +1995,31 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
     assert.deepEqual(symlinksUnder(SRC), []);
   });
 
+  it('nothing in src/ imports the owner\'s transactions at runtime yet: Phase 3\'s app/owner.ts and Phase 7\'s cli/ will (6e-4, s.17.3)', () => {
+    /** The real source files that load `target` at runtime: an import that is not type-only, a re-export or a dynamic import. */
+    const importersOf = (target: string): string[] =>
+      sourceFiles().filter((rel) => {
+        const source = ts.createSourceFile(rel, readFileSync(path.join(SRC, rel), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+        const hits = (spec: ts.Node | undefined): boolean =>
+          spec !== undefined && ts.isStringLiteral(spec) && spec.text.startsWith('.') && path.relative(SRC, path.resolve(SRC, path.dirname(rel), spec.text)).split(path.sep).join('/').toLowerCase() === target;
+        let found = false;
+        const visit = (node: ts.Node): void => {
+          if (ts.isImportDeclaration(node) && node.importClause?.isTypeOnly !== true && hits(node.moduleSpecifier)) {
+            found = true;
+          } else if (ts.isExportDeclaration(node) && !node.isTypeOnly && hits(node.moduleSpecifier)) {
+            found = true;
+          } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword && hits(node.arguments[0])) {
+            found = true;
+          }
+          ts.forEachChild(node, visit);
+        };
+        visit(source);
+        return found;
+      });
+    assert.deepEqual(importersOf('app/owner-tx.ts'), []);
+    assert.deepEqual(importersOf('app/config-tx.ts'), ['app/owner-tx.ts'], 'the scan sees a real import');
+  });
+
   it('CANARY: the audit writers reach only their callers: the chain only its three files, the owner\'s only app/owner.ts and cli/, the server\'s only cli/, app/owner.ts only its wiring file; none is re-exported or imported dynamically (reviews P, Q)', () => {
     const only = 'may be imported at runtime only by';
     flaggedFor([
@@ -2028,6 +2065,13 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['app/day-tx.ts', "export { confirmJumpTx } from './jump-tx.ts';", only],
       // 6e-3: the engine's config step holds no owner writer (s.17.3): the owner's commands are app/owner-tx.ts (6e-4)
       ['app/config-tx.ts', "import { writeOwnerConfig } from '../storage/repo-owner.ts'; export function f(): number | null { return writeOwnerConfig(); }", only],
+      // 6e-4: the owner's transactions reach only the owner's command paths
+      ['app/x.ts', "import { setTx } from './owner-tx.ts'; export function f(): void { setTx(); }", `${only} app/owner.ts`],
+      ['app/engine.ts', "import { resumeTx } from './owner-tx.ts'; export function f(): void { resumeTx(); }", `${only} app/owner.ts`],
+      ['app/config-tx.ts', "import { cancelPendingTx } from './owner-tx.ts'; export function f(): void { cancelPendingTx(); }", `${only} app/owner.ts`],
+      ['telegram/x.ts', "import { setTx } from '../app/owner-tx.ts'; export function f(): void { setTx(); }", `${only} app/owner.ts`],
+      ['app/owner.ts', "export { setTx } from './owner-tx.ts';", only], // an allowed importer, but a re-export
+      ['app/owner-tx.ts', "import { clearKill } from '../storage/repo-server.ts'; export function f(): void { clearKill(); }", `${only} cli/`], // never the server's writers
     ]);
     // the typed rule (below) checks that what is imported is only called; these are the import rules alone
     const fine: [string, string][] = [
@@ -2047,6 +2091,10 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['cli/start.ts', "import { startPaperEngine } from '../app/engine.ts'; import { systemRng } from '../core/rng.ts'; export function f(): void { startPaperEngine(systemRng); }"],
       ['cli/confirm.ts', "import { confirmJumpTx } from '../app/jump-tx.ts'; export function f(): void { confirmJumpTx(); }"],
       ['app/x.ts', "import { applyDueTx, readConfigState } from './config-tx.ts'; export function f(): void { readConfigState(); applyDueTx(); }"], // unrestricted: no owner writer in it
+      ['app/owner-tx.ts', "import { writeOwnerConfig } from '../storage/repo-owner.ts'; export function f(): number | null { return writeOwnerConfig(); }"],
+      ['app/owner.ts', "import { setTx } from './owner-tx.ts'; export function onSet(): void { setTx(); }"],
+      ['cli/config.ts', "import { rollbackTx } from '../app/owner-tx.ts'; export function f(): void { rollbackTx(); }"],
+      ['app/x.ts', "import type { OwnerConfigOutcome } from './owner-tx.ts'; export const x = (o: OwnerConfigOutcome): OwnerConfigOutcome => o;"],
       ['app/x.ts', "import { newId } from '../core/rng.ts'; export function f(): string { return newId('token'); }"],
       ['app/faults.ts', "import { RngError } from '../core/rng.ts'; export const isRng = (e: unknown): boolean => e instanceof RngError;"],
       ['execution/x.ts', "import type { Rng } from '../core/rng.ts'; export const x = (r: Rng): string => r.orderId();"],
@@ -2430,6 +2478,9 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       'app/token-store.ts': ["import { redeemApproval } from '../storage/repo-redeem.ts';\nexport const r = redeemApproval;", handed],
       // the key maker handed on to whoever imports this app/ file (6d-1, STORAGE_DESIGN s.16.7.4)
       'app/x.ts': ["import { newApprovalKey } from '../core/rng.ts';\nexport const k = newApprovalKey;", handed],
+      // the owner's transactions handing an owner writer on, and an owner path handing them on (6e-4)
+      'app/owner-tx.ts': ["import { unpause } from '../storage/repo-owner.ts';\nexport const u = unpause;\nexport function setTx(): number { return 1; }", handed],
+      'cli/b13.ts': ["import { setTx } from '../app/owner-tx.ts';\nexport const s = setTx;", handed],
     };
     const { program, srcRoot } = virtualProgram({ ...files, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])) });
     const { problems, restrictedCalls } = sqlProblems(program, srcRoot);
@@ -2561,6 +2612,7 @@ describe('architecture: the approval transactions of step 6d-2 (STORAGE_DESIGN s
     const HEAD = "import type { Db, Tx } from '../storage/sqlite.ts';\nimport { write } from '../storage/repo-ok.ts';\n";
     const tryIn = 'no try inside a transaction callback';
     const handed = 'goes only to a function of storage/, app/ or cli/';
+    const unseen = 'is called inside a transaction callback, where the rule cannot follow it';
     const bad: Record<string, readonly [string, ...string[]]> = {
       'app/c1.ts': [`${HEAD}export const f = (db: Db): number => db.transaction(() => { try { return 1; } catch { return 2; } });`, tryIn],
       'app/c2.ts': [`${HEAD}export const f = (db: Db): number => db.transaction(() => { const g = (): number => { try { return 1; } catch { return 2; } }; return g(); });`, tryIn],
@@ -2582,6 +2634,11 @@ describe('architecture: the approval transactions of step 6d-2 (STORAGE_DESIGN s
       'app/c13-lib.ts': ['export function risky(): number { try { return 1; } catch { return 2; } }', `${tryIn} (followed from app/c13.ts)`],
       'app/c14-lib.ts': ['export function risky(): number { try { return 1; } catch { return 2; } }', `${tryIn} (followed from app/c14.ts)`],
       'app/c15.ts': [`${HEAD}const o = { m(): number { try { return 1; } catch { return 2; } } };\nexport const f = (db: Db): number => db.transaction(() => o.m());`, `${tryIn} (followed from app/c15.ts)`],
+      // 6e-4: a function handed in, or held in a variable, runs code the rule cannot follow
+      'app/c16.ts': [`${HEAD}export const f = (db: Db, plan: () => number): number => db.transaction(() => plan());`, unseen],
+      'app/c17.ts': [`${HEAD}const pick = (): (() => number) => () => { try { return 1; } catch { return 2; } };\nexport const f = (db: Db): number => db.transaction(() => { const g = pick(); return g(); });`, unseen],
+      'app/c18.ts': [`${HEAD}export const f = (db: Db, o: { readonly run: () => number }): number => db.transaction(() => { const { run } = o; return run(); });`, unseen],
+      'app/c19.ts': [`${HEAD}const outer = (plan: () => number): number => plan();\nexport const f = (db: Db): number => db.transaction(() => outer(() => 1));`, `${unseen} (followed from app/c19.ts)`],
     };
     const callers: Record<string, string> = {
       'app/c13.ts': `${HEAD}import { risky as r } from './c13-lib.ts';\nexport const f = (db: Db): number => db.transaction(() => r());`,
@@ -2600,6 +2657,12 @@ describe('architecture: the approval transactions of step 6d-2 (STORAGE_DESIGN s
         'const helper = (tx: Tx, x: string): void => write(tx, x);',
         'export const b = (db: Db): void => db.transaction((tx) => helper(tx, \'y\'));',
         'export const c = (db: Db): string[] => db.transaction(() => [1, 2].map((n) => String(n)));',
+        // an interface method (the clock, the guard) is called, never followed, and never gets the handle
+        'interface Clock { now(): number }',
+        'export const d = (db: Db, clock: Clock): number => db.transaction(() => clock.now());',
+        // a function written in place in a variable is followed
+        'const local = (): number => 1;',
+        'export const e = (db: Db): number => db.transaction(() => local());',
       ].join('\n'),
     };
     const { program, srcRoot } = virtualProgram({ 'storage/sqlite.ts': STUB, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])), ...callers, ...ok });

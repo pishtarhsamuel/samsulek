@@ -273,6 +273,19 @@ can trade, and no key or account exists anywhere.
     are warned). A damaged settings row stops new buys and alerts you; it is never repaired by guessing.
   - In paper nothing ever waits (no strategy is live), so this step does nothing until Phase 8.
   - 35 deliberate bugs were planted, and every one is caught (after one missing test was added).
+- Part 6e-4 is built (tests first), NOT YET REVIEWED, on the same branch. Step 6e is now complete:
+  - Your setting commands are saved as all-or-nothing steps: /set, /rollback (one step back each time)
+    and /cancel (drop a change that is still waiting). A bad name or value changes nothing. In paper a
+    change applies at once; once anything is live, a riskier risk or exit change waits 24 hours.
+  - The paper model can only become more cautious, whatever the command.
+  - /resume restarts buying after the -50% halt only right after a money check (at most one minute
+    old) that valued everything, and never while a "+50% jump" is unconfirmed. After two stop days in a
+    row it needs no such check.
+  - These commands work even while buying is blocked, and only your Telegram (after the owner check)
+    and the server will be able to call them. Nothing calls them yet (Telegram comes in Phase 3).
+  - 42 deliberate bugs were planted, and every one is caught (after one missing test was added).
+    Building it also found a blind spot in one of the automatic code checks (it could not see code
+    handed into a database step as a function); the check is now stricter, and nothing else tripped it.
 - For you to know: in paper, the "free SOL" limit can never be the one that stops a buy, because the
   50% exposure limit always stops it first. That is fine, and the reason is written down for the
   reviewers.
@@ -281,14 +294,13 @@ can trade, and no key or account exists anywhere.
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
 - Next: the reviewers' re-check of 6d-1 and their reviews of 6d-2, 6d-3 and 6e (from Nov 23, 18:30
-  Athens time); the last part of 6e (6e-4: your setting commands and /resume); then chain clients, the
-  paper engine, Telegram and logging.
+  Athens time), which now covers all of 6e; then chain clients, the paper engine, Telegram and logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
-- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 64% (settings,
+- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 66% (settings,
   accounting, risk engine, the storage files, the approval transactions, the start-up checks, the
-  daily money check and the bot's settings step done, the last five parts awaiting review; 6e-4 next);
-  the whole build about 30-32%. Proving an edge on paper takes weeks on top of that.
+  daily money check, the bot's settings step and your setting commands done, the last six parts
+  awaiting review); the whole build about 31-33%. Proving an edge on paper takes weeks on top of that.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.

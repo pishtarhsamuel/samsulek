@@ -453,6 +453,48 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    - The import rule: app/config-tx.ts cannot import repo-owner.ts (a canary); app/ may import it.
    - Planted bugs: 35, every one caught after one missing test (a paper strategy) was added.
 
+   Done in step 6e-4 (the owner's commands, STORAGE_DESIGN s.17.15; UNREVIEWED, D11):
+   - `setTx`: in paper a value applies at once (safer or riskier; a lamport value kept whole; from
+     Telegram or the server), as the next version by the owner, undoing to the active one, with the
+     owner's row and the anchor; a strategy's own value restarts its count, an exit value and the paper
+     model every count; nine refusals (unknown name, a mode, not a number in three forms, out of bounds
+     either side, no change, a paper model less pessimistic) write nothing; while a strategy is live a
+     riskier risk value waits a day and a safer one then applies and replaces it; a /set to the current
+     value cancels its waiting row; a live strategy's own value demotes it, the engine's row after the
+     owner's; a clock behind the active version or a waiting row runs the command at that time and warns,
+     and dates a demotion and a gate restart as the command, not the clock;
+     a stored version that does not decode is `error:config` at the owner site; an actor that is not the
+     owner is a TypeError for all four commands.
+   - `rollbackTx`: nothing to roll back at the setup; one step back (author rollback, the earlier undo
+     target); two steps along the undo chain, then nothing left; a paper-model-only rollback refused;
+     with a strategy live, a rollback whose fields all wait makes only waiting rows.
+   - `cancelPendingTx`: the row deleted with the owner's cancel row; an unknown name and nothing waiting
+     refused; a row the engine applied first is gone.
+   - `resumeTx`: the peak refused, writing nothing and never as a bug, when not halted, with a held jump,
+     no known equity, no money check, one 60,001 ms old, or a newest one that could not value everything;
+     resumed at 60,000 ms exactly as `resumePeak` computes, with the clear time, the owner's row and the
+     anchor; the streak resumed as `resumeStreak` computes without a money check, the live halt left; a
+     halt that storage then cannot find is `error:bad-request`; a wrong kind is a TypeError;
+     `RESUME_FRESH_MS` is 60,000.
+   - The race: the due step and /cancel on one due row, both orders: the inner one is busy and writes
+     nothing; afterwards it finds no row.
+   - Fault injection: every statement of the richest /set, /rollback, /cancel and /resume failed in each
+     of full, io, constraint, bad-param and busy: the database as before (plus only the disk-db halt for
+     full and io), no anchor moved, the latch and the alerts as s.17.5.6 says.
+   - The command-sequence property (200 runs of up to 30 steps, two fixed sequences first): random /set,
+     /rollback, /cancel, due steps, clock moves both ways and strategies set live, against the planners
+     on a model at the same command time: outcomes, history, waiting rows, modes and gates equal after
+     every step; storage never refuses a planner's plan; the owner's row comes first. The day-sequence
+     property now resumes through `resumeTx`.
+   - The import rules: app/owner-tx.ts only from app/owner.ts and cli/ (six canaries, three allowed
+     imports, two "handed on" canaries); nothing in src/ imports it at runtime yet (a scan of the real
+     files, which sees app/owner-tx.ts's own import of app/config-tx.ts).
+   - The no-catch rule's new clause (C32): a function parameter, a variable holding a returned function,
+     a destructured method and a parameter called in a followed helper are each flagged inside a
+     transaction; an interface method and a function written in place in a variable are not.
+   - Planted bugs: 42 on the final code, every one caught; the first draft's run found one missing test
+     (a demotion with the clock behind), added.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

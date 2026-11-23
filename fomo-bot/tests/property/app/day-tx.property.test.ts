@@ -1,7 +1,8 @@
 // The day-sequence property of step 6e-1 (STORAGE_DESIGN.md s.17.8): random steps (the clock forward
 // from 1 ms to 26 hours and back from 1 ms to 2 days, across both time-change nights; the one position's
 // mark set to zero, small, large, above 2 SOL; the mark left to go stale past 30 s and 5 minutes; the
-// paper SOL set to zero or low; an untrusted clock; the owner's resumes) run through observeDayTx on
+// paper SOL set to zero or low; an untrusted clock; the owner's resumes, through resumeTx since 6e-4,
+// with its refusals modelled by the same rules) run through observeDayTx on
 // SQLite and, beside it, through the pure functions on a model: the same valuation, the base from the
 // model's own snapshots by the same rule, observeEquity, the halts of the halting trips, the low-equity
 // stop. After every step the stored day state, halts, stop flag and snapshots equal the model's; the
@@ -20,8 +21,7 @@ import { readAuditRow, verifyAuditChain } from '../../../src/storage/repo-audit.
 import { readAccount, readActivePositions } from '../../../src/storage/repo-book.ts';
 import { readDayState } from '../../../src/storage/repo-day.ts';
 import { readFlags, readHalts } from '../../../src/storage/repo-flags.ts';
-import { resumeHalt } from '../../../src/storage/repo-owner.ts';
-import { StorageError } from '../../../src/storage/sqlite.ts';
+import { RESUME_FRESH_MS, resumeTx } from '../../../src/app/owner-tx.ts';
 import { dayPolicyOf } from '../../../src/app/caps.ts';
 import { DAY, HOUR, dayWorld, holding, mark, setPaperSol, type DayWorld } from '../../unit/app/day-world.ts';
 import { T } from '../../unit/app/world.ts';
@@ -187,17 +187,33 @@ describe('observeDayTx against the pure functions on random day sequences (s.17.
             } else if (s.kind === 'trust') {
               w.guard.trusted = s.trusted;
             } else if (s.kind === 'resume') {
+              // through the owner's transaction (6e-4), its refusals by the same rules on the model's own rows
+              const now = w.clock.now();
               const reason = s.which === 'peak' ? 'peak-halt:paper' : 'daily-stop-twice:paper';
-              try {
-                const lifted = w.db.transaction((tx) => resumeHalt(tx, w.clock.now(), 'owner-telegram', s.which));
-                if (lifted) {
-                  m.halts.delete(reason);
-                  m.state = s.which === 'peak' ? resumePeak(m.state) : resumeStreak(m.state);
-                  seenKinds.add(`resume ${s.which}`);
+              const newest = m.snaps.filter((x) => x.at <= now).sort((a, b) => b.at - a.at)[0];
+              const refusal = !m.halts.has(reason)
+                ? 'not-halted'
+                : s.which === 'streak'
+                  ? null
+                  : m.state.jumpPending
+                    ? 'jump-held'
+                    : m.state.lastEquity < 1n
+                      ? 'equity-unknown'
+                      : newest === undefined || newest.equity === null || now - newest.at > RESUME_FRESH_MS
+                        ? 'observe-first'
+                        : null;
+              const o = resumeTx(w.deps, 'owner-telegram', s.which);
+              if (refusal === null) {
+                assert.deepEqual(o, { kind: 'resumed', which: s.which, at: now });
+                m.halts.delete(reason);
+                m.state = s.which === 'peak' ? resumePeak(m.state) : resumeStreak(m.state);
+                seenKinds.add(`resume ${s.which}`);
+              } else {
+                assert.deepEqual(o, { kind: 'refused', reason: refusal });
+                if (refusal === 'jump-held' || refusal === 'equity-unknown') {
+                  assert.throws(() => resumePeak(m.state), RiskError); // the pure function refuses the same states
                 }
-              } catch (e) {
-                assert.ok(e instanceof StorageError && e.code === 'row-count', String(e));
-                assert.throws(() => resumePeak(m.state), RiskError);
+                seenKinds.add(`resume refused ${refusal}`);
               }
             } else {
               const o = observeDayTx(w.deps);

@@ -248,9 +248,10 @@ function readExit(req: ExitRequest): ExitRequest {
  * After the engine wrote an audit row (a KILL or a halt), the anchor moves to the newest row (16.5.4,
  * C36), from a check of the whole chain. A failure only alerts: an anchor that is behind still passes
  * the next boot's check (the chain may grow past it), so a missed write only weakens the tripwire.
- * Exported for app/day-tx.ts (6e), which writes halt rows inside its own observation.
+ * Exported for the 6e transactions, which write audit rows inside their own steps; it takes only what it
+ * uses, so the owner's commands (which read no slot) can call it too.
  */
-export function anchorAfter(deps: StoreDeps): void {
+export function anchorAfter(deps: Pick<StoreDeps, 'db' | 'latch' | 'alerts' | 'anchors'>): void {
   try {
     const chain = verifyAuditChain(deps.db);
     // after a write newestAt is a time; the anchor store refuses anything else
