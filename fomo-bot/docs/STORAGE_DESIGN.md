@@ -4363,6 +4363,9 @@ Conditions from review U, for later steps:
 - Exit loop (risk 1): the backoff per position never re-asks an exit whose refusal is permanent
   (`auto-exits-stopped`, a spent budget), and keeps a minimum interval between asks for one position;
   both tested.
+- Phase 3 (risk re-check of the fix): when the owner's /sell and /panic arrive, the early stop for a
+  spent fee budget applies to automatic exits only (today `readExit` accepts only automatic ones), with
+  a test that the owner's sale of a position with a spent budget still runs.
 - Engine loop (risk 2): the request's market facts (pool reserves, `poolMinTrade`, `quotedOut`,
   `rentRequired`, `attemptsAllowed`, `simulatedCu`, the p95 exit cost) come from the engine's own venue
   read at the quote slot, never from the plan's author; tested with a plan and a market made by
@@ -4374,4 +4377,8 @@ Conditions from review U, for later steps:
 - Follow-ups, not blocking: the invariant-2 property also checks the percentage caps on the stored
   rows (risk 3, `buyLimitViolations` of s.16.9); the repo-orders writers restricted to
   app/approve-tx.ts (security 2); a refusal whose own mint or id trips the secret filter recorded under
-  a fixed placeholder instead of latching entries (security 4).
+  a fixed placeholder instead of latching entries (security 4); from the security re-check, an
+  optional tripwire for the LIMIT: inside a transaction callback, refuse an `as` or `satisfies` whose
+  operand can be called or holds a handle (a closure passed `as unknown` is not seen today).
+
+Both reviewers re-checked the fixes (commit 9265c37) and confirmed them (REVIEWS.md U).
