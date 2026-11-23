@@ -344,6 +344,53 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    - Two buy tokens for one position are refused by `buyTokenExpiry`.
    - Planted bugs for these fixes: 10, all caught.
 
+   Done in step 6d-3 (the boot and the engine start, STORAGE_DESIGN s.16.16; built unreviewed under owner
+   decision D10, reviewed 2026-11-23 (REVIEWS.md V), both approved with notes):
+   - The run files: the KILL file reads present for any error but "no such file"; the anchor is
+     written 0600 through a temp file and a rename (a leftover 0666 temp made 0600), read back strictly
+     (extra keys, an id of 0 or a fraction, an upper-case hash, a time out of range, bad JSON, an
+     unreadable file: each throws), and null with no file; the probe's link count, links, file-system
+     type and missing paths.
+   - The audit reader: one row as stored, frozen, null past the newest, bad ids refused; `newestAt` is
+     the newest row's time. KILL and halts move the anchor, from a check of the whole chain; a failed
+     anchor write only warns.
+   - The boot, every refusal on its own (18 codes; each alerts with its code and leaves no handle on
+     the file): built-ins that can be changed (a child without the flag); no run lock; the path (a
+     relative folder; a file name that is a path, a dot name, a trailing dot, a Windows device name;
+     one folder for two names; a missing folder; a link on the way, a linked database or run folder; a
+     hard link on the database or its -wal; a database or run folder of another user; a chmod that
+     fails; no uid; NFS, FUSE or no type, also mounted on the run folder or the database); open (a
+     missing or foreign file); health (a foreign key); migrations (a changed migration); required rows
+     (no accounts; the flags row, a strategy mode or a day-state row gone); config; the audit chain (an
+     edited row, an empty log); the anchor (past the newest row, another hash, a malformed file); the
+     KILL and halt links (another row, another source or reason); the book (a stuck row);
+     conservation (paper and live); the paper account (a withdrawal, no deposit, above 2 SOL; exactly
+     2 SOL passes); the live account (money, or a live position with no money); the abandon and the
+     KILL file write at a clock past 2200. Also: a bot file that was never migrated (migrations); an
+     engine audit row with the KILL's or a halt's detail but another action (the links); the boot's
+     own chmod calls, a stray -wal included.
+   - The healthy start: the report, the first-start warning, the anchor written and named in the boot
+     alert, folders 0700 and files 0600, a second start with no warning; KILL stored or the KILL file
+     (stored as the sentinel's, the anchor on its row); halts listed; stale openings both ways (no
+     order: abandoned at max(now, opened_at); an order: counted, with a warning); a buy token an old
+     process still holds is refused once its position is closed; a clock behind the newest row only
+     warns, even at the largest time; a failing anchor write warns; a throwing alert sink latches.
+   - Windows through a fake probe: under the profile passes (a name starting with two dots too); UNC
+     in three forms, a profile redirected to a network share (both slashes), another drive, a profile
+     next door, OneDrive by root or by name in any case, no profile, a hard link, a junction, and two
+     names for one folder where case does not count: each refused.
+   - The engine: one paper authority (one key, wiped), exactly the deps, frozen, one feed shared, the
+     anchor file in the run folder, ids from the Rng; a buy approved and redeemed end to end; the boot's
+     latch (KILL stored); the KILL file in the run folder stops buys; a busy storm and a disk-full
+     fault store the disk-db halt and move the anchor; onFatal once; the K gate against its redeemer
+     (extra arguments, an expired token, another engine's token); a refused boot comes through with no
+     key drawn; 14 bad inputs refused before the boot touches anything; a throw after the boot closes
+     the database and alerts, and a throwing sink does not hide it; `assertPaperAuthority`'s refusals.
+   - C18: the chmod failure for real (a uid 65534 child, a root-owned 0666 file; root on POSIX only).
+   - Planted bugs: 123 in two runs; 114 caught, 9 equivalent (another check does the same job, each
+     reason written down). The first run showed four weak tests and one missing check (a live
+     position), all fixed, and one freeze that did nothing (removed).
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

@@ -218,6 +218,32 @@ can trade, and no key or account exists anywhere.
     fee budget is spent) no longer uses up the position's sell numbers, so it can always still be sold
     later; and the check that no code inside a database step can swallow an error now also catches
     three sneakier ways of handing that step on. Their other notes are conditions for later parts.
+- Part 6d-3 is built (tests first) and REVIEWED: both reviewers approved it with notes on Nov 23,
+  and it joined the main work. Their notes are small fixes for the start command, which comes
+  later (refuse a second start in one process, check the folders above the data folder, refuse
+  untested systems, and a few more). It holds the start-up checks and the engine's start:
+  - Before it does anything, the bot checks its data folder: on this computer (not a network share or
+    OneDrive), private to the bot's own user, with no shortcut or second name for the database. Then the
+    database's health and layout, every record it needs, its safety log, that KILL and every halt point
+    at their own log entries, and that both books add up (paper has its one deposit; live holds nothing,
+    not even a position). Any failure: it refuses to start and alerts you with a short code.
+  - After each start, KILL and halt, the bot writes a small bookmark of its safety log. If the log is
+    ever shorter than the bookmark, or the database is an older copy, it refuses to start.
+  - A buy that was approved but never sent before a crash is cancelled at the next start; one that was
+    sent stays counted until its result is known.
+  - The engine makes exactly one approval key per run, and the part that sends orders gets only "use
+    an approval", never "make one". Nothing can start the bot yet: the start command comes with the
+    server setup.
+  - 1,223 tests pass. 123 deliberate bugs were planted; the tests catch 114, and the other 9 change
+    nothing because another check already does their job (each reason is written down). The first run
+    found four weak tests and one missing check (a live position with an empty live account would have
+    passed the start); all fixed.
+  - At start-up the bot cancels a stale buy without knowing the chain's clock; both reviewers
+    accepted that: the old run's approvals died with it, and a test shows the database refuses
+    such an approval even if the old run were somehow still alive.
+  - The Windows-only checks (shortcuts called junctions, OneDrive, network paths) are tested with a
+    stand-in for Windows; a real run on your PC comes with the setup guide. If a guess is wrong, the bot
+    refuses to start rather than running somewhere unsafe.
 - For you to know: in paper, the "free SOL" limit can never be the one that stops a buy, because the
   50% exposure limit always stops it first. That is fine, and the reason is written down for the
   reviewers.
@@ -225,15 +251,15 @@ can trade, and no key or account exists anywhere.
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: the reviews of 6d-3 (the start-up checks) and 6e (the settings and day-state transactions),
-  both already built on the separate branch; then chain clients, the paper engine, Telegram and
+- Next: the review of 6e (the settings and day-state transactions), built on the separate branch;
+  then chain clients, the paper engine, Telegram and
   logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
-- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 55% (settings,
-  accounting, risk engine, the storage files and the approval transactions done, the last two parts
-  awaiting review; the start-up checks next); the whole build about 26-30%. Proving an edge on paper
-  takes weeks on top of that.
+- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 60% (settings,
+  accounting, risk engine, the storage files, the approval transactions and the start-up checks done,
+  the last three parts awaiting review; 6e next); the whole build about 28-31%. Proving an edge on
+  paper takes weeks on top of that.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.

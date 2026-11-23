@@ -25,6 +25,7 @@ import type { BreakerState } from '../risk/blocks.ts';
 import { canonicalPlan, type OrderPlan, type PlanUrgency } from '../risk/plan.ts';
 import type { ApprovedPool, CheckedPlan, PlanContext, PlanProblem, QuoteContext } from '../risk/recheck.ts';
 import { BASE_FEE_PER_SIGNATURE } from '../risk/reserve.ts';
+import { verifyAuditChain } from '../storage/repo-audit.ts';
 import { abandonOpening, insertOpening, readPosition, type StoredPosition } from '../storage/repo-book.ts';
 import { countEntry, setHalt, setKill } from '../storage/repo-flags.ts';
 import {
@@ -42,6 +43,7 @@ import {
 import type { Db } from '../storage/sqlite.ts';
 import { FAILED_FEE_BUDGET, exitPlanCapsOf } from './caps.ts';
 import type { ExitWatch } from './exit-watch.ts';
+import type { AnchorStore } from './run-files.ts';
 import { AppError, classify, isSecretRefusal, type Alert, type AlertSink, type EntryLatch, type FaultScope, type FaultSink, type KillSentinel, type LatchReason } from './faults.ts';
 import type { Clock } from './slots.ts';
 import { readActiveConfig, readBuySnapshot } from './snapshot.ts';
@@ -82,10 +84,12 @@ export interface EngineDeps {
   readonly faults: FaultSink;
   readonly alerts: AlertSink;
   readonly exitWatch: ExitWatch;
+  /** The audit anchor (app/run-files.ts), written after each KILL and halt the engine sets. */
+  readonly anchors: AnchorStore;
 }
 
 /** What the small writes need: the boot (6d-3) calls them before the issuer exists. */
-export type StoreDeps = Pick<EngineDeps, 'db' | 'clock' | 'slots' | 'latch' | 'faults' | 'alerts'>;
+export type StoreDeps = Pick<EngineDeps, 'db' | 'clock' | 'slots' | 'latch' | 'faults' | 'alerts' | 'anchors'>;
 
 /** What a strategy asks for (Phase 4 makes it); app derives the intent id and fills the identity. */
 export interface EntryRequest {
@@ -245,13 +249,32 @@ function readExit(req: ExitRequest): ExitRequest {
 // ---------------------------------------------------------------- the small writes
 
 /**
+ * After the engine wrote an audit row (a KILL or a halt), the anchor moves to the newest row (16.5.4,
+ * C36), from a check of the whole chain. A failure only alerts: an anchor that is behind still passes
+ * the next boot's check (the chain may grow past it), so a missed write only weakens the tripwire.
+ */
+function anchorAfter(deps: StoreDeps): void {
+  try {
+    const chain = verifyAuditChain(deps.db);
+    // after a write newestAt is a time; the anchor store refuses anything else
+    deps.anchors.write({ id: chain.newestId, hash: chain.newestHash, at: chain.newestAt as number });
+  } catch {
+    alertSafely(deps.alerts, deps.latch, { code: 'anchor-write-failed', severity: 'warn' });
+  }
+}
+
+/**
  * KILL stored with its engine audit row (repo-flags.ts setKill). KILL is marked seen first, whatever
  * the write does; a failed write latches entries and alerts outside the database (C25).
  */
 export function persistKillTx(deps: StoreDeps, source: 'sentinel' | 'cli'): 'set' | 'already' | 'failed' {
   deps.latch.markKill();
   try {
-    return deps.db.transaction((tx) => setKill(tx, deps.clock.now(), source)) ? 'set' : 'already';
+    const set = deps.db.transaction((tx) => setKill(tx, deps.clock.now(), source));
+    if (set) {
+      anchorAfter(deps);
+    }
+    return set ? 'set' : 'already';
   } catch (e) {
     deps.faults.report('kill', classify(e));
     deps.latch.set('kill-write-failed');
@@ -267,7 +290,11 @@ export function persistKillTx(deps: StoreDeps, source: 'sentinel' | 'cli'): 'set
  */
 export function persistHaltTx(deps: StoreDeps, reason: string): 'set' | 'already' | 'failed' {
   try {
-    return deps.db.transaction((tx) => setHalt(tx, reason, deps.clock.now())) ? 'set' : 'already';
+    const set = deps.db.transaction((tx) => setHalt(tx, reason, deps.clock.now()));
+    if (set) {
+      anchorAfter(deps);
+    }
+    return set ? 'set' : 'already';
   } catch (e) {
     deps.latch.set('halt-write-failed');
     alertSafely(deps.alerts, deps.latch, { code: 'halt-write-failed', severity: 'fatal', codes: [classify(e).code] });

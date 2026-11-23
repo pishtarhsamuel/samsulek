@@ -4342,7 +4342,8 @@ Written down, for the reviewers:
 
 Conditions for 6d-3 from this step:
 - `startPaperEngine` wires the fault sink's `onDiskTrouble` to `persistHaltTx(storeDeps, 'disk-db')` and
-  checks the deps it builds; the boot abandons stale openings only with a known slot past their expiry.
+  checks the deps it builds; the boot abandons stale openings only with a known slot past their expiry
+  (as built, the boot abandons without a slot, for the reasons in 16.16, flagged for the reviewers).
 - The anchor file is written after each KILL and halt (16.5.4).
 
 Tests: TEST_PLAN.md s.3, "Done in step 6d-2". Planted bugs (scratchpad `mut/run29.py` and
@@ -4393,3 +4394,119 @@ Conditions from review U, for later steps:
   operand can be called or holds a handle (a closure passed `as unknown` is not seen today).
 
 Both reviewers re-checked the fixes (commit 9265c37) and confirmed them (REVIEWS.md U).
+
+### 16.16 As built in step 6d-3 (the boot and the engine start), and what changed from the design
+
+Status: UNREVIEWED (owner decision D10). Built after 6d-2 on the same branch,
+`claude/exciting-hamilton-2d7lto-6d2-unreviewed`; it joins the working branch only after both
+reviewers have confirmed 6d-1 and approved 6d-2 and this step.
+
+Built, tests first: `app/run-files.ts` (the KILL file, the audit anchor and the real file-system
+probe), `app/storage-boot.ts` (`bootStorage`, `checkDataPath`), `app/engine.ts` (`startPaperEngine`,
+`assertPaperAuthority`), `storage/repo-audit.ts` (`readAuditRow`, and the chain check's `newestAt`),
+and the anchor write after each KILL and halt in `app/approve-tx.ts` (`StoreDeps` and `EngineDeps` gain
+`anchors`). Nothing in risk/, portfolio/, config/, core/ or migration 1 changed. No cli/ file starts the
+engine: the start command waits for the run lock (security on D11).
+
+Differences from 16.3 to 16.6 (the main session's decisions; the reviewers challenge these too):
+- **The boot abandons stale openings without a slot**, against the letter of 16.15 ("6d-3's boot must
+  therefore abandon only with a known slot", from review T's security 3, which was written for
+  `abandonOpeningTx`). At boot no slot exists (the feed starts after the boot), and the rule's reason
+  does not apply: security 3 keeps a still-valid token of this process from latching every entry as a
+  bug, and at boot this process holds no token. The old process's tokens carry MACs of a key that
+  died with it, and the run lock keeps it out. If the lock failed and the old process still ran, its
+  token would meet the closed position in T2 (the position check, then the trigger
+  `approvals_consumed_while_active`) and be refused, with no order: a test pins it ("a buy token an old
+  process still holds"). The boot abandons in its own transaction (`readPosition`, `buyOrderOf`,
+  `abandonOpening` at max(now, openedAt)); `abandonOpeningTx` keeps its slot rule for the running
+  engine. The alternative, if the reviewers want the slot rule at boot too: leave stale openings
+  counted at boot (fail closed) and let the engine abandon them with `abandonOpeningTx` once the feed
+  knows the slot. The cost is a mint blocked and its held-back spend counted until then.
+- The anchor's `at` is the newest row's own time, not the boot's clock (16.6 step 11 said now):
+  `AuditAnchor.at` says so, and the anchor after a KILL or halt uses the same.
+- The path checks are stricter than 16.6 step 1: the three names must differ (also where case does not
+  count), must not be a Windows device name (`CON`, `NUL`, `COM1`, `LPT1`, with any extension) and must
+  not end in a dot (Windows drops it); the file-system type is checked for each folder and for the
+  database, its `-wal` and its `-shm` (a share mounted inside the data folder is not a link), not only
+  for the data folder; a folder the probe reports as a link is refused even if it also says folder;
+  "under the profile" is a path relation, not a text prefix (`C:\Users\Owner2` is not under
+  `C:\Users\Owner`; a name starting with two dots is).
+- An empty audit log refuses (`audit-chain`): the owner's setup writes the first rows, and an anchor
+  needs an id of at least 1.
+- Step 5 also reads the halts (step 7 links them); the clock check of step 6 runs inside the anchor
+  step.
+- The boot's `StoreDeps` exist only for the KILL file's write (`persistKillTx`): a slot source that
+  answers null (the KILL write never reads it) and a fault sink whose fatal and disk hooks do nothing,
+  because a failure there refuses the start anyway.
+- An alert sink that throws latches entries as a bug (as `alertSafely` does); the start goes on, and a
+  refusal still throws its `BootError`.
+- The engine checks its inputs and makes the slot feed before the boot touches anything: a bad input
+  is a TypeError with no file touched, no key drawn and no alert. C7's frozen check is the boot's step
+  0, the first step that touches anything; the checks before it are pure.
+- `assertPaperAuthority` (C64) is exported so its refusals are tested on their own:
+  `createEngineAuthority` writes the mode as a literal, so in the engine it cannot fail.
+- A throw after the boot closes the database and alerts `engine-start-failed` (fatal); a throwing sink
+  does not hide the error.
+- The redeemer handed out is risk's own `{ mode, redeem }`: no verifier and no issuer (C65).
+- C18 is a real test (tests/unit/storage/sqlite-chmod.test.ts): a child as uid 65534 opening a
+  root-owned 0666 database gets StorageError `io` (EPERM). It runs as root on POSIX only.
+- `readAuditRow` returns the detail `jsonCell` already froze, deeply; the second freeze is dropped (a
+  planted bug showed it changed nothing).
+
+The scratch runs (VERIFIED_FACTS, 2026-11-20): V1 (statfs gives the kernel's numbers; ext4 and tmpfs
+seen, the rest from linux/magic.h), V2 (now the C18 test), V5 (a rename over an existing file, 0600 kept;
+Linux). V4, and V5 on Windows: UNVERIFIED, for the owner. A wrong guess about Windows refuses the start;
+it cannot let a bad folder through.
+
+Written down, for the reviewers:
+- LIMIT: the path checks and the open are not one atomic step. Someone who can write the 0700 data
+  folder (the bot's user, or root) could swap a file between them; the folder's owner and mode are the
+  defense.
+- LIMIT: Windows permissions (ACLs) are not checked or set (no chmod on win32); the profile folder's
+  default ACL is the defense (V4).
+- The run lock is still only a token (D11), and nothing in cli/ starts the engine.
+- The anchor stays a tripwire (D10): deleting its file passes as a first start, with a warning alert.
+- s.16.11 Q1 (refuse to start on a shorter log) is built with the recommended answer; the owner has not
+  confirmed it yet.
+
+Conditions for later steps from this one:
+- The cli/ start command (the ops step): the run lock (V9), the process flags of C7, `systemRng`, the
+  boot's options from the server config, and V4 and V5 on Windows.
+- The engine loop: the slot reported before T1 exit (C4), the health loop's alert on an unknown slot
+  (C63), the run loop's exit on `onFatal`, and T3 settling an opening that has an order (C67).
+
+Review V (REVIEWS.md V, 2026-11-23): both reviewers APPROVED WITH NOTES, and both accept the boot's
+abandon without a slot (atomic with the buy-order check; an old process's token is refused by T2). Their
+findings are conditions for the cli/ start command (the ops step), each with a test:
+- `startPaperEngine` refuses a second start in one process (both reviewers: two authorities and two
+  latches otherwise), released by `close()`.
+- The data folder's parent folders are checked like OpenSSH's StrictModes: each owned by root or the
+  bot's user, and writable by group or others only with the sticky bit (security 1; its probe booted
+  under a 0777 parent without the sticky bit).
+- Platforms other than linux and win32 are refused until verified (security 2: they skip the
+  file-system check).
+- The boot refuses a strategy stored in live mode, as it refuses live money and live positions (risk 2).
+- The start message and alerts carry only the BootError's code, never its message or cause (security 5).
+- The anchor: a rolled-back database plus a deleted anchor clears a stored KILL with only the
+  `no-audit-anchor` warning (D10); keep a second anchor outside the data folder, or alert it loudly and
+  show the audit id in the start message so the owner sees it drop (security 4).
+- Windows: synced folders other than OneDrive (Dropbox, Google Drive, iCloudDrive) are refused too or
+  the owner is told; ACLs stay unchecked until V4 runs (security 6). The anchor's temp file is
+  unlinked first and written with `wx` (security 7, optional).
+- C18 is recorded as run, not skipped: it skips itself where uid 65534 cannot read the checkout, so it
+  runs in the main checkout or CI (both reviewers).
+
+Tests: TEST_PLAN.md s.3, "Done in step 6d-3". Planted bugs (scratchpad `mut/run31.py` and
+`mut/run32.py`): 122 in the first run, 107 caught and 5 marked equivalent before it ran. Of the other
+ten, five showed four weak tests (a data folder on a network share under a redirected profile, in both
+slash forms; the boot's own chmod calls, hidden behind openDb's chmod of the main file; a bot file that
+was never migrated; an engine audit row with the KILL's or a halt's detail but another action), one
+showed a second freeze that did nothing (removed), and four are equivalent. Looking into the live
+account's survivors showed a missing check: a live position with an all-zero live account passed the
+boot; it is refused now. The follow-up run of 22 caught every gap. 123 planted in all: 114 caught and 9
+equivalent, each with its reason in the script: a relative folder fails the realpath comparison; with no
+uid the owner check refuses; an anchor past the newest row fails when its hash is read; the schema's
+CHECK lets only the engine write `engine:` actions; with conservation and the position check, the live
+SOL, deposit and withdrawal checks each follow from the others; a null boot option throws a TypeError
+anyway; the authority's mode is a literal. Coverage: every line of the new files, and every branch but
+the non-Linux side of the probe's `fsType` (run-files.ts), which only runs off Linux.

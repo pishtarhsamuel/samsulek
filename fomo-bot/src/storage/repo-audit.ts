@@ -28,6 +28,39 @@ export interface ChainCheck {
   readonly rows: number;
   readonly newestId: number;
   readonly newestHash: string;
+  /** When the newest row was written; null before the first (the boot compares the clock with it). */
+  readonly newestAt: number | null;
+}
+
+/** One audit row as stored (the boot checks the anchor and the KILL and halt links with it). */
+export interface AuditRow {
+  readonly id: number;
+  readonly at: number;
+  readonly actor: (typeof ACTORS)[number];
+  readonly action: string;
+  readonly detail: unknown;
+  readonly hash: string;
+}
+
+const ONE_ROW = 'SELECT id, at, actor, action, detail_json, hash FROM audit_log WHERE id = ?';
+
+/** The row with this id, or null when the log has none (step 6d-3, the boot). */
+export function readAuditRow(r: Reader, id: number): AuditRow | null {
+  if (!Number.isSafeInteger(id) || id < 1 || id > MAX_AUDIT_ID) {
+    throw new StorageError('bad-param', `expected an audit id from 1 to ${MAX_AUDIT_ID}`);
+  }
+  const row = r.get(ONE_ROW, BigInt(id));
+  if (row === undefined) {
+    return null;
+  }
+  return Object.freeze({
+    id: intCell(row, 'id', 1, MAX_AUDIT_ID),
+    at: msCell(row, 'at'),
+    actor: cellOneOf(row, 'actor', ACTORS),
+    action: codeCell(row, 'action'),
+    detail: jsonCell(row, 'detail_json'), // frozen all the way down by jsonCell, so a reader cannot change it
+    hash: hex64Cell(row, 'hash'),
+  });
 }
 
 const broken = (detail: string): StorageError => new StorageError('audit-broken', detail);
@@ -41,6 +74,7 @@ export function verifyAuditChain(r: Reader): ChainCheck {
   const rows = r.all(ALL_ROWS);
   let prev = AUDIT_GENESIS;
   let last = 0;
+  let lastAt: number | null = null;
   for (const row of rows) {
     const id = intCell(row, 'id', 1, MAX_AUDIT_ID);
     if (id !== last + 1) {
@@ -60,6 +94,7 @@ export function verifyAuditChain(r: Reader): ChainCheck {
     }
     prev = hash;
     last = id;
+    lastAt = at;
   }
-  return Object.freeze({ rows: rows.length, newestId: last, newestHash: prev });
+  return Object.freeze({ rows: rows.length, newestId: last, newestHash: prev, newestAt: lastAt });
 }
