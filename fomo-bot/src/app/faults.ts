@@ -7,6 +7,7 @@
 // anywhere. The fault sink applies a fault: the latch, the alerts (outside the database), the
 // disk-db halt on a full disk, an I/O error or a busy storm (three busy refusals in ten minutes),
 // and onFatal once. classify and the sink never throw.
+import { ConfigError } from '../config/tunables.ts';
 import { AmountError } from '../core/units.ts';
 import { RngError } from '../core/rng.ts';
 import { LedgerError } from '../portfolio/ledger.ts';
@@ -56,8 +57,8 @@ export interface Fault {
   readonly disk: boolean;
 }
 
-/** Where the fault happened (an alert names it). t2 is a buy token's use, t2-exit an exit token's. */
-export type FaultSite = 't1-buy' | 't1-exit' | 't2' | 't2-exit' | 'abandon' | 'refusal' | 'kill' | 'halt' | 'boot';
+/** Where the fault happened (an alert names it). t2 is a buy token's use, t2-exit an exit token's; day is the equity observation (6e). */
+export type FaultSite = 't1-buy' | 't1-exit' | 't2' | 't2-exit' | 'abandon' | 'refusal' | 'kill' | 'halt' | 'boot' | 'day';
 /** A fault here stopped a sale: it always alerts (review T, risk 4). */
 const EXIT_SITES: ReadonlySet<FaultSite> = new Set<FaultSite>(['t1-exit', 't2-exit']);
 
@@ -211,6 +212,10 @@ function classifyKnown(e: unknown): Fault {
   }
   if (e instanceof LedgerError) {
     return fault('error:ledger', 'intent');
+  }
+  if (e instanceof ConfigError) {
+    // a stored config that does not decode cannot be trusted for any intent (6e names it)
+    return fault('error:config', 'latch', { bug: true });
   }
   if (e instanceof RngError) {
     const code = ownValue(e, 'code');

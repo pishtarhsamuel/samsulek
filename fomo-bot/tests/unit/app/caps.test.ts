@@ -15,12 +15,15 @@ import {
   buyCapsOf,
   dayPolicyOf,
   exitPlanCapsOf,
+  lowEquityStopOf,
 } from '../../../src/app/caps.ts';
 import { AppError } from '../../../src/app/faults.ts';
 import { HARD_CAPS } from '../../../src/config/caps.ts';
 import { DEFAULT_TUNABLES, TUNABLE_PATHS, boundsOf, withValue, type Tunables } from '../../../src/config/tunables.ts';
 import { AmountError, lamports, microLamportsPerCu, type Lamports } from '../../../src/core/units.ts';
 import { BASE_FEE_PER_SIGNATURE, attemptCost, feeReserve, positionExitBudget } from '../../../src/risk/reserve.ts';
+import { sizeEntry } from '../../../src/risk/sizing.ts';
+import fc from 'fast-check';
 import type { StoredAccount } from '../../../src/storage/repo-book.ts';
 
 const RENT = lamports(2_039_280n);
@@ -231,5 +234,54 @@ describe('app/caps.ts: dayPolicyOf (D7, contract 9)', () => {
     refused(() => dayPolicyOf('paper', DEFAULT_TUNABLES, paperAccount({ totalDeposits: lamports(2_000_000_001n) })));
     refused(() => dayPolicyOf('paper', DEFAULT_TUNABLES, paperAccount({ mode: 'live' })));
     refused(() => dayPolicyOf('live' as 'paper', DEFAULT_TUNABLES, paperAccount()));
+  });
+});
+
+describe('app/caps.ts: lowEquityStopOf, the low-equity stop (C33, RISK_POLICY s.6 step 4)', () => {
+  it('at 10% per trade and the 0.02 SOL minimum: off at a sizing equity of 0.2 SOL, on one lamport below', () => {
+    assert.equal(DEFAULT_TUNABLES.risk.tradePctBps, 1_000);
+    assert.equal(lowEquityStopOf(lamports(0n), lamports(200_000_000n), DEFAULT_TUNABLES), false); // 10% is exactly 20,000,000
+    assert.equal(lowEquityStopOf(lamports(0n), lamports(199_999_999n), DEFAULT_TUNABLES), true);
+    // the sizing equity is the day's baseline when it is above zero and below the equity (approve.ts)
+    assert.equal(lowEquityStopOf(lamports(199_999_999n), lamports(900_000_000n), DEFAULT_TUNABLES), true);
+    assert.equal(lowEquityStopOf(lamports(900_000_000n), lamports(200_000_000n), DEFAULT_TUNABLES), false); // a baseline above the equity: the equity
+    assert.equal(lowEquityStopOf(lamports(0n), lamports(0n), DEFAULT_TUNABLES), true);
+    // a lower per-trade share needs more equity: at 5%, 0.4 SOL
+    const five = withValue(DEFAULT_TUNABLES, 'risk.tradePctBps', 500);
+    assert.equal(lowEquityStopOf(lamports(0n), lamports(399_999_999n), five), true);
+    assert.equal(lowEquityStopOf(lamports(0n), lamports(400_000_000n), five), false);
+    assert.throws(() => lowEquityStopOf(-1n as Lamports, lamports(1n), DEFAULT_TUNABLES), AmountError);
+    assert.throws(() => lowEquityStopOf(lamports(0n), 1 as unknown as Lamports, DEFAULT_TUNABLES), AmountError);
+  });
+
+  it("agrees with sizeEntry's equity-below-minimum on 1,000 random equities, baselines and per-trade shares", () => {
+    const [low, high] = boundsOf('risk.tradePctBps') as readonly [number, number];
+    fc.assert(
+      fc.property(fc.bigInt({ min: 0n, max: 3_000_000_000n }), fc.bigInt({ min: 0n, max: 3_000_000_000n }), fc.integer({ min: low, max: high }), (dayStart, equity, share) => {
+        const t = withValue(DEFAULT_TUNABLES, 'risk.tradePctBps', share);
+        const sizingEquity = dayStart > 0n && dayStart < equity ? dayStart : equity; // approve.ts's rule
+        const sized = sizeEntry(
+          {
+            strategy: 'momentum',
+            mode: 'paper',
+            liveSol: null,
+            sizeHint: 'normal',
+            sizingEquity: lamports(sizingEquity),
+            exposure: lamports(0n),
+            launchExposure: lamports(0n),
+            poolRealSolReserve: lamports(100_000_000_000n),
+            sol: lamports(10_000_000_000n),
+            reserveAfterBuy: lamports(0n),
+            rent: lamports(0n),
+            buyAttemptFees: lamports(0n),
+            minTrade: lamports(0n),
+            liveRampHalf: false,
+          },
+          buyCapsOf(t, RENT).sizing,
+        );
+        assert.equal(lowEquityStopOf(lamports(dayStart), lamports(equity), t), !sized.ok && sized.reason === 'equity-below-minimum');
+      }),
+      { numRuns: 1_000 },
+    );
   });
 });

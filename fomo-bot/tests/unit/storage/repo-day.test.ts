@@ -12,7 +12,7 @@ import { applyTransfer, confirmEquityJump, emptyEquityState, observeEquity, type
 import { RiskError } from '../../../src/risk/reserve.ts';
 import { amountParam, boolParam, dayParam, intParam, msParam } from '../../../src/storage/codec.ts';
 import * as dayFile from '../../../src/storage/repo-day.ts';
-import { SNAPSHOT_KEEP_MS, insertSnapshot, pruneSnapshots, readDayState, snapshotNear, writeDayState } from '../../../src/storage/repo-day.ts';
+import { SNAPSHOT_KEEP_MS, insertSnapshot, newestSnapshot, pruneSnapshots, readDayState, snapshotNear, writeDayState } from '../../../src/storage/repo-day.ts';
 import type { Db } from '../../../src/storage/sqlite.ts';
 import { TEST_NOW, count, migratedDb, removeDir, storageError, tamper, tempDir } from './helpers.ts';
 
@@ -76,7 +76,7 @@ function withTampered(script: string, fn: (db: Db) => void): void {
 
 describe('the engine\'s day-state file: only what it may do', () => {
   it('exports the day state\'s read and write, the peak-restart check and the snapshots\', and nothing else: a new export here is a reviewed change', () => {
-    assert.deepEqual(Object.keys(dayFile).sort(), ['SNAPSHOT_KEEP_MS', 'checkPeakRestart', 'insertSnapshot', 'pruneSnapshots', 'readDayState', 'snapshotNear', 'writeDayState']);
+    assert.deepEqual(Object.keys(dayFile).sort(), ['SNAPSHOT_KEEP_MS', 'checkPeakRestart', 'insertSnapshot', 'newestSnapshot', 'pruneSnapshots', 'readDayState', 'snapshotNear', 'writeDayState']);
   });
 });
 
@@ -372,7 +372,7 @@ describe('the equity snapshots: the base of the jump test, from the database and
       assert.equal(db.transaction((tx) => insertSnapshot(tx, 'paper', T, lamports(5n * SOL), null)), false);
       assert.equal(db.transaction((tx) => insertSnapshot(tx, 'live', T, null, null)), true); // unknown equity is kept as such
       assert.equal(count(db, 'equity_snapshots'), 2n);
-      assert.equal(snapshotNear(db, 'paper', T), SOL);
+      assert.deepEqual(snapshotNear(db, 'paper', T, T), { equity: SOL, at: T });
       storageError(() => db.transaction((tx) => insertSnapshot(tx, 'paper', Number.NaN, null, null)), 'bad-param');
       // the stops' equity is never above the full one (risk/daystate.ts); the schema has no CHECK for it, so the code refuses it
       storageError(() => db.transaction((tx) => insertSnapshot(tx, 'paper', T + 1, lamports(SOL), lamports(2n * SOL))), 'bad-param');
@@ -382,23 +382,56 @@ describe('the equity snapshots: the base of the jump test, from the database and
     });
   });
 
-  it('the snapshot nearest a time, with a known equity, of that mode only; the older one on a tie; none when there is none', () => {
+  it('the snapshot nearest a time, with a known equity, of that mode only, at or before now, with its own time; the older one on a tie (C42)', () => {
     withDb((db) => {
-      assert.equal(snapshotNear(db, 'paper', T - HOUR), null);
+      assert.equal(snapshotNear(db, 'paper', T - HOUR, T), null);
       db.transaction((tx) => {
         insertSnapshot(tx, 'paper', T - 2 * HOUR, lamports(1n), null);
         insertSnapshot(tx, 'paper', T - HOUR - 60_000, lamports(2n), null);
         insertSnapshot(tx, 'paper', T - HOUR + 60_000, lamports(3n), null);
         insertSnapshot(tx, 'paper', T - HOUR + 1_000, null, null); // nearest, but its equity is unknown
+        insertSnapshot(tx, 'paper', T + 600_000, lamports(4n), null); // after now: a clock that stepped back
         insertSnapshot(tx, 'live', T - HOUR, lamports(9n), null);
         return 0;
       });
-      assert.equal(snapshotNear(db, 'paper', T - HOUR), 2n); // a minute before and a minute after: the older
-      assert.equal(snapshotNear(db, 'paper', T - HOUR + 30_000), 3n);
-      assert.equal(snapshotNear(db, 'live', T - HOUR), 9n);
-      assert.equal(snapshotNear(db, 'paper', 0), 1n);
-      storageError(() => snapshotNear(db, 'paper', Number.NaN), 'bad-param');
-      storageError(() => snapshotNear(db, 'demo' as unknown as 'paper', T), 'bad-param');
+      assert.deepEqual(snapshotNear(db, 'paper', T - HOUR, T), { equity: 2n, at: T - HOUR - 60_000 }); // a minute before and after: the older
+      assert.deepEqual(snapshotNear(db, 'paper', T - HOUR + 30_000, T), { equity: 3n, at: T - HOUR + 60_000 });
+      assert.deepEqual(snapshotNear(db, 'live', T - HOUR, T), { equity: 9n, at: T - HOUR });
+      assert.deepEqual(snapshotNear(db, 'paper', 0, T), { equity: 1n, at: T - 2 * HOUR });
+      // a row after now is never the base, however near it is
+      assert.deepEqual(snapshotNear(db, 'paper', T + 600_000, T), { equity: 3n, at: T - HOUR + 60_000 });
+      assert.deepEqual(snapshotNear(db, 'paper', T + 600_000, T + 600_000), { equity: 4n, at: T + 600_000 });
+      assert.deepEqual(snapshotNear(db, 'paper', T, T - 2 * HOUR), { equity: 1n, at: T - 2 * HOUR }); // now before the target
+      assert.equal(snapshotNear(db, 'paper', T - HOUR, T - 3 * HOUR), null);
+      assert.ok(Object.isFrozen(snapshotNear(db, 'paper', T - HOUR, T)));
+      for (const [target, now] of [
+        [Number.NaN, T],
+        [T, Number.NaN],
+      ] as const) {
+        storageError(() => snapshotNear(db, 'paper', target, now), 'bad-param');
+      }
+      storageError(() => snapshotNear(db, 'demo' as unknown as 'paper', T, T), 'bad-param');
+    });
+  });
+
+  it('the newest snapshot at or before now, unknown equity included (T1 freshness, 6e)', () => {
+    withDb((db) => {
+      assert.equal(newestSnapshot(db, 'paper', T), null);
+      db.transaction((tx) => {
+        insertSnapshot(tx, 'paper', T - 60_000, lamports(5n), lamports(4n));
+        insertSnapshot(tx, 'paper', T, null, null);
+        insertSnapshot(tx, 'paper', T + 1_000, lamports(6n), null); // after now
+        insertSnapshot(tx, 'live', T + 500, lamports(9n), null);
+        return 0;
+      });
+      assert.deepEqual(newestSnapshot(db, 'paper', T), { at: T, equity: null, stopEquity: null });
+      assert.deepEqual(newestSnapshot(db, 'paper', T - 1), { at: T - 60_000, equity: 5n, stopEquity: 4n });
+      assert.deepEqual(newestSnapshot(db, 'paper', T + 1_000), { at: T + 1_000, equity: 6n, stopEquity: null });
+      assert.deepEqual(newestSnapshot(db, 'live', T + 1_000), { at: T + 500, equity: 9n, stopEquity: null });
+      assert.equal(newestSnapshot(db, 'live', T), null);
+      assert.ok(Object.isFrozen(newestSnapshot(db, 'paper', T)));
+      storageError(() => newestSnapshot(db, 'paper', Number.NaN), 'bad-param');
+      storageError(() => newestSnapshot(db, 'demo' as unknown as 'paper', T), 'bad-param');
     });
   });
 
@@ -414,7 +447,7 @@ describe('the equity snapshots: the base of the jump test, from the database and
       });
       assert.equal(db.transaction((tx) => pruneSnapshots(tx, T)), 2); // the two from a day and an hour ago
       assert.equal(db.transaction((tx) => pruneSnapshots(tx, T + 23 * HOUR)), 1); // a clock 23 h ahead: two hours ago goes
-      assert.equal(snapshotNear(db, 'paper', T - HOUR), 1n); // the hour-ago one is still there
+      assert.deepEqual(snapshotNear(db, 'paper', T - HOUR, T + 23 * HOUR), { equity: 1n, at: T - HOUR }); // the hour-ago one is still there
       assert.equal(db.transaction((tx) => pruneSnapshots(tx, 5)), 0); // near 1970 the margin stops at 0
       storageError(() => db.transaction((tx) => pruneSnapshots(tx, Number.NaN)), 'bad-param');
       assert.equal(count(db, 'equity_snapshots'), 2n);

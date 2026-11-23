@@ -10,7 +10,7 @@
 import { athensDay, previousDay } from '../core/day.ts';
 import type { Lamports } from '../core/units.ts';
 import type { EquityState } from '../risk/daystate.ts';
-import { amountParam, boolCell, boolParam, dayCell, dayParam, intCell, intParam, lamportsCell, lamportsCellOrNull, msCellOrNull, msParam } from './codec.ts';
+import { amountParam, boolCell, boolParam, dayCell, dayParam, intCell, intParam, lamportsCell, lamportsCellOrNull, msCell, msCellOrNull, msParam } from './codec.ts';
 import { expectChanges, oneOf, required } from './repo-util.ts';
 import { StorageError, type Reader, type Row, type Tx } from './sqlite.ts';
 
@@ -217,7 +217,11 @@ export function checkPeakRestart(state: EquityState, m: LedgerMode): void {
 // ---------------------------------------------------------------- the equity snapshots
 
 const INSERT_SNAPSHOT = 'INSERT INTO equity_snapshots (mode, at, equity, stop_equity) VALUES (?, ?, ?, ?) ON CONFLICT (mode, at) DO NOTHING';
-const NEAREST = 'SELECT equity FROM equity_snapshots WHERE mode = ? AND equity IS NOT NULL ORDER BY abs(at - ?), at LIMIT 1';
+// the base of the jump test, on the (mode, at) key: the newest known row at or before the target (and
+// now), and the oldest known row after the target and at or before now; the nearer wins in code
+const KNOWN_AT_OR_BEFORE = 'SELECT at, equity FROM equity_snapshots WHERE mode = ? AND at <= ? AND equity IS NOT NULL ORDER BY at DESC LIMIT 1';
+const KNOWN_AFTER = 'SELECT at, equity FROM equity_snapshots WHERE mode = ? AND at > ? AND at <= ? AND equity IS NOT NULL ORDER BY at LIMIT 1';
+const NEWEST = 'SELECT at, equity, stop_equity FROM equity_snapshots WHERE mode = ? AND at <= ? ORDER BY at DESC LIMIT 1';
 const PRUNE_SNAPSHOTS = 'DELETE FROM equity_snapshots WHERE at < ?';
 
 /** How long snapshots are kept: the jump test reads the hour before now, and a day covers a clock that jumped ahead. */
@@ -239,10 +243,32 @@ export function insertSnapshot(tx: Tx, m: LedgerMode, at: number, equity: Lampor
   return tx.run(INSERT_SNAPSHOT, checked, atParam, full, stops) === 1;
 }
 
-/** The known equity of the snapshot nearest `target` in this mode (the older one on a tie), or null when there is none. */
-export function snapshotNear(r: Reader, m: LedgerMode, target: number): Lamports | null {
-  const row = r.get(NEAREST, mode(m), msParam(target));
-  return row === undefined ? null : lamportsCell(row, 'equity');
+/** A snapshot row with a known equity: its equity and its own time. */
+function knownOf(row: Row | undefined): { readonly equity: Lamports; readonly at: number } | null {
+  return row === undefined ? null : Object.freeze({ equity: lamportsCell(row, 'equity'), at: msCell(row, 'at') });
+}
+
+/**
+ * The known equity nearest `target` in this mode, with the row's own time, among the rows at or before
+ * `now` only (C42: a row a clock that stepped back left in the future is never the base); the older one
+ * on a tie; null when there is none.
+ */
+export function snapshotNear(r: Reader, m: LedgerMode, target: number, now: number): { readonly equity: Lamports; readonly at: number } | null {
+  const checked = mode(m);
+  const targetParam = msParam(target);
+  const nowParam = msParam(now);
+  const before = knownOf(r.get(KNOWN_AT_OR_BEFORE, checked, targetParam < nowParam ? targetParam : nowParam));
+  const after = knownOf(r.get(KNOWN_AFTER, checked, targetParam, nowParam));
+  if (before === null || after === null) {
+    return before ?? after;
+  }
+  return after.at - target < target - before.at ? after : before;
+}
+
+/** The newest snapshot at or before `now` in this mode, unknown equity included (T1's freshness rule), or null. */
+export function newestSnapshot(r: Reader, m: LedgerMode, now: number): { readonly at: number; readonly equity: Lamports | null; readonly stopEquity: Lamports | null } | null {
+  const row = r.get(NEWEST, mode(m), msParam(now));
+  return row === undefined ? null : Object.freeze({ at: msCell(row, 'at'), equity: lamportsCellOrNull(row, 'equity'), stopEquity: lamportsCellOrNull(row, 'stop_equity') });
 }
 
 /** Deletes the snapshots older than SNAPSHOT_KEEP_MS, in both modes; returns how many. */

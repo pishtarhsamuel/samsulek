@@ -11,59 +11,13 @@ import { abandonOpeningTx, approveBuyTx, approveExitTx, persistKillTx, recordRef
 import { createEngineAuthority } from '../../../src/app/authority.ts';
 import { readHalts } from '../../../src/storage/repo-flags.ts';
 import { readPosition } from '../../../src/storage/repo-book.ts';
-import { StorageError, type Db, type StorageErrorCode, type Tx } from '../../../src/storage/sqlite.ts';
+import type { Db, StorageErrorCode } from '../../../src/storage/sqlite.ts';
 import { count } from '../storage/helpers.ts';
+import { FAULT_CODES, faulty } from './faulty-db.ts';
 import { testRng } from './world.ts';
 import { entryRequest, exitRequest, openPosition, txWorld, type TxWorld } from './tx-world.ts';
 
-const CODES: readonly StorageErrorCode[] = ['full', 'io', 'constraint', 'bad-param', 'busy'];
-
-/**
- * A handle whose FIRST transaction throws `code` at its k-th get, all or run (k from 1), before the
- * statement runs; later transactions and the plain reads pass through. k = 0 throws nothing: it counts.
- */
-function faulty(real: Db, k: number, code: StorageErrorCode): { readonly db: Db; readonly statements: () => number } {
-  let n = 0;
-  let first = true;
-  const db = {
-    file: real.file,
-    readOnly: false,
-    get: (sql: string, ...p: never[]) => real.get(sql, ...p),
-    all: (sql: string, ...p: never[]) => real.all(sql, ...p),
-    close: () => real.close(),
-    transaction: (fn: (tx: Tx) => unknown) => {
-      const armed = first;
-      first = false;
-      return real.transaction((tx) => {
-        const hit = (): void => {
-          if (armed) {
-            n += 1;
-            if (n === k) {
-              throw new StorageError(code, 'injected by the test');
-            }
-          }
-        };
-        const wrapped: Tx = {
-          get: (sql, ...p) => {
-            hit();
-            return tx.get(sql, ...p);
-          },
-          all: (sql, ...p) => {
-            hit();
-            return tx.all(sql, ...p);
-          },
-          run: (sql, ...p) => {
-            hit();
-            return tx.run(sql, ...p);
-          },
-          script: (sql) => tx.script(sql),
-        };
-        return fn(wrapped) as never;
-      });
-    },
-  } as unknown as Db;
-  return { db, statements: () => n };
-}
+const CODES = FAULT_CODES; // the handle itself is tests/unit/app/faulty-db.ts (shared with the day transactions)
 
 /** How many statements a successful call runs in its first transaction. */
 function statementsOf(make: () => TxWorld, run: (w: TxWorld, db: Db) => unknown): number {

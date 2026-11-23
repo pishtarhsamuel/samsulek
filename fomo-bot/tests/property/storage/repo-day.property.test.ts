@@ -137,7 +137,7 @@ function step(tx: Tx, now: number, s: Step): void {
         now,
         equity: s.equity === null ? null : lamports(s.equity),
         stopEquity: stopEquity === null ? null : lamports(stopEquity),
-        equityAnHourAgo: snapshotNear(tx, 'paper', now - HOUR),
+        equityAnHourAgo: snapshotNear(tx, 'paper', now - HOUR, now)?.equity ?? null,
       };
       ({ state: next, trips } = observeEquity(before, observation, POLICY));
     } else if (s.kind === 'confirm') {

@@ -381,6 +381,38 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      reason written down). The first run showed four weak tests and one missing check (a live
      position), all fixed, and one freeze that did nothing (removed).
 
+   Done in step 6e-1 (the equity observation, STORAGE_DESIGN s.17.12; UNREVIEWED, owner decision D11, on
+   the same branch):
+   - The snapshot readers: the nearest known row at or before now with its own time (the older on a
+     tie, a row after now never used, now before the target, unknown rows skipped), the newest row at or
+     before now with unknown equity; both against a brute-force oracle on 1,000 random row sets.
+   - The low-equity stop: off at 0.2 SOL of sizing equity at 10% per trade, on one lamport below; the
+     day's baseline as the sizing equity; 5% needs 0.4 SOL; agreement with sizeEntry's
+     equity-below-minimum on 1,000 random equities, baselines and shares.
+   - The observation: the first one sets the day, its baseline and the peak, at one clock reading (a
+     clock that would answer differently is read once); each halting trip as its halt row with its own
+     audit row first, level-triggered; two halts in one tick interleave with their rows (C28); the daily
+     stop and the jump hold in the day state; anomalies stored as unknown snapshots; a clock back across
+     midnight halts, stores no snapshot and prunes nothing; a same-day baseline of 0 set again (C39);
+     the base missing, ok at exactly the tolerance, far one millisecond past it, and never a row after
+     now (C42); unknown equity (the stops idle at under 5 minutes, on the stops equity after); the
+     low-equity stop on, kept by the day's baseline, off on a new day, one alert per turn-on (C33).
+   - The failures (C40): an untrusted clock writes nothing and warns at most every 10 minutes; a live
+     position, a day-state write storage refuses (a planted state) and a marks reader that throws each
+     set the day-state-error halt with its row and the anchor, and the next tick observes the stored
+     state again; busy writes nothing and halts nothing; a failed anchor write only warns.
+   - Athens midnight on 2026-03-29 (23 hours) and 2026-10-25 (25 hours): the daily stop lasts until
+     local midnight, never an hour early or late.
+   - The watch: each alert, its severity and codes, the rate limit and its edges, a hold's first tick,
+     unknown equity over 5 minutes, the base alerts only after the first hour, a throwing sink.
+   - Fault injection: every statement of the richest observation (two halts, the stop, a snapshot, the
+     prune) failed in turn with full, io, constraint, bad-param and busy: only the failure's halts and
+     their audit rows stay, and the latch is as s.17.5.6 says.
+   - The day-sequence property: 200 random runs of up to 40 steps (across both time-change nights) and
+     two fixed sequences, against the pure functions on a model, after every step.
+   - Planted bugs: 43; 42 caught, 1 equivalent (paper's caps are inside the hard values). The first run
+     showed two weak tests (a missing live account; the watch's first-hour edge), both fixed.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

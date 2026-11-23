@@ -238,6 +238,23 @@ can trade, and no key or account exists anywhere.
   - The Windows-only checks (shortcuts called junctions, OneDrive, network paths) are tested with a
     stand-in for Windows; a real run on your PC comes with the setup guide. If a guess is wrong, the bot
     refuses to start rather than running somewhere unsafe.
+- Your answers of Nov 23 are recorded: D11 (build 6e now, on the same separate branch), D12 (refuse to
+  start on a shorter safety log) and D13 (never another person's wallet address in the trade records).
+- Step 6e (saving the daily money check and your setting changes) is designed by the architect, in four
+  parts (STORAGE_DESIGN.md s.17), and its first part, 6e-1, is built (tests first) and NOT YET REVIEWED,
+  on the same separate branch (D11):
+  - Every few seconds the bot will write down, in one all-or-nothing step, what its paper money is
+    worth, the day's starting value, the highest value so far, and any stop that this triggers: -30% in
+    a day, -50% from the high, two stop days in a row, an impossible value (zero, above 2 SOL, over three
+    times the bankroll) or a clock that ran backwards. A stop is saved in the same step as the value
+    that caused it.
+  - A value that cannot be real is never used as the reference for the "+50% in an hour" check.
+  - If the check itself fails in any way (other than the database being busy for a moment), new buys
+    halt and you get an alert; only the server can restart them. It never retries with edited numbers.
+  - The time changes work: on the 23- and 25-hour days the daily stop lasts exactly until local midnight.
+  - Nothing calls it yet: the bot's main loop comes later, and it needs a trustworthy clock first.
+  - 43 deliberate bugs were planted: the tests catch 42, and the last one cannot matter in paper. The
+    first run found two weak tests, both fixed.
 - For you to know: in paper, the "free SOL" limit can never be the one that stops a buy, because the
   50% exposure limit always stops it first. That is fine, and the reason is written down for the
   reviewers.
@@ -245,15 +262,15 @@ can trade, and no key or account exists anywhere.
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: the reviewers' re-check of 6d-1 and their reviews of 6d-2 and 6d-3 (after Nov 23); then 6e
-  (the settings and day-state transactions); then chain clients, the paper engine, Telegram and
-  logging.
+- Next: the reviewers' re-check of 6d-1 and their reviews of 6d-2, 6d-3 and 6e (from Nov 23, 18:30
+  Athens time); the rest of 6e (the jump confirmation and the 30-second rule for buys, the engine's
+  settings step, your setting commands); then chain clients, the paper engine, Telegram and logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
-- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 60% (settings,
-  accounting, risk engine, the storage files, the approval transactions and the start-up checks done,
-  the last three parts awaiting review; 6e next); the whole build about 28-31%. Proving an edge on
-  paper takes weeks on top of that.
+- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 62% (settings,
+  accounting, risk engine, the storage files, the approval transactions, the start-up checks and the
+  daily money check done, the last four parts awaiting review; the rest of 6e next); the whole build
+  about 29-31%. Proving an edge on paper takes weeks on top of that.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.

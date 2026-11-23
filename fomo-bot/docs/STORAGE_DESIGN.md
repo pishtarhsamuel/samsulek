@@ -5267,3 +5267,55 @@ Decisions the reviewers should challenge:
   repo-day.property.test.ts) with backward steps added.
 - U7. Contract 8's independent time source (the RPC's block time within about a minute) is a chain
   fact for Phase 3; nothing in 6e depends on its value.
+
+### 17.12 As built in step 6e-1 (the equity observation), and what changed from the design
+
+Status: UNREVIEWED (owner decision D11), on `claude/exciting-hamilton-2d7lto-6d2-unreviewed`; it joins
+the working branch only after both reviewers have approved it (and the earlier steps).
+
+Built, tests first: `app/day-tx.ts` (`observeDayTx`, `createDayWatch`, `TimeGuard`, `DayDeps`, the
+constants of 17.4), the two readers of `storage/repo-day.ts` (`snapshotNear(r, mode, target, now)`
+with the row's own time, and `newestSnapshot`), `lowEquityStopOf` in `app/caps.ts`, the `day` fault site
+and `error:config` in `app/faults.ts`, and `anchorAfter` and `alertSafely` exported from
+`app/approve-tx.ts`. Nothing in risk/, portfolio/, config/, core/ or migration 1 changed.
+`observeDayTx` has no caller in src/ yet: the run loop is a later step (17.6).
+
+Differences from 17.3 to 17.5 (the main session's decisions; the reviewers challenge these too):
+- `ObserveOutcome`'s `observed` gains `stopChanged`, so the watch alerts on each turn-on of the
+  low-equity stop without a memory of the stored flag.
+- faults.ts gains only what 6e-1 uses: the `day` site and `error:config`. The `jump`, `config-due` and
+  `owner` sites and `day-state-stale` come with their own sub-steps.
+- The marks are read inside the outer `try` (still before BEGIN): a marks reader that throws is
+  classified (`error:unexpected`, a latch and a bug) and halts with `day-state-error:paper`, like any
+  other failure.
+- The watch remembers the previous observation to see a hold's first tick: the `equity-jump` trip
+  repeats on every tick while held (checked on the pure function). `day-halt-set`, `equity-jump-held`,
+  `equity-below-minimum`, `equity-unknown`, `jump-base-*` and `day-clock-untrusted` are warnings;
+  `day-state-error` is a bug. A rate-limited code alerts again after 10 minutes, or at once when the
+  clock steps back (as the fault sink's exit alerts do).
+- `snapshotNear` is the two indexed SELECTs of 17.3; the older row's query is bounded by the lower of
+  the target and now.
+- The fault-injection handle moved to tests/unit/app/faulty-db.ts, shared by 6d-2's and 6e's sweeps.
+- The day-sequence property runs 200 random runs plus two fixed sequences that reach every trip, both
+  resumes, a far base, unknown equity and an untrusted clock on every execution. Some trips (two stop
+  days in a row) are rare in random runs: a run of 2,000 found no mismatch but did not reach that one.
+
+The scratch runs (VERIFIED_FACTS, 2026-11-23): U1 (all three snapshot SELECTs search the (mode, at)
+primary key; 0.02 ms a read at 200,000 rows), U2 (2026 to 2030: 10 of 10 time changes as the EU rule,
+and `athensDay` changes exactly at local midnight on the 23- and 25-hour days), U5 (17,280 rows, a day
+of 5 s ticks, pruned at once in 20 ms; the -wal about 1 MB). U3, U4 and U6 are not needed by 6e-1's code
+(U4 is covered: the no-catch rule passes with the new callback and its interface call).
+
+Written down, for the reviewers:
+- No production `TimeGuard` exists (R17); T1 does not yet read the snapshot's age (6e-2 adds the 30 s
+  rule). Until both exist, nothing calls `observeDayTx` outside the tests.
+- A live position, a missing live account, a config that does not decode and a marks reader that
+  throws all end in `day-state-error:paper` (R8 read widely); busy never does.
+
+Tests: TEST_PLAN.md s.3, "Done in step 6e-1". Planted bugs (scratchpad `mut/run33.py`): 43, 40 caught
+in the first run and 1 equivalent (paper's caps are inside the hard values, so `capsInEffect` changes
+nothing in paper). The two left showed two weak tests: no test had a missing live account, and the
+watch's first-hour test could not tell "at the hour" from "a millisecond later". Both tests are fixed,
+and both bugs are caught now: 42 caught, 1 equivalent. Coverage: every line and branch of
+app/day-tx.ts.
+
