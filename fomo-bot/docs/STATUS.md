@@ -194,12 +194,13 @@ can trade, and no key or account exists anywhere.
     reviewer blocked it: the slot clock could be walked far ahead, or stalled by a clock that
     steps back, and a buy approval ignored a KILL or halt written by another process. All of it is
     fixed, and 34 of 34 planted bugs in the fixes are caught. Both reviewers then hit the weekly
-    usage limit before confirming the fixes; with your OK (decision D8) this part is saved as
-    "review pending", and the re-check comes after Nov 23. Nothing builds on it until both confirm.
-- Part 6d-2 is built (tests first), and NOT YET REVIEWED: with your OK (decision D9) it is saved on
-  its own branch, `claude/exciting-hamilton-2d7lto-6d2-unreviewed`, and joins the main work only
-  after both reviewers approve it. It holds the steps that turn a strategy's buy or a sell into an
-  approval:
+    usage limit before confirming the fixes; with your OK (decision D8) this part was saved as
+    "review pending". On Nov 23 both re-checked it: the security reviewer CONFIRMED, the risk
+    reviewer APPROVED WITH NOTES. Their new notes are small conditions for the exit and health
+    loops (keep the slot reading fresh during long outages, and alert in two quiet failure cases).
+- Part 6d-2 is built (tests first) and REVIEWED: both reviewers approved it with notes on Nov 23,
+  and it joined the main work with their two fixes (below). It holds the steps that turn a
+  strategy's buy or a sell into an approval:
   - A buy is one locked database step: it reads your limits, halts, KILL, pause, the day's count,
     the positions and the money, asks the risk engine, and writes the result. If anything fails half
     way, nothing of it is saved, and the approval only goes out after the save.
@@ -213,6 +214,10 @@ can trade, and no key or account exists anywhere.
     one at a time, and the tests caught every one in the end; the first runs found four weak tests
     and one rule that should be stricter, all fixed. Building it also turned up a trap: a sell for a
     position that is not open would have stopped all new buys; now it just alerts.
+  - The review found two things to fix, both done and confirmed: a sell that can never pass (its
+    fee budget is spent) no longer uses up the position's sell numbers, so it can always still be sold
+    later; and the check that no code inside a database step can swallow an error now also catches
+    three sneakier ways of handing that step on. Their other notes are conditions for later parts.
 - Part 6d-3 is built (tests first), and NOT YET REVIEWED: with your OK (decision D10) it sits on the
   same separate branch as 6d-2 and joins the main work only after both reviewers approve. It holds the
   start-up checks and the engine's start:
@@ -293,8 +298,9 @@ can trade, and no key or account exists anywhere.
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: the reviewers' re-check of 6d-1 and their reviews of 6d-2, 6d-3 and 6e (from Nov 23, 18:30
-  Athens time), which now covers all of 6e; then chain clients, the paper engine, Telegram and logging.
+- Next: the reviews of 6d-3 (the start-up checks) and 6e (the settings and day-state transactions),
+  both built on the separate branch (6d-1 and 6d-2 are reviewed and in the main work); then chain
+  clients, the paper engine, Telegram and logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;

@@ -425,13 +425,34 @@ describe('T1 exit', () => {
       exitApproved(approveExitTx(w.deps, exitRequest(w.deps, 'ps_1')));
       const short = approveExitTx(w.deps, exitRequest(w.deps, 'ps_2', {}, { mint: 'MintB', tokenAccount: 'AtaOfMintB' }));
       assert.ok(short.kind === 'refused' && short.problems.includes('exit-fee-budget'));
+      const before = dump(w.db);
       const none = approveExitTx(w.deps, exitRequest(w.deps, 'ps_3', {}, { mint: 'MintC', tokenAccount: 'AtaOfMintC' }));
-      assert.ok(none.kind === 'refused' && none.problems.includes('auto-exits-stopped'));
+      // review U, risk 1: a spent budget is known before any plan is checked: nothing written, no exit number used
+      assert.deepEqual({ ...none }, { kind: 'not-run', code: 'auto-exits-stopped' });
+      assert.equal(dump(w.db), before);
       assert.deepEqual(
         w.alerts.seen.filter((a) => a.code === 'exit-fee-budget').map((a) => a.codes),
         [['ps_2'], ['ps_3']],
         'risk 8: a refusal for the fee budget says so',
       );
+    });
+  });
+
+  it('a spent fee budget, asked again every 2 s for an hour: no exit number used, the fee-budget alert once a minute, exit-blocked once in ten minutes (review U, risk 1)', () => {
+    withWorld((w) => {
+      openPosition(w.db, 'ps_1');
+      w.db.transaction((tx) => tx.run('UPDATE positions SET failed_fees = ?, cost_basis = ? WHERE id = ?', '3375000', '3375000', 'ps_1'));
+      const before = dump(w.db);
+      for (let i = 0; i < 1_800; i += 1) {
+        assert.deepEqual({ ...approveExitTx(w.deps, exitRequest(w.deps, 'ps_1')) }, { kind: 'not-run', code: 'auto-exits-stopped' });
+        w.clock.advance(2_000);
+      }
+      assert.equal(dump(w.db), before);
+      assert.equal(readPosition(w.db, 'ps_1').exitSeq, 0);
+      const budget = w.alerts.seen.filter((a) => a.code === 'exit-fee-budget').length;
+      assert.ok(budget >= 60 && budget <= 61, `once a minute: ${budget}`);
+      const blocked = w.alerts.seen.filter((a) => a.code === 'exit-blocked').length;
+      assert.ok(blocked >= 6 && blocked <= 7, `once in ten minutes: ${blocked}`);
     });
   });
 

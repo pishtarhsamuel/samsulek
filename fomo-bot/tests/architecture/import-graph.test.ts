@@ -1406,13 +1406,19 @@ export interface NoCatchResult {
  *    with a visited set, and that body is held to rules 2 to 4; a function value of app/ or cli/ that
  *    cannot be followed (a parameter, or a variable that holds no function written in place) is never
  *    called there (6e-4: a planner handed in as a closure would run unseen);
- * 4. a value typed Reader, Tx or Db of storage/sqlite.ts, or a function literal, is passed only to a
- *    function declared in storage/, app/ or cli/ (followed by rule 3) or in TypeScript's own lib files
- *    (Promise's members excepted): an interface method, a parameter or a variable of function type
- *    never receives the transaction or a closure over it;
+ * 4. an argument that could hand the transaction on is passed only to a function declared in
+ *    storage/, app/ or cli/ (followed by rule 3) or in TypeScript's own lib files (Promise's members
+ *    excepted): a function written in place, any value that can be called (a closure over the
+ *    transaction kept in a variable, a bound function), and any value that holds a Reader, Tx or Db
+ *    of storage/sqlite.ts (the handle itself, or an object or array holding one, three levels deep).
+ *    So an interface method, a parameter or a variable of function type never receives the
+ *    transaction or a closure over it (review U, security 1: a closure in a variable, an object
+ *    holding the handle and a bound function used to get past);
  * 5. in storage/ (sqlite.ts and migrations.ts excepted) every catch block ends with a throw.
- * LIMIT, written down: code behind an interface or reached through `this` is not followed (rule 4
- * keeps the transaction from it; app/ has no classes with such methods); review is the guard there.
+ * LIMIT, written down: code behind an interface or reached through `this` is not followed; rule 4
+ * keeps the transaction and every function value from it, but not a handle hidden deeper than three
+ * levels or behind a type rewritten by hand (app/ has no classes with such methods); review is the
+ * guard there.
  */
 export function noCatchProblems(program: ts.Program, srcRoot: string): NoCatchResult {
   const checker = program.getTypeChecker();
@@ -1458,6 +1464,27 @@ export function noCatchProblems(program: ts.Program, srcRoot: string): NoCatchRe
       const symbol = t.getSymbol() ?? t.aliasSymbol;
       return symbol !== undefined && HANDLE_TYPES.has(symbol.name) && (symbol.declarations ?? []).some((d) => relOf(d.getSourceFile()) === SQLITE_FILE);
     });
+  /** The handle itself, or an object or array whose properties or elements hold one, up to `depth` levels down. */
+  const holdsHandle = (type: ts.Type, depth: number): boolean =>
+    isHandleType(type) ||
+    (depth > 0 &&
+      (type.isUnion() ? type.types : [type]).some(
+        (t) =>
+          [t.getNumberIndexType(), t.getStringIndexType()].some((e) => e !== undefined && holdsHandle(e, depth - 1)) ||
+          t.getProperties().some((p) => {
+            const d = p.valueDeclaration ?? p.declarations?.[0];
+            return d !== undefined && holdsHandle(checker.getTypeOfSymbolAtLocation(p, d), depth - 1);
+          }),
+      ));
+  const isCallable = (type: ts.Type): boolean => (type.isUnion() ? type.types : [type]).some((t) => t.getCallSignatures().length > 0);
+  /** Rule 4: an argument that could hand the transaction on. */
+  const handsOn = (a: ts.Expression): boolean => {
+    if (ts.isArrowFunction(a) || ts.isFunctionExpression(a)) {
+      return true;
+    }
+    const type = checker.getTypeAtLocation(a);
+    return isCallable(type) || holdsHandle(type, 3);
+  };
   const isTransactionCall = (call: ts.CallExpression): boolean => {
     if (!ts.isPropertyAccessExpression(call.expression) || call.expression.name.text !== 'transaction') {
       return false;
@@ -1483,12 +1510,12 @@ export function noCatchProblems(program: ts.Program, srcRoot: string): NoCatchRe
         if (ts.isIdentifier(callee) && unfollowable && inSrc(dRel) && ['app', 'cli'].includes(folderOf(dRel))) {
           problems.push(`${rel}: a function value of app/ or cli/ (a parameter or a variable) is called inside a transaction callback, where the rule cannot follow it (${where})`);
         }
-        const carries = (node.arguments ?? []).some((a) => ts.isArrowFunction(a) || ts.isFunctionExpression(a) || isHandleType(checker.getTypeAtLocation(a)));
+        const carries = (node.arguments ?? []).some(handsOn);
         if (carries) {
           const ours = d !== undefined && body !== undefined && inSrc(dRel) && ['storage', 'app', 'cli'].includes(folderOf(dRel));
           const lib = d !== undefined && program.isSourceFileDefaultLibrary(d.getSourceFile()) && !isPromiseMember(d);
           if (!ours && !lib) {
-            problems.push(`${rel}: the transaction, or a function literal, goes only to a function of storage/, app/ or cli/, or of TypeScript's own lib (${where})`);
+            problems.push(`${rel}: the transaction, a function or a value holding the transaction goes only to a function of storage/, app/ or cli/, or of TypeScript's own lib (${where})`);
           }
         }
         if (body !== undefined && inSrc(dRel) && ['app', 'cli'].includes(folderOf(dRel)) && !visited.has(body)) {
@@ -2634,11 +2661,18 @@ describe('architecture: the approval transactions of step 6d-2 (STORAGE_DESIGN s
       'app/c13-lib.ts': ['export function risky(): number { try { return 1; } catch { return 2; } }', `${tryIn} (followed from app/c13.ts)`],
       'app/c14-lib.ts': ['export function risky(): number { try { return 1; } catch { return 2; } }', `${tryIn} (followed from app/c14.ts)`],
       'app/c15.ts': [`${HEAD}const o = { m(): number { try { return 1; } catch { return 2; } } };\nexport const f = (db: Db): number => db.transaction(() => o.m());`, `${tryIn} (followed from app/c15.ts)`],
+      // review U, security 1: the reviewer's three reproductions, and three more ways to the same end
+      'app/c16.ts': [`${HEAD}interface Each { each(fn: () => void): void }\nexport const f = (db: Db, e: Each): void => db.transaction((tx) => { const w = (): void => write(tx, ''); e.each(w); write(tx, 'after'); });`, handed],
+      'app/c17.ts': [`${HEAD}interface Holder { run(o: { readonly tx: Tx }): void }\nexport const f = (db: Db, h: Holder): void => db.transaction((tx) => { h.run({ tx }); write(tx, 'after'); });`, handed],
+      'app/c18.ts': [`${HEAD}interface Each { each(fn: () => void): void }\nexport const f = (db: Db, e: Each): void => db.transaction((tx) => { const w = write.bind(null, tx, ''); e.each(w); });`, handed],
+      'app/c19.ts': [`${HEAD}interface Each { each(fn: () => void): void }\nexport const f = (db: Db, e: Each): void => db.transaction((tx) => e.each(write.bind(null, tx, '')));`, handed],
+      'app/c20.ts': [`${HEAD}interface Holder { run(o: unknown): void }\nexport const f = (db: Db, h: Holder): void => db.transaction((tx) => { const box = { inner: { tx } }; h.run(box); });`, handed],
+      'app/c21.ts': [`${HEAD}interface Holder { run(o: readonly Tx[]): void }\nexport const f = (db: Db, h: Holder): void => db.transaction((tx) => h.run([tx]));`, handed],
       // 6e-4: a function handed in, or held in a variable, runs code the rule cannot follow
-      'app/c16.ts': [`${HEAD}export const f = (db: Db, plan: () => number): number => db.transaction(() => plan());`, unseen],
-      'app/c17.ts': [`${HEAD}const pick = (): (() => number) => () => { try { return 1; } catch { return 2; } };\nexport const f = (db: Db): number => db.transaction(() => { const g = pick(); return g(); });`, unseen],
-      'app/c18.ts': [`${HEAD}export const f = (db: Db, o: { readonly run: () => number }): number => db.transaction(() => { const { run } = o; return run(); });`, unseen],
-      'app/c19.ts': [`${HEAD}const outer = (plan: () => number): number => plan();\nexport const f = (db: Db): number => db.transaction(() => outer(() => 1));`, `${unseen} (followed from app/c19.ts)`],
+      'app/c22.ts': [`${HEAD}export const f = (db: Db, plan: () => number): number => db.transaction(() => plan());`, unseen],
+      'app/c23.ts': [`${HEAD}const pick = (): (() => number) => () => { try { return 1; } catch { return 2; } };\nexport const f = (db: Db): number => db.transaction(() => { const g = pick(); return g(); });`, unseen],
+      'app/c24.ts': [`${HEAD}export const f = (db: Db, o: { readonly run: () => number }): number => db.transaction(() => { const { run } = o; return run(); });`, unseen],
+      'app/c25.ts': [`${HEAD}const outer = (plan: () => number): number => plan();\nexport const f = (db: Db): number => db.transaction(() => outer(() => 1));`, `${unseen} (followed from app/c25.ts)`],
     };
     const callers: Record<string, string> = {
       'app/c13.ts': `${HEAD}import { risky as r } from './c13-lib.ts';\nexport const f = (db: Db): number => db.transaction(() => r());`,
@@ -2657,12 +2691,17 @@ describe('architecture: the approval transactions of step 6d-2 (STORAGE_DESIGN s
         'const helper = (tx: Tx, x: string): void => write(tx, x);',
         'export const b = (db: Db): void => db.transaction((tx) => helper(tx, \'y\'));',
         'export const c = (db: Db): string[] => db.transaction(() => [1, 2].map((n) => String(n)));',
+        // a named function to the lib, and an object of functions that holds no handle to an outside call
+        'export const d = (db: Db): string[] => db.transaction(() => [1, 2].map(String));',
+        'interface Issuer { issue(x: string): string }',
+        'interface Risk { decide(input: { readonly n: number }, issuer: Issuer): string }',
+        "export const e = (db: Db, risk: Risk, issuer: Issuer): string => db.transaction((tx) => { write(tx, 'y'); return risk.decide({ n: 1 }, issuer); });",
         // an interface method (the clock, the guard) is called, never followed, and never gets the handle
         'interface Clock { now(): number }',
-        'export const d = (db: Db, clock: Clock): number => db.transaction(() => clock.now());',
+        'export const g = (db: Db, clock: Clock): number => db.transaction(() => clock.now());',
         // a function written in place in a variable is followed
         'const local = (): number => 1;',
-        'export const e = (db: Db): number => db.transaction(() => local());',
+        'export const h = (db: Db): number => db.transaction(() => local());',
       ].join('\n'),
     };
     const { program, srcRoot } = virtualProgram({ 'storage/sqlite.ts': STUB, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])), ...callers, ...ok });

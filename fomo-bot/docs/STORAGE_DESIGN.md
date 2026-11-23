@@ -4246,6 +4246,17 @@ Conditions for the exit loop and later steps:
   and never throws (a throwing sink latches entries until a restart).
 - Security 4: the health loop alerts on `unknownSinceMs` (C63); Phase 3's chain clients check the
   cluster's genesis hash. Security 5: contract 8's guarded clock is the feed's clock.
+- From the re-check (2026-11-23), risk A: after more than 15 s of unknown slot the feed needs two
+  readings again, and each stays fresh for 2 s, so while positions are open the exit loop polls HTTP
+  at least every 2 s (`maxAgeMs`) or takes two readings 0.5 to 5 s apart before a T1 exit; tested with
+  a stream outage of more than 15 s. Risk B: the health loop also alerts when only one channel has
+  reported recently while positions are open (one channel alone can walk the slot ahead at 10 a
+  second unseen, as slots.ts says). Risk C: a fresh channel more than 150 slots behind stops every
+  token, exits included (fails closed); the exit loop then quotes from a fresh provider.
+- From the re-check, security N1: two channels agreeing on a wild slot leave the authority's ratchet
+  refusing every token while the feed re-anchors and `unknownSinceMs` looks healthy; the health loop
+  (or 6d-3) alerts when an issue refuses as expired while the feed's slot is known. N2: a fresh
+  channel more than 150 slots behind stalls adoption (fails closed; slot-behind reports it).
 
 Conditions for 6d-3:
 - Security on s.16.6: a hard-link check (`nlink` 1) for the database, its -wal and its -shm; the
@@ -4343,6 +4354,46 @@ was looser than it should be (the bug window above). Both tests are fixed and th
 three are caught now (the third as its opposite). A follow-up run of 9 for the not-sellable rule, the
 stricter window and the V7 canaries caught 8 and showed one more weak test (no exit of an exiting
 position): fixed, and caught. 130 planted in all, every one caught.
+
+Review U (REVIEWS.md U, 2026-11-23): both reviewers APPROVED WITH NOTES. Fixed before this step joins
+the working branch (on a branch from this step's last commit, so the step joins with its own fixes):
+- Risk 1: an automatic exit whose fee budget is spent is `not-run` with code `auto-exits-stopped`:
+  nothing is written and no exit number is used, so a loop that keeps asking can no longer use up the
+  position's 1,000,000 exit numbers (at 10 a second, in about 28 hours) and leave it unsellable. It
+  still alerts `exit-fee-budget` and counts toward `exit-blocked`. Test: an hour of asks every 2 s
+  leaves the database and `exitSeq` unchanged. The owner's /sell (Phase 3) is not stopped by it.
+- Security 1: rule 4 of the no-catch rule (16.7.4) now treats as handing the transaction on any
+  argument that can be called (a closure over the transaction kept in a variable, a bound function)
+  and any argument holding a Reader, Tx or Db (an object or an array, three levels deep), not only a
+  function written in place or the handle itself. Six canaries (the reviewer's three reproductions,
+  an inline bind, a nested object, an array); a named function handed to the lib and an object of
+  functions with no handle stay allowed; the real src/ is clean. The LIMIT says what is still not
+  seen (a handle deeper than three levels or behind a type rewritten by hand).
+- Security 5: `buyTokenExpiry` refusing two buy tokens for one position is pinned by a test.
+
+Conditions from review U, for later steps:
+- Exit loop (risk 1): the backoff per position never re-asks an exit whose refusal is permanent
+  (`auto-exits-stopped`, a spent budget), and keeps a minimum interval between asks for one position;
+  both tested.
+- Phase 3 (risk re-check of the fix): when the owner's /sell and /panic arrive, the early stop for a
+  spent fee budget applies to automatic exits only (today `readExit` accepts only automatic ones), with
+  a test that the owner's sale of a position with a spent budget still runs.
+- Engine loop (risk 2): the request's market facts (pool reserves, `poolMinTrade`, `quotedOut`,
+  `rentRequired`, `attemptsAllowed`, `simulatedCu`, the p95 exit cost) come from the engine's own venue
+  read at the quote slot, never from the plan's author; tested with a plan and a market made by
+  separate code.
+- Before Phase 8 (risk 4): exits fall back to the hard exit caps when the stored config does not
+  decode (with review T note 7, the exits-only start).
+- Before Phase 3's Telegram sink (security 3): the alert boundary runs every code through the secret
+  filter (an exit alert's position id is only id-checked; D13).
+- Follow-ups, not blocking: the invariant-2 property also checks the percentage caps on the stored
+  rows (risk 3, `buyLimitViolations` of s.16.9); the repo-orders writers restricted to
+  app/approve-tx.ts (security 2); a refusal whose own mint or id trips the secret filter recorded under
+  a fixed placeholder instead of latching entries (security 4); from the security re-check, an
+  optional tripwire for the LIMIT: inside a transaction callback, refuse an `as` or `satisfies` whose
+  operand can be called or holds a handle (a closure passed `as unknown` is not seen today).
+
+Both reviewers re-checked the fixes (commit 9265c37) and confirmed them (REVIEWS.md U).
 
 ### 16.16 As built in step 6d-3 (the boot and the engine start), and what changed from the design
 

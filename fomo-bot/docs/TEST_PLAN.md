@@ -334,6 +334,16 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    - Planted bugs: 130 in two runs, every one caught in the end; the first runs caught 126 and showed
      four weak tests (fixed) and one rule to make stricter (the bug window, changed).
 
+   Done after review U (both APPROVED WITH NOTES, 2026-11-23; STORAGE_DESIGN s.16.15):
+   - A spent fee budget: the exit is not-run (`auto-exits-stopped`) with nothing written, the
+     fee-budget alert kept; an hour of asks every 2 s leaves the database and the exit number
+     unchanged, the fee-budget alert once a minute, exit-blocked once in ten minutes.
+   - The no-catch rule's rule 4: six new canaries (a closure over the transaction in a variable, an
+     object holding it, a bound function kept and inline, a nested object, an array), two allowed
+     cases (a named function to the lib, an object of functions without a handle).
+   - Two buy tokens for one position are refused by `buyTokenExpiry`.
+   - Planted bugs for these fixes: 10, all caught.
+
    Done in step 6d-3 (the boot and the engine start, STORAGE_DESIGN s.16.16; UNREVIEWED, owner decision
    D10, on the same branch as 6d-2):
    - The run files: the KILL file reads present for any error but "no such file"; the anchor is
