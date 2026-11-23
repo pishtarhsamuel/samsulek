@@ -4246,6 +4246,17 @@ Conditions for the exit loop and later steps:
   and never throws (a throwing sink latches entries until a restart).
 - Security 4: the health loop alerts on `unknownSinceMs` (C63); Phase 3's chain clients check the
   cluster's genesis hash. Security 5: contract 8's guarded clock is the feed's clock.
+- From the re-check (2026-11-23), risk A: after more than 15 s of unknown slot the feed needs two
+  readings again, and each stays fresh for 2 s, so while positions are open the exit loop polls HTTP
+  at least every 2 s (`maxAgeMs`) or takes two readings 0.5 to 5 s apart before a T1 exit; tested with
+  a stream outage of more than 15 s. Risk B: the health loop also alerts when only one channel has
+  reported recently while positions are open (one channel alone can walk the slot ahead at 10 a
+  second unseen, as slots.ts says). Risk C: a fresh channel more than 150 slots behind stops every
+  token, exits included (fails closed); the exit loop then quotes from a fresh provider.
+- From the re-check, security N1: two channels agreeing on a wild slot leave the authority's ratchet
+  refusing every token while the feed re-anchors and `unknownSinceMs` looks healthy; the health loop
+  (or 6d-3) alerts when an issue refuses as expired while the feed's slot is known. N2: a fresh
+  channel more than 150 slots behind stalls adoption (fails closed; slot-behind reports it).
 
 Conditions for 6d-3:
 - Security on s.16.6: a hard-link check (`nlink` 1) for the database, its -wal and its -shm; the

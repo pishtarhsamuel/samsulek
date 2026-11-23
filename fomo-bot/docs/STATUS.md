@@ -194,8 +194,10 @@ can trade, and no key or account exists anywhere.
     reviewer blocked it: the slot clock could be walked far ahead, or stalled by a clock that
     steps back, and a buy approval ignored a KILL or halt written by another process. All of it is
     fixed, and 34 of 34 planted bugs in the fixes are caught. Both reviewers then hit the weekly
-    usage limit before confirming the fixes; with your OK (decision D8) this part is saved as
-    "review pending", and the re-check comes after Nov 23. Nothing builds on it until both confirm.
+    usage limit before confirming the fixes; with your OK (decision D8) this part was saved as
+    "review pending". On Nov 23 both re-checked it: the security reviewer CONFIRMED, the risk
+    reviewer APPROVED WITH NOTES. Their new notes are small conditions for the exit and health
+    loops (keep the slot reading fresh during long outages, and alert in two quiet failure cases).
 - For you to know before live: at 5% per trade, live trading needs at least 0.4 SOL in the
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
