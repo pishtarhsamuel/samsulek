@@ -5319,3 +5319,41 @@ watch's first-hour test could not tell "at the hour" from "a millisecond later".
 and both bugs are caught now: 42 caught, 1 equivalent. Coverage: every line and branch of
 app/day-tx.ts.
 
+### 17.13 As built in step 6e-2 (the jump confirmation and T1's freshness), and what changed
+
+Status: UNREVIEWED (owner decision D11), on the same branch.
+
+Built, tests first: `app/jump-tx.ts` (`confirmJumpTx`, `ConfirmOutcome`), T1's freshness rule in
+`app/snapshot.ts` (`DAY_STATE_MAX_AGE_MS` = 30,000; `readBuySnapshot` refuses `day-state-stale`), the
+`jump` fault site and the quiet code `day-state-stale` in `app/faults.ts`, and the import rule
+(`app/jump-tx.ts` from cli/ only) with its canaries.
+
+Differences from 17.5.2 and 17.6:
+- The confirmation alerts directly, not through the day watch (whose `note` takes an observation's
+  outcome): `equity-jump-confirmed` (info), `jump-confirm-refused` (warn) and `day-state-error` (bug, with
+  the code); none is rate-limited, since a confirmation comes from the verification routine or the
+  owner, not from a tick.
+- A RiskError from `confirmEquityJump` is a refusal, not a fault: it is not reported to the fault sink.
+  Every other failure is (a busy confirmation counts toward the busy storm, which a test pins).
+- The freshness check sits after the live checks in `readBuySnapshot`, so a live position still refuses
+  as `live-not-built` first. Exits never read it.
+- Every T1 test world (tests/unit/app/tx-world.ts, the engine tests, the parallel race rounds, the
+  snapshot tests) gets a fresh, valued paper snapshot at T; no 6d-2 test needed any other change.
+- The race "an observation trips the stop while T1 waits" is deterministic, in one process with two
+  connections: inside A's observation (through its one clock reading, like 6d-2's slot trick) B's T1 is
+  busy and unrecorded; after A commits, B is refused by the daily stop, or by the peak halt. The child
+  processes of 17.8 are not needed for it, because SQLite's lock serializes the two steps.
+
+Written down, for the reviewers:
+- With the freshness rule, a stopped or failing money check refuses every buy within 30 s, quietly
+  (`error:day-state-stale` is recorded with each refused intent). The check's own failures alert through
+  the day watch; a run loop that stopped altogether alerts only once the health loop exists (later, as
+  C63).
+- `confirmJumpTx` has no caller in src/ yet: the verification routine (Phase 3) and the server's confirm
+  command (Phase 7).
+
+Tests: TEST_PLAN.md s.3, "Done in step 6e-2". Planted bugs (scratchpad `mut/run34.py`): 18, 16 caught in
+the first run; the two left showed two weak tests (no test read the clock twice in a confirmation, and
+none checked that its faults reach the sink). Both are fixed: 18 of 18 caught. Coverage: every line and
+branch of app/jump-tx.ts and of the freshness rule.
+

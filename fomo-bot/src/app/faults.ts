@@ -27,6 +27,7 @@ export const APP_ERROR_CODES = Object.freeze([
   'live-not-built',
   'bad-request',
   'stale-opening-has-order',
+  'day-state-stale',
 ] as const);
 export type AppErrorCode = (typeof APP_ERROR_CODES)[number];
 
@@ -57,8 +58,8 @@ export interface Fault {
   readonly disk: boolean;
 }
 
-/** Where the fault happened (an alert names it). t2 is a buy token's use, t2-exit an exit token's; day is the equity observation (6e). */
-export type FaultSite = 't1-buy' | 't1-exit' | 't2' | 't2-exit' | 'abandon' | 'refusal' | 'kill' | 'halt' | 'boot' | 'day';
+/** Where the fault happened (an alert names it). t2 is a buy token's use, t2-exit an exit token's; day is the equity observation and jump its confirmation (6e). */
+export type FaultSite = 't1-buy' | 't1-exit' | 't2' | 't2-exit' | 'abandon' | 'refusal' | 'kill' | 'halt' | 'boot' | 'day' | 'jump';
 /** A fault here stopped a sale: it always alerts (review T, risk 4). */
 const EXIT_SITES: ReadonlySet<FaultSite> = new Set<FaultSite>(['t1-exit', 't2-exit']);
 

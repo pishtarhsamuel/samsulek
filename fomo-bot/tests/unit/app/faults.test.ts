@@ -79,6 +79,7 @@ describe('classify: each throw to its code, scope and alerts', () => {
       'abandon-token-valid': fault('error:abandon-token-valid', 'intent'),
       'position-not-sellable': fault('error:position-not-sellable', 'intent'),
       'entries-latched': fault('error:entries-latched', 'intent'),
+      'day-state-stale': fault('error:day-state-stale', 'intent'), // quiet: the stopped tick alerts on its own (6e)
       'rent-unknown': fault('error:rent-unknown', 'intent', { warn: true }),
       'p95-below-base-fee': fault('error:p95-below-base-fee', 'intent', { warn: true }),
       'stale-opening-has-order': fault('error:stale-opening-has-order', 'intent', { warn: true }),

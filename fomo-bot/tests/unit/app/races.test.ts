@@ -21,6 +21,7 @@ import { DEFAULT_TUNABLES, withValue } from '../../../src/config/tunables.ts';
 import { athensDay } from '../../../src/core/day.ts';
 import { lamports } from '../../../src/core/units.ts';
 import { insertOpening, readActivePositions } from '../../../src/storage/repo-book.ts';
+import { insertSnapshot } from '../../../src/storage/repo-day.ts';
 import { countEntry, entriesOn, readFlags } from '../../../src/storage/repo-flags.ts';
 import { setStrategyMode, writeOwnerConfig } from '../../../src/storage/repo-owner.ts';
 import type { Db } from '../../../src/storage/sqlite.ts';
@@ -204,7 +205,10 @@ describe('races on one database file (C3)', () => {
         const room = ROOMS[rand(ROOMS.length)] as Room;
         const file = path.join(dir, `round-${round}.sqlite`);
         const db = setUpDb(file);
-        db.transaction((tx) => setStrategyMode(tx, T - 1, 'owner-telegram', 'momentum', 'paper'));
+        db.transaction((tx) => {
+          setStrategyMode(tx, T - 1, 'owner-telegram', 'momentum', 'paper');
+          insertSnapshot(tx, 'paper', T, lamports(550_000_000n), lamports(550_000_000n)); // the money check T1 needs fresh (6e-2)
+        });
         leaveOneRoom(db, room);
         for (let i = 0; i < n; i += 1) {
           send(i, { op: 'round', file, mint: `MintR${round}C${i}`, positionId: `ps_r${round}c${i}`, small: room === 'exposure' });

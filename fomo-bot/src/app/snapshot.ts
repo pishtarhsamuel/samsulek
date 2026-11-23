@@ -18,11 +18,14 @@ import type { BreakerState, StrategyMode } from '../risk/blocks.ts';
 import { dailyStopActive } from '../risk/daystate.ts';
 import { readAccount, readActivePositions, type StoredBook, type StoredPosition } from '../storage/repo-book.ts';
 import { readConfigHistory } from '../storage/repo-config.ts';
-import { readDayState } from '../storage/repo-day.ts';
+import { newestSnapshot, readDayState } from '../storage/repo-day.ts';
 import { activeBans, entriesOn, readFlags, readHalts, readModes, type Ban } from '../storage/repo-flags.ts';
 import type { Reader, Tx } from '../storage/sqlite.ts';
 import { MARK_POLICY, buyCapsOf } from './caps.ts';
 import { AppError } from './faults.ts';
+
+/** T1 refuses entries when the newest paper money check is older than this, or unvalued (6e, s.17.6). */
+export const DAY_STATE_MAX_AGE_MS = 30_000;
 
 export interface ActiveConfig {
   readonly versionId: number;
@@ -122,6 +125,12 @@ export function readBuySnapshot(tx: Tx, s: BuySnapshotInput): BuySnapshot {
   const { versionId, tunables } = readActiveConfig(tx);
   if (active.some((p) => p.mode !== 'paper')) {
     throw new AppError('live-not-built', 'a live position exists, and live trading is not built (Phase 8)');
+  }
+  // 6e (s.17.6, R2): the newest money check is at most 30 s old and valued the whole book, so a missed
+  // or failed observation, a stopped tick or an untrusted clock stops entries within 30 s; exits never read it
+  const checked = newestSnapshot(tx, 'paper', now);
+  if (checked === null || now - checked.at > DAY_STATE_MAX_AGE_MS || checked.equity === null) {
+    throw new AppError('day-state-stale', 'the last equity observation is missing, older than 30 s or unvalued');
   }
 
   const equity = valueEquity(ledgerOf({ account: paper, positions: active }), marks, now, MARK_POLICY).equity;

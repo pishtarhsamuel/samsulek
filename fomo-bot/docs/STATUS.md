@@ -255,6 +255,13 @@ can trade, and no key or account exists anywhere.
   - Nothing calls it yet: the bot's main loop comes later, and it needs a trustworthy clock first.
   - 43 deliberate bugs were planted: the tests catch 42, and the last one cannot matter in paper. The
     first run found two weak tests, both fixed.
+- Part 6e-2 is built (tests first), NOT YET REVIEWED, on the same branch:
+  - A buy is now refused when the last money check is more than 30 seconds old or could not value
+    everything, so a stop can never be missed between two checks, and a broken check stops buying fast.
+  - A held "+50% in an hour" jump is cleared only by a fresh check of the real balance within 5 minutes,
+    from the server or (later) the verification routine; never by a strategy, Telegram or the AI. It
+    never vouches for more than was seen, and it works even while the bot is halted.
+  - 18 deliberate bugs were planted, and every one is caught (after two weak tests were fixed).
 - For you to know: in paper, the "free SOL" limit can never be the one that stops a buy, because the
   50% exposure limit always stops it first. That is fine, and the reason is written down for the
   reviewers.
@@ -263,8 +270,8 @@ can trade, and no key or account exists anywhere.
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
 - Next: the reviewers' re-check of 6d-1 and their reviews of 6d-2, 6d-3 and 6e (from Nov 23, 18:30
-  Athens time); the rest of 6e (the jump confirmation and the 30-second rule for buys, the engine's
-  settings step, your setting commands); then chain clients, the paper engine, Telegram and logging.
+  Athens time); the rest of 6e (the engine's settings step, your setting commands); then chain clients,
+  the paper engine, Telegram and logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;

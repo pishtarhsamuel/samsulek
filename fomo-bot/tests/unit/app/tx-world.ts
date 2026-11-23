@@ -13,6 +13,7 @@ import { bps, lamports, microLamportsPerCu, type Lamports } from '../../../src/c
 import type { Mark } from '../../../src/portfolio/equity.ts';
 import type { OrderPlan } from '../../../src/risk/plan.ts';
 import { insertOpening } from '../../../src/storage/repo-book.ts';
+import { insertSnapshot } from '../../../src/storage/repo-day.ts';
 import { setStrategyMode } from '../../../src/storage/repo-owner.ts';
 import type { Db } from '../../../src/storage/sqlite.ts';
 import { WSOL } from '../risk/fixtures.ts';
@@ -96,7 +97,10 @@ export function memoryAnchors(): MemoryAnchors {
 /** `setUp: false` for a second handle on a database another world set up already (the race tests). */
 export function txWorld(db: Db = setUpDb(), options: { readonly setUp?: boolean } = {}): TxWorld {
   if (options.setUp !== false) {
-    db.transaction((tx) => setStrategyMode(tx, T - 1, 'owner-telegram', 'momentum', 'paper'));
+    db.transaction((tx) => {
+      setStrategyMode(tx, T - 1, 'owner-telegram', 'momentum', 'paper');
+      insertSnapshot(tx, 'paper', T, lamports(550_000_000n), lamports(550_000_000n)); // the money check T1 needs fresh (6e-2)
+    });
   }
   const clock = testClock();
   const slot: { value: bigint | null } = { value: SLOT };

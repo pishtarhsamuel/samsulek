@@ -120,6 +120,9 @@ const RESTRICTED_FILES: Readonly<Record<string, { readonly allows: (rel: string)
   'app/authority.ts': { allows: (rel) => rel === 'app/engine.ts', who: 'app/engine.ts (one authority per process)' },
   'app/storage-boot.ts': { allows: (rel) => rel === 'app/engine.ts', who: 'app/engine.ts (the boot runs once, before the authority)' },
   'app/engine.ts': { allows: (rel) => rel.startsWith('cli/'), who: 'cli/ (the process entry)' },
+  // clearing a held equity jump: no strategy, Telegram or AI path may (contract 3; 6e-2, STORAGE_DESIGN
+  // s.17.3); the server's confirm command is cli/, and Phase 3 adds its verification file by name
+  'app/jump-tx.ts': { allows: (rel) => rel.startsWith('cli/'), who: 'cli/ (the server confirms; Phase 3 names the verification file)' },
   'storage/repo-book.ts': {
     allows: (rel) => rel.startsWith('app/') || rel === 'storage/repo-orders.ts' || rel === 'storage/repo-redeem.ts',
     who: 'app/, storage/repo-orders.ts and storage/repo-redeem.ts',
@@ -2019,6 +2022,10 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['app/approve-tx.ts', "import { bootStorage } from './storage-boot.ts'; export function f(): void { bootStorage(); }", `${only} app/engine.ts`],
       ['app/x.ts', "import { startPaperEngine } from './engine.ts'; export function f(): void { startPaperEngine(); }", `${only} cli/`],
       ['app/engine.ts', "export { createEngineAuthority } from './authority.ts';", only],
+      // 6e-2: a held equity jump is cleared only from cli/ (contract 3)
+      ['app/x.ts', "import { confirmJumpTx } from './jump-tx.ts'; export function f(): void { confirmJumpTx(); }", `${only} cli/`],
+      ['strategies/x.ts', "import { confirmJumpTx } from '../app/jump-tx.ts'; export function f(): void { confirmJumpTx(); }", `${only} cli/`],
+      ['app/day-tx.ts', "export { confirmJumpTx } from './jump-tx.ts';", only],
     ]);
     // the typed rule (below) checks that what is imported is only called; these are the import rules alone
     const fine: [string, string][] = [
@@ -2036,6 +2043,7 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['execution/x.ts', "import type { StoredOrder } from '../storage/repo-orders.ts'; export const x = (o: StoredOrder): StoredOrder => o;"],
       ['app/engine.ts', "import { createEngineAuthority } from './authority.ts'; import { bootStorage } from './storage-boot.ts'; export function f(): void { bootStorage(); createEngineAuthority(); }"],
       ['cli/start.ts', "import { startPaperEngine } from '../app/engine.ts'; import { systemRng } from '../core/rng.ts'; export function f(): void { startPaperEngine(systemRng); }"],
+      ['cli/confirm.ts', "import { confirmJumpTx } from '../app/jump-tx.ts'; export function f(): void { confirmJumpTx(); }"],
       ['app/x.ts', "import { newId } from '../core/rng.ts'; export function f(): string { return newId('token'); }"],
       ['app/faults.ts', "import { RngError } from '../core/rng.ts'; export const isRng = (e: unknown): boolean => e instanceof RngError;"],
       ['execution/x.ts', "import type { Rng } from '../core/rng.ts'; export const x = (r: Rng): string => r.orderId();"],

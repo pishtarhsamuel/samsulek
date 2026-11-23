@@ -413,6 +413,21 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    - Planted bugs: 43; 42 caught, 1 equivalent (paper's caps are inside the hard values). The first run
      showed two weak tests (a missing live account; the watch's first-hour edge), both fixed.
 
+   Done in step 6e-2 (the jump confirmation and T1's freshness, STORAGE_DESIGN s.17.13; UNREVIEWED, D11):
+   - T1's freshness: refused `day-state-stale` with no paper snapshot (a live one never counts), one
+     30,001 ms old, one with unknown equity, one only after now, or a valued older one behind an unvalued
+     newest one; accepted at 30,000 ms. Every 6d-2 T1 test passes with a fresh snapshot in its world.
+   - The confirmation: at the hold and 5 minutes after it, the lower of the verified and the held level;
+     refused 5 minutes and 1 ms after, before the hold, with no hold and above the sanity limits, writing
+     nothing and setting no halt; it works while KILL, a halt and the pause are set (C41); the clock read
+     once; the next observation moves the baseline and the peak again; an untrusted clock writes
+     nothing; a value that is not lamports halts with day-state-error; busy does not, and three busy
+     confirmations make a busy storm.
+   - The race: inside an observation that trips the daily stop or the peak halt, a buy on a second
+     connection is busy and unrecorded; after the commit it is refused by that stop.
+   - The import rule: only cli/ imports app/jump-tx.ts (three canaries, one allowed import).
+   - Planted bugs: 18, every one caught after two weak tests were fixed.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |
