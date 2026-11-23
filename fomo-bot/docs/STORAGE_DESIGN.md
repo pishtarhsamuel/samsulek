@@ -4268,3 +4268,128 @@ Tests: TEST_PLAN.md s.3, "Done in step 6d-1", review T. Planted bugs (scratchpad
 blocked by the lead cap anyway, so the spent budget was never what stopped it; and the clock test's
 one expected alert came from its NaN reading, so a fractional reading time could pass unseen. Both
 tests are fixed, and all 34 are caught.
+
+### 16.15 As built in step 6d-2 (the approval transactions), and what changed from the design
+
+Status: UNREVIEWED (owner decision D9). Built while review T's confirmation round waits for the usage
+limit, on the branch `claude/exciting-hamilton-2d7lto-6d2-unreviewed`; it joins the working branch only
+after both reviewers have confirmed 6d-1 and approved this step.
+
+Built, tests first: `app/caps.ts`, `app/snapshot.ts`, `app/approve-tx.ts`, `app/exit-watch.ts` (new),
+the 6d-2 additions to `app/faults.ts`, two read-only readers in `storage/repo-orders.ts`
+(`outstandingExitApprovals`, `buyTokenExpiry`), and the no-catch and `positionExitBudget` rules of
+16.7.4. Nothing in risk/, portfolio/, config/, core/ or migration 1 changed.
+
+Differences from 16.3 to 16.5 (the main session's decisions; the reviewers challenge these too):
+- A fifth new file, `app/exit-watch.ts`, for review T's exit-path conditions (risk 4, 5 and 8): an exit
+  that does not approve warns with its position and codes (once a minute per position and codes); a
+  refusal for the fee budget, or because automatic exits stopped, raises `exit-fee-budget`; five exits
+  in a row that did not approve for one position raise `exit-blocked` (once in ten minutes per
+  position, severity warn); an approved exit ends the run. `EngineDeps` gains `exitWatch`.
+- `ExitOutcome` gains `not-run` (risk 5): an unknown slot, a malformed request, an owner origin, or a
+  position that cannot be read write nothing and use up no exit number. After the position is read, an
+  error is recorded and uses up the number, except `busy` (as for a buy).
+- `StoreDeps` gains `slots`: `abandonOpeningTx` refuses (`abandon-token-valid`, a new quiet code) until
+  the slot is past the buy token's expiry slot (security 3), read with the new `buyTokenExpiry`. It also
+  needs a known slot. 6d-3's boot must therefore abandon only with a known slot.
+- `persistHaltTx` never reports its own failure to the fault sink: the sink's `onDiskTrouble` asks for
+  this very halt, so a full disk would ask again without end (a test pins one attempt). It latches
+  `halt-write-failed` and alerts with the fault's code. `persistKillTx` reports to the sink as designed.
+- The anchor write after a KILL or halt (16.5.4) moves to 6d-3, with `app/run-files.ts` and its
+  `AnchorStore`: `EngineDeps` has no `anchors` yet.
+- `BuySnapshot` gains `killStored`, which the buy marks in the latch after COMMIT.
+- Paper only, in more places: a live mode or any live position refuses in the snapshot, and a live
+  position refuses in T1 exit (`live-not-built`, recorded). A live entry request is recorded as a live
+  intent with the error.
+- `readActiveConfig` reads the whole history (ids without a gap; version 1 required) and decodes the
+  newest. A stored version that does not decode throws `ConfigError`, which `classify` makes
+  `error:unexpected`: entries latch as a bug.
+- Two casts in the snapshot rest on the schema's CHECKs: a cooldown's or pause's end is never null, and a
+  strategy kind's key is a strategy id. Were either wrong, risk's own checks would refuse the entry.
+- In T1 exit, `identity.tokenAccountOf(p.mint)` runs inside the transaction, on the mint it read: the
+  paper identity is a fixed mapping, and the mint must come from the position, never the caller.
+- app/faults.ts: the bug storm (security on D1): five bug-class faults of single intents within ten
+  minutes latch entries as a bug and alert `bug-storm`, once per process; a fault the clock now puts in
+  the future (it stepped back) stays in the window, because it is recent in real time (the busy window
+  does the same; the first version dropped it, and a planted bug showed the looser rule).
+- An exit of a position that cannot be sold (opening or closed) is `not-run` with the quiet code
+  `position-not-sellable`, before the position counts as read: such a position takes no exit number
+  (repo-book.ts), so recording the refusal would fail and latch entries as a bug. An exit loop that
+  raced a settlement, or asked too early, is told through the exit-path alert, never latched. An exiting
+  position (every token sold) still gets its account close. risk/approve.ts's words for impossible position lists are bugs
+  (risk 4), pinned against risk's own throws. `isSecretRefusal` tells the exit path that the secret
+  filter refused the planner's text: the exit is retried once with reasons `['inputs-refused']` and no
+  inputs, and `exit-inputs-refused` alerts as a bug (C31).
+- `exit-seq-high` alerts when the position's next exit number reaches 10,000.
+
+The races (C3): free SOL cannot be the last room under the paper caps. Exposure (at most 50% of equity)
+binds first: with no marked positions, the SOL must be at least twice the SOL held for buys in flight,
+and free SOL below one trade would need a wallet under about 38M lamports, where a 10% trade is below
+the 20M minimum. The rooms tested are the position cap, the entry count and the exposure cap (lowered to
+10% for the test).
+
+The scratch runs (VERIFIED_FACTS, 2026-11-20): V3 (no `busy` in 50 rounds of two to six processes with a
+5 s timeout), V7 (the canaries) and V8 (a second connection's plain read does not wait).
+
+Written down, for the reviewers:
+- LIMIT of the no-catch rule: code behind an interface, and code reached through `this`, is not
+  followed; rule 4 keeps the transaction from it. Calls into risk/, portfolio/, config/ and core/ are not
+  followed either: they never receive the transaction, and config's decoder rethrows.
+- The exit loop does not exist yet: reporting the quote's slot as `http` before T1 exit (C4), the backoff
+  per position, and the commitment of its HTTP reads (risk 6) arrive with it.
+- `sellSimPassed` is the exit loop's own claim; in paper the loop simulates the sale against a random
+  holder (D4).
+
+Conditions for 6d-3 from this step:
+- `startPaperEngine` wires the fault sink's `onDiskTrouble` to `persistHaltTx(storeDeps, 'disk-db')` and
+  checks the deps it builds; the boot abandons stale openings only with a known slot past their expiry.
+- The anchor file is written after each KILL and halt (16.5.4).
+
+Tests: TEST_PLAN.md s.3, "Done in step 6d-2". Planted bugs (scratchpad `mut/run29.py` and
+`mut/run30.py`): 121 planted in the first run, 118 caught. The three left showed two weak tests (an exit
+that failed after its position was read was never counted toward exit-blocked, and "automatic exits
+stopped" was only ever tested next to a fee-budget refusal that raised the same alert) and one rule that
+was looser than it should be (the bug window above). Both tests are fixed and the rule is changed; all
+three are caught now (the third as its opposite). A follow-up run of 9 for the not-sellable rule, the
+stricter window and the V7 canaries caught 8 and showed one more weak test (no exit of an exiting
+position): fixed, and caught. 130 planted in all, every one caught.
+
+Review U (REVIEWS.md U, 2026-11-23): both reviewers APPROVED WITH NOTES. Fixed before this step joins
+the working branch (on a branch from this step's last commit, so the step joins with its own fixes):
+- Risk 1: an automatic exit whose fee budget is spent is `not-run` with code `auto-exits-stopped`:
+  nothing is written and no exit number is used, so a loop that keeps asking can no longer use up the
+  position's 1,000,000 exit numbers (at 10 a second, in about 28 hours) and leave it unsellable. It
+  still alerts `exit-fee-budget` and counts toward `exit-blocked`. Test: an hour of asks every 2 s
+  leaves the database and `exitSeq` unchanged. The owner's /sell (Phase 3) is not stopped by it.
+- Security 1: rule 4 of the no-catch rule (16.7.4) now treats as handing the transaction on any
+  argument that can be called (a closure over the transaction kept in a variable, a bound function)
+  and any argument holding a Reader, Tx or Db (an object or an array, three levels deep), not only a
+  function written in place or the handle itself. Six canaries (the reviewer's three reproductions,
+  an inline bind, a nested object, an array); a named function handed to the lib and an object of
+  functions with no handle stay allowed; the real src/ is clean. The LIMIT says what is still not
+  seen (a handle deeper than three levels or behind a type rewritten by hand).
+- Security 5: `buyTokenExpiry` refusing two buy tokens for one position is pinned by a test.
+
+Conditions from review U, for later steps:
+- Exit loop (risk 1): the backoff per position never re-asks an exit whose refusal is permanent
+  (`auto-exits-stopped`, a spent budget), and keeps a minimum interval between asks for one position;
+  both tested.
+- Phase 3 (risk re-check of the fix): when the owner's /sell and /panic arrive, the early stop for a
+  spent fee budget applies to automatic exits only (today `readExit` accepts only automatic ones), with
+  a test that the owner's sale of a position with a spent budget still runs.
+- Engine loop (risk 2): the request's market facts (pool reserves, `poolMinTrade`, `quotedOut`,
+  `rentRequired`, `attemptsAllowed`, `simulatedCu`, the p95 exit cost) come from the engine's own venue
+  read at the quote slot, never from the plan's author; tested with a plan and a market made by
+  separate code.
+- Before Phase 8 (risk 4): exits fall back to the hard exit caps when the stored config does not
+  decode (with review T note 7, the exits-only start).
+- Before Phase 3's Telegram sink (security 3): the alert boundary runs every code through the secret
+  filter (an exit alert's position id is only id-checked; D13).
+- Follow-ups, not blocking: the invariant-2 property also checks the percentage caps on the stored
+  rows (risk 3, `buyLimitViolations` of s.16.9); the repo-orders writers restricted to
+  app/approve-tx.ts (security 2); a refusal whose own mint or id trips the secret filter recorded under
+  a fixed placeholder instead of latching entries (security 4); from the security re-check, an
+  optional tripwire for the LIMIT: inside a transaction callback, refuse an `as` or `satisfies` whose
+  operand can be called or holds a handle (a closure passed `as unknown` is not seen today).
+
+Both reviewers re-checked the fixes (commit 9265c37) and confirmed them (REVIEWS.md U).

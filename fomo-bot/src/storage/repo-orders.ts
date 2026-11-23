@@ -161,6 +161,11 @@ const INSERT_APPROVAL =
 const EXITS_IN_FLIGHT = "SELECT kind, in_amount FROM orders WHERE position_id = ? AND kind IN ('sell', 'close-account') AND status IN ('approved', 'submitted')";
 const BUY_ORDER =
   "SELECT id, intent_id, token_id, position_id, mode, kind, status, plan_hash, in_amount, min_out, max_spend, quote_slot, created_at, updated_at FROM orders WHERE position_id = ? AND kind = 'buy'";
+const OUTSTANDING_EXITS =
+  "SELECT count(*) AS n FROM approvals WHERE position_id = ? AND kind IN ('sell', 'close-account') AND consumed_at IS NULL AND expires_at_slot >= ?";
+const BUY_TOKEN_EXPIRY = "SELECT expires_at_slot FROM approvals WHERE position_id = ? AND kind = 'buy'";
+/** More exit tokens of one position than exit numbers exist is not a book, it is a broken database. */
+const MAX_EXIT_TOKENS = MAX_EXIT_SEQ + 1;
 
 const badParam = (what: string): StorageError => new StorageError('bad-param', `expected ${what}`);
 const mode = (m: LedgerMode): LedgerMode => oneOf(m, MODES, 'a ledger mode (paper or live)');
@@ -486,4 +491,28 @@ function orderOf(r: Row): StoredOrder {
 export function buyOrderOf(r: Reader, positionId: string): StoredOrder | null {
   const row = r.get(BUY_ORDER, idParam(positionId));
   return row === undefined ? null : orderOf(row);
+}
+
+/**
+ * T1 exit (review S, risk 3b; STORAGE_DESIGN s.16.3): the position's sell and close tokens not yet
+ * used and still usable at `slot` (its expiry slot included). An unused token can still be redeemed
+ * and become an order, so with exitsInFlight it counts as an exit in flight: a second exit waits
+ * until the first token is used or has expired.
+ */
+export function outstandingExitApprovals(r: Reader, positionId: string, slot: bigint): number {
+  return intCell(required(r.get(OUTSTANDING_EXITS, idParam(positionId), slotParam(slot)), 'the outstanding exit tokens'), 'n', 0, MAX_EXIT_TOKENS);
+}
+
+/**
+ * The slot a position's buy token expires at, used or not, or null when the position has none (step
+ * 6d-2, review T security 3): an opening position is abandoned only after its buy token expired, so
+ * a token that can still be redeemed never meets a closed position.
+ */
+export function buyTokenExpiry(r: Reader, positionId: string): bigint | null {
+  const rows = r.all(BUY_TOKEN_EXPIRY, idParam(positionId));
+  if (rows.length > 1) {
+    throw new StorageError('row-count', 'a position has one buy token at most');
+  }
+  const row = rows[0];
+  return row === undefined ? null : slotCell(row, 'expires_at_slot');
 }

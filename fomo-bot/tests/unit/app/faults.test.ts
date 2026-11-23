@@ -6,7 +6,7 @@
 // src/app/faults.ts.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { AppError, classify, createEntryLatch, createFaultSink, type Alert, type Fault } from '../../../src/app/faults.ts';
+import { AppError, classify, createEntryLatch, createFaultSink, isSecretRefusal, type Alert, type Fault } from '../../../src/app/faults.ts';
 import { AmountError } from '../../../src/core/units.ts';
 import { RngError } from '../../../src/core/rng.ts';
 import { LedgerError } from '../../../src/portfolio/ledger.ts';
@@ -75,6 +75,8 @@ describe('classify: each throw to its code, scope and alerts', () => {
     const expect = {
       'slot-unknown': fault('error:slot-unknown', 'intent'),
       'abandon-needs-settlement': fault('error:abandon-needs-settlement', 'intent'),
+      'abandon-token-valid': fault('error:abandon-token-valid', 'intent'),
+      'position-not-sellable': fault('error:position-not-sellable', 'intent'),
       'entries-latched': fault('error:entries-latched', 'intent'),
       'rent-unknown': fault('error:rent-unknown', 'intent', { warn: true }),
       'p95-below-base-fee': fault('error:p95-below-base-fee', 'intent', { warn: true }),
@@ -94,6 +96,18 @@ describe('classify: each throw to its code, scope and alerts', () => {
   it("risk, amount, ledger and randomness errors stay with their intent; only risk's hard-limit backstop is a bug", () => {
     assert.deepEqual(classify(new RiskError('the approval would break a hard limit (exposure): refusing')), fault('error:risk', 'intent', { bug: true }));
     assert.deepEqual(classify(new RiskError('the plan is malformed')), fault('error:risk', 'intent'));
+    // states the database and the snapshot make impossible are bugs too (review T, risk 4); the
+    // approve-tx tests pin these words against risk's own throws
+    for (const message of [
+      'more than 1000 active positions: not a real portfolio',
+      'a position has an unknown strategy',
+      'a position here must be opening, open, exiting or stuck',
+      'two positions share an id, or the new position already exists',
+      'two active positions share a mint',
+      'an opening position carries its maxSpend and the others their value, never the other number',
+    ]) {
+      assert.deepEqual(classify(new RiskError(message)), fault('error:risk', 'intent', { bug: true }), message);
+    }
     assert.deepEqual(classify(new AmountError('not an amount')), fault('error:amount', 'intent'));
     assert.deepEqual(classify(new LedgerError('not balanced')), fault('error:ledger', 'intent'));
     assert.deepEqual(classify(new RngError('rng-filter', 'x')), fault('error:rng-filter', 'intent', { warn: true }));
@@ -123,6 +137,34 @@ describe('classify: each throw to its code, scope and alerts', () => {
       assert.deepEqual(classify(e), unexpected);
     }
     assert.ok(Object.isFrozen(classify(new Error('z'))));
+  });
+});
+
+describe('isSecretRefusal: the secret filter refused the text the bot was given (the exit retry, review T)', () => {
+  it("is true only for storage's bad-param with the filter's own words", () => {
+    assert.equal(isSecretRefusal(new StorageError('bad-param', 'expected the reasons that does not look like a secret (it looks like one: own-secret)')), true);
+    const forged = new StorageError('bad-param', 'x');
+    Object.defineProperty(forged, 'detail', { get: () => 'it looks like one: own-secret' });
+    const otherCode = new StorageError('constraint', 'it looks like one: own-secret');
+    // a look-alike that passes instanceof and throws when its fields are read: still false, never a throw
+    const hostile = new Proxy(new StorageError('bad-param', 'x'), {
+      getOwnPropertyDescriptor: () => {
+        throw new Error('trap');
+      },
+    });
+    for (const e of [
+      hostile,
+      new StorageError('bad-param', 'expected a redeem within 15 s of the token issue (a retry gets a new token)'),
+      new StorageError('bad-param', 'expected a code'),
+      otherCode,
+      forged,
+      new Error('it looks like one: own-secret'),
+      { code: 'bad-param', detail: 'it looks like one: own-secret' },
+      null,
+      'it looks like one:',
+    ]) {
+      assert.equal(isSecretRefusal(e), false);
+    }
   });
 });
 
@@ -294,5 +336,54 @@ describe('the fault sink: what each scope does', () => {
     for (const key of Object.keys(ok)) {
       assert.throws(() => createFaultSink({ ...ok, [key]: null } as unknown as typeof ok), TypeError, key);
     }
+  });
+});
+
+describe('the bug storm (review T, security on D1): bug-class intent faults latch entries when they repeat', () => {
+  const bug = fault('error:storage-constraint', 'intent', { bug: true });
+
+  it('five within ten minutes (inclusive) latch entries as a bug and alert once; four do not', () => {
+    const w = sinkWorld();
+    for (let i = 0; i < 4; i += 1) {
+      w.sink.report('t1-buy', bug);
+      w.advance(150_000); // the fifth comes exactly ten minutes after the first
+    }
+    assert.deepEqual(w.latch.blocked(), []);
+    w.sink.report('t1-buy', bug);
+    assert.deepEqual(w.latch.blocked(), ['bug']);
+    assert.deepEqual(
+      w.alerts.filter((a) => a.code === 'bug-storm'),
+      [{ code: 'bug-storm', severity: 'bug', codes: ['t1-buy'] }],
+    );
+    w.sink.report('t1-exit', bug);
+    assert.equal(w.alerts.filter((a) => a.code === 'bug-storm').length, 1, 'once per process');
+  });
+
+  it('five spread over more than ten minutes do not; warnings, quiet faults and latch faults do not count', () => {
+    const w = sinkWorld();
+    for (let i = 0; i < 5; i += 1) {
+      w.sink.report('t1-buy', bug);
+      w.advance(150_001);
+    }
+    for (let i = 0; i < 6; i += 1) {
+      w.sink.report('t1-buy', fault('error:rent-unknown', 'intent', { warn: true }));
+      w.sink.report('t1-buy', fault('error:slot-unknown', 'intent'));
+    }
+    assert.deepEqual(w.latch.blocked(), []);
+    const latched = sinkWorld();
+    for (let i = 0; i < 6; i += 1) {
+      latched.sink.report('t1-buy', fault('error:storage-bad-cell', 'latch', { bug: true }));
+    }
+    assert.equal(latched.alerts.filter((a) => a.code === 'bug-storm').length, 0, 'a latch fault latches on its own');
+  });
+
+  it('a clock that steps back does not wipe the faults it just saw (run29): they still count, and nothing throws', () => {
+    const w = sinkWorld();
+    for (let i = 0; i < 4; i += 1) {
+      w.sink.report('t1-buy', bug);
+    }
+    w.advance(-3_600_000); // the four are seconds old in real time, an hour "ahead" of the clock
+    w.sink.report('t1-buy', bug);
+    assert.deepEqual(w.latch.blocked(), ['bug'], 'the fifth makes the storm');
   });
 });

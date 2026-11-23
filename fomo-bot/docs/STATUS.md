@@ -198,18 +198,42 @@ can trade, and no key or account exists anywhere.
     "review pending". On Nov 23 both re-checked it: the security reviewer CONFIRMED, the risk
     reviewer APPROVED WITH NOTES. Their new notes are small conditions for the exit and health
     loops (keep the slot reading fresh during long outages, and alert in two quiet failure cases).
+- Part 6d-2 is built (tests first) and REVIEWED: both reviewers approved it with notes on Nov 23,
+  and it joined the main work with their two fixes (below). It holds the steps that turn a
+  strategy's buy or a sell into an approval:
+  - A buy is one locked database step: it reads your limits, halts, KILL, pause, the day's count,
+    the positions and the money, asks the risk engine, and writes the result. If anything fails half
+    way, nothing of it is saved, and the approval only goes out after the save.
+  - A sell reads no stop at all, so KILL or a halt can never keep a position from being sold. An
+    unknown chain slot or a bad request writes nothing, and every refused sell alerts you; five in a
+    row for one position raise an "exit blocked" alert.
+  - Tested hard: every database statement made to fail in turn in five ways; up to six processes
+    racing for the last free slot (exactly one wins, 50 rounds); a KILL from another process; a crash
+    in the middle; 200 random runs checking that no limit is ever broken; a new rule that no code
+    inside a database step can swallow an error. 1,165 tests pass. 130 deliberate bugs were planted
+    one at a time, and the tests caught every one in the end; the first runs found four weak tests
+    and one rule that should be stricter, all fixed. Building it also turned up a trap: a sell for a
+    position that is not open would have stopped all new buys; now it just alerts.
+  - The review found two things to fix, both done and confirmed: a sell that can never pass (its
+    fee budget is spent) no longer uses up the position's sell numbers, so it can always still be sold
+    later; and the check that no code inside a database step can swallow an error now also catches
+    three sneakier ways of handing that step on. Their other notes are conditions for later parts.
+- For you to know: in paper, the "free SOL" limit can never be the one that stops a buy, because the
+  50% exposure limit always stops it first. That is fine, and the reason is written down for the
+  reviewers.
 - For you to know before live: at 5% per trade, live trading needs at least 0.4 SOL in the
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: the rest of step 6 (6d-2 the buy and sell transactions, 6d-3 the start-up checks, 6e the
-  settings and day-state transactions); then chain clients, the paper engine, Telegram and
+- Next: the reviews of 6d-3 (the start-up checks) and 6e (the settings and day-state transactions),
+  both already built on the separate branch; then chain clients, the paper engine, Telegram and
   logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
-- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 50% (settings,
-  accounting, risk engine and the storage files done; the transactions that use them next); the
-  whole build about 24-28%. Proving an edge on paper takes weeks on top of that.
+- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 55% (settings,
+  accounting, risk engine, the storage files and the approval transactions done, the last two parts
+  awaiting review; the start-up checks next); the whole build about 26-30%. Proving an edge on paper
+  takes weeks on top of that.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.

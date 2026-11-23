@@ -16,11 +16,13 @@ import { insertOpening, readPosition } from '../../../src/storage/repo-book.ts';
 import * as ordersFile from '../../../src/storage/repo-orders.ts';
 import {
   ORDER_STATUSES,
+  buyTokenExpiry,
   insertApproval,
   insertDecision,
   insertEntryIntent,
   insertExitIntent,
   intentExists,
+  outstandingExitApprovals,
   type NewDecision,
   type NewEntryIntent,
   type NewExitIntent,
@@ -112,8 +114,19 @@ const intentRow = (db: Db, id: string) => db.get('SELECT * FROM intents WHERE id
 const approvalRow = (db: Db, id: string) => db.get('SELECT * FROM approvals WHERE token_id = ?', id);
 
 describe('the orders file: only what it may do', () => {
-  it('exports the intent, decision and approval writers, the two order readers and the order statuses, and nothing else', () => {
-    assert.deepEqual(Object.keys(ordersFile).sort(), ['ORDER_STATUSES', 'buyOrderOf', 'exitsInFlight', 'insertApproval', 'insertDecision', 'insertEntryIntent', 'insertExitIntent', 'intentExists']);
+  it('exports the intent, decision and approval writers, the order and approval readers and the order statuses, and nothing else', () => {
+    assert.deepEqual(Object.keys(ordersFile).sort(), [
+      'ORDER_STATUSES',
+      'buyOrderOf',
+      'buyTokenExpiry',
+      'exitsInFlight',
+      'insertApproval',
+      'insertDecision',
+      'insertEntryIntent',
+      'insertExitIntent',
+      'intentExists',
+      'outstandingExitApprovals',
+    ]);
     assert.deepEqual([...ORDER_STATUSES], ['approved', 'submitted', 'landed', 'failed', 'expired']);
     assert.ok(Object.isFrozen(ORDER_STATUSES));
   });
@@ -578,6 +591,74 @@ describe('approvals: risk\'s own token for an approved decision, bound to the pl
         insertDecision(tx, approvedEntry());
       });
       refusedInside(db, (tx) => insertApproval(tx, issue(h, BUY), canonicalPlan(BUY), T), 'bad-param', /mode/);
+    });
+  });
+});
+
+describe('the approval readers of step 6d-2: exit tokens still usable, and when a buy token expires', () => {
+  /** An open position with one exit intent and its approved decision, ready for an exit token. */
+  function withExitDecided(db: Db, seq = 0): void {
+    db.transaction((tx) => {
+      insertExitIntent(tx, { ...EXIT, id: `exit-p1-${seq}`, exitSeq: seq });
+      insertDecision(tx, { outcome: 'exit-approved', intentId: `exit-p1-${seq}`, at: T + 2 + seq, configVersion: 1, slot: 1_005n });
+    });
+  }
+  /** What T2 does to a token, written by hand. */
+  const useToken = (db: Db, tokenId: string, slot: bigint): void => {
+    db.transaction((tx) => tx.run('UPDATE approvals SET consumed_at = ?, consumed_slot = ? WHERE token_id = ?', BigInt(T + 9), slot, tokenId));
+  };
+
+  it('counts an unused exit token until its expiry slot, inclusive, and not after it is used (review S, risk 3b)', () => {
+    withDb((db, h) => {
+      boughtUpToDecision(db);
+      const buy = issue(h, BUY);
+      db.transaction((tx) => insertApproval(tx, buy, canonicalPlan(BUY), T + 1));
+      holdTokens(db, 'p1');
+      assert.equal(outstandingExitApprovals(db, 'p1', 1_000n), 0, 'a buy token is no exit');
+      withExitDecided(db);
+      const sell = issue(h, SELL);
+      db.transaction((tx) => insertApproval(tx, sell, canonicalPlan(SELL), T + 3));
+      assert.equal(sell.expiresAtSlot, 1_025n);
+      assert.equal(outstandingExitApprovals(db, 'p1', 1_000n), 1);
+      assert.equal(outstandingExitApprovals(db, 'p1', 1_025n), 1, 'usable at its expiry slot');
+      assert.equal(outstandingExitApprovals(db, 'p1', 1_026n), 0, 'expired');
+      assert.equal(outstandingExitApprovals(db, 'p2', 1_000n), 0, 'another position');
+      useToken(db, sell.id, 1_010n);
+      assert.equal(outstandingExitApprovals(db, 'p1', 1_000n), 0, 'used: exitsInFlight counts its order instead');
+      withExitDecided(db, 1);
+      db.transaction((tx) => insertApproval(tx, issue(h, CLOSE), canonicalPlan(CLOSE), T + 4));
+      assert.equal(outstandingExitApprovals(db, 'p1', 1_000n), 1, 'a close token counts too');
+    });
+  });
+
+  it("a buy token's expiry slot, or null before the position has one", () => {
+    withDb((db, h) => {
+      assert.equal(buyTokenExpiry(db, 'p1'), null);
+      boughtUpToDecision(db);
+      assert.equal(buyTokenExpiry(db, 'p1'), null, 'a decision without its token');
+      const buy = issue(h, BUY);
+      db.transaction((tx) => insertApproval(tx, buy, canonicalPlan(BUY), T + 1));
+      assert.equal(buyTokenExpiry(db, 'p1'), 1_025n);
+      useToken(db, buy.id, 1_001n);
+      assert.equal(buyTokenExpiry(db, 'p1'), 1_025n, 'used or not, the slot it expires at');
+      holdTokens(db, 'p1');
+      withExitDecided(db);
+      db.transaction((tx) => insertApproval(tx, issue(h, SELL), canonicalPlan(SELL), T + 3));
+      assert.equal(buyTokenExpiry(db, 'p1'), 1_025n, 'an exit token is not the buy token');
+    });
+  });
+
+  it('two buy tokens for one position (a database no writer here can make) are refused, never read as one (review U, security 5)', () => {
+    const broken = { get: () => undefined, all: () => [{ expires_at_slot: 1_025n }, { expires_at_slot: 2_000n }] } as unknown as Db;
+    storageError(() => buyTokenExpiry(broken, 'p1'), 'row-count');
+  });
+
+  it('refuses a bad id or slot before reading', () => {
+    withDb((db) => {
+      storageError(() => outstandingExitApprovals(db, 'bad id', 1n), 'bad-param');
+      storageError(() => outstandingExitApprovals(db, 'p1', -1n), 'bad-param');
+      storageError(() => outstandingExitApprovals(db, 'p1', 2n ** 63n), 'bad-param');
+      storageError(() => buyTokenExpiry(db, 'bad id'), 'bad-param');
     });
   });
 });
