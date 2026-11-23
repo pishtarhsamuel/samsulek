@@ -148,7 +148,11 @@ export interface ExitRequest {
 export type ExitOutcome =
   | { readonly kind: 'approved'; readonly intentId: string; readonly exitSeq: number; readonly token: ApprovalToken; readonly plan: CheckedPlan }
   | { readonly kind: 'refused'; readonly intentId: string; readonly exitSeq: number; readonly problems: readonly (PlanProblem | 'not-an-exit')[] }
-  /** Nothing was read or written (the slot was unknown, the request or the position unreadable): no exit number used. */
+  /**
+   * Nothing was written and no exit number used: the slot was unknown, the request or the position
+   * unreadable, or (code `auto-exits-stopped`) the automatic exits of the position are stopped for its
+   * spent fee budget, which no retry can change (review U, risk 1).
+   */
   | { readonly kind: 'not-run'; readonly code: string }
   | { readonly kind: 'error'; readonly code: string; readonly scope: FaultScope; readonly recorded: boolean };
 
@@ -403,7 +407,12 @@ export function approveBuyTx(deps: EngineDeps, req: EntryRequest): EntryOutcome 
 
 type ExitResult =
   | { readonly kind: 'refused'; readonly positionId: string; readonly intentId: string; readonly exitSeq: number; readonly problems: readonly (PlanProblem | 'not-an-exit')[] }
-  | { readonly kind: 'approved'; readonly positionId: string; readonly intentId: string; readonly exitSeq: number; readonly token: ApprovalToken; readonly plan: CheckedPlan };
+  | { readonly kind: 'approved'; readonly positionId: string; readonly intentId: string; readonly exitSeq: number; readonly token: ApprovalToken; readonly plan: CheckedPlan }
+  | { readonly kind: 'stopped'; readonly positionId: string };
+
+/** risk's own problem name for it, so the exit watch alerts exit-fee-budget as for a refusal (risk 8). */
+const AUTO_STOPPED: readonly PlanProblem[] = Object.freeze(['auto-exits-stopped']);
+const AUTO_STOPPED_OUTCOME: ExitOutcome = Object.freeze({ kind: 'not-run', code: 'auto-exits-stopped' });
 
 /** T1 for an exit (s.16.5.2): no flag is read, every exit fact is re-read inside the transaction. */
 export function approveExitTx(deps: EngineDeps, req: ExitRequest): ExitOutcome {
@@ -441,6 +450,12 @@ function exitOnce(deps: EngineDeps, req: ExitRequest, retried: boolean): ExitOut
       const { versionId, tunables } = readActiveConfig(tx);
       // until T3: failed_fees is lifetime, so this budget never resets (C55, D5 of s.16.11)
       const budgetLeft = lamports(FAILED_FEE_BUDGET > p.failedFees ? FAILED_FEE_BUDGET - p.failedFees : 0n);
+      if (budgetLeft === 0n) {
+        // risk would refuse every automatic exit as auto-exits-stopped, and no retry can change that:
+        // nothing is written, so a loop that keeps asking never uses up the position's exit numbers
+        // (review U, risk 1). The owner's /sell (Phase 3) is no automatic exit and is not stopped here.
+        return { kind: 'stopped', positionId: p.id };
+      }
       const context: PlanContext = Object.freeze({
         currentSlot: slot,
         intentId,
@@ -479,6 +494,10 @@ function exitOnce(deps: EngineDeps, req: ExitRequest, retried: boolean): ExitOut
     });
 
     // after COMMIT
+    if (result.kind === 'stopped') {
+      deps.exitWatch.refused(result.positionId, AUTO_STOPPED); // exit-fee-budget, and a run toward exit-blocked
+      return AUTO_STOPPED_OUTCOME;
+    }
     if (result.exitSeq + 1 >= EXIT_SEQ_ALERT) {
       alertSafely(deps.alerts, deps.latch, { code: 'exit-seq-high', severity: 'warn', codes: [result.positionId] });
     }

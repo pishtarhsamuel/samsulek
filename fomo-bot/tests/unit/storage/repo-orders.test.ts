@@ -648,6 +648,11 @@ describe('the approval readers of step 6d-2: exit tokens still usable, and when 
     });
   });
 
+  it('two buy tokens for one position (a database no writer here can make) are refused, never read as one (review U, security 5)', () => {
+    const broken = { get: () => undefined, all: () => [{ expires_at_slot: 1_025n }, { expires_at_slot: 2_000n }] } as unknown as Db;
+    storageError(() => buyTokenExpiry(broken, 'p1'), 'row-count');
+  });
+
   it('refuses a bad id or slot before reading', () => {
     withDb((db) => {
       storageError(() => outstandingExitApprovals(db, 'bad id', 1n), 'bad-param');

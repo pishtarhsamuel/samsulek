@@ -4342,3 +4342,36 @@ was looser than it should be (the bug window above). Both tests are fixed and th
 three are caught now (the third as its opposite). A follow-up run of 9 for the not-sellable rule, the
 stricter window and the V7 canaries caught 8 and showed one more weak test (no exit of an exiting
 position): fixed, and caught. 130 planted in all, every one caught.
+
+Review U (REVIEWS.md U, 2026-11-23): both reviewers APPROVED WITH NOTES. Fixed before this step joins
+the working branch (on a branch from this step's last commit, so the step joins with its own fixes):
+- Risk 1: an automatic exit whose fee budget is spent is `not-run` with code `auto-exits-stopped`:
+  nothing is written and no exit number is used, so a loop that keeps asking can no longer use up the
+  position's 1,000,000 exit numbers (at 10 a second, in about 28 hours) and leave it unsellable. It
+  still alerts `exit-fee-budget` and counts toward `exit-blocked`. Test: an hour of asks every 2 s
+  leaves the database and `exitSeq` unchanged. The owner's /sell (Phase 3) is not stopped by it.
+- Security 1: rule 4 of the no-catch rule (16.7.4) now treats as handing the transaction on any
+  argument that can be called (a closure over the transaction kept in a variable, a bound function)
+  and any argument holding a Reader, Tx or Db (an object or an array, three levels deep), not only a
+  function written in place or the handle itself. Six canaries (the reviewer's three reproductions,
+  an inline bind, a nested object, an array); a named function handed to the lib and an object of
+  functions with no handle stay allowed; the real src/ is clean. The LIMIT says what is still not
+  seen (a handle deeper than three levels or behind a type rewritten by hand).
+- Security 5: `buyTokenExpiry` refusing two buy tokens for one position is pinned by a test.
+
+Conditions from review U, for later steps:
+- Exit loop (risk 1): the backoff per position never re-asks an exit whose refusal is permanent
+  (`auto-exits-stopped`, a spent budget), and keeps a minimum interval between asks for one position;
+  both tested.
+- Engine loop (risk 2): the request's market facts (pool reserves, `poolMinTrade`, `quotedOut`,
+  `rentRequired`, `attemptsAllowed`, `simulatedCu`, the p95 exit cost) come from the engine's own venue
+  read at the quote slot, never from the plan's author; tested with a plan and a market made by
+  separate code.
+- Before Phase 8 (risk 4): exits fall back to the hard exit caps when the stored config does not
+  decode (with review T note 7, the exits-only start).
+- Before Phase 3's Telegram sink (security 3): the alert boundary runs every code through the secret
+  filter (an exit alert's position id is only id-checked; D13).
+- Follow-ups, not blocking: the invariant-2 property also checks the percentage caps on the stored
+  rows (risk 3, `buyLimitViolations` of s.16.9); the repo-orders writers restricted to
+  app/approve-tx.ts (security 2); a refusal whose own mint or id trips the secret filter recorded under
+  a fixed placeholder instead of latching entries (security 4).
