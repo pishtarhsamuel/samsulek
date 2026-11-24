@@ -29,7 +29,8 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   core: [],
   config: ['core', 'storage'],
   storage: ['core'],
-  chain: ['core', 'config'],
+  // pure, and only the pure core/ (step 7, CHAIN_DESIGN s.10 rule 3): nothing in chain/ needs config/
+  chain: ['core'],
   venues: ['core'],
   ingest: ['core', 'chain', 'venues', 'fomo'],
   fomo: ['core', 'venues'],
@@ -138,6 +139,9 @@ const RESTRICTED_FILES: Readonly<Record<string, { readonly allows: (rel: string)
     allows: (rel) => rel.startsWith('app/') || rel === 'storage/repo-orders.ts' || rel === 'storage/repo-redeem.ts',
     who: 'app/, storage/repo-orders.ts and storage/repo-redeem.ts',
   },
+  // the real clocks and timers: only the process entry holds them and hands them in, so every other
+  // file takes the interfaces and its tests stay deterministic (step 7, CHAIN_DESIGN s.10 rule 5)
+  'core/clock.ts': { allows: (rel) => rel.startsWith('cli/'), who: 'cli/ (the process entry hands the clocks in)' },
 };
 /**
  * Who each writer of the audit chain may write as (review Q re-check, security R1): its every call
@@ -189,7 +193,25 @@ const PURE: Readonly<Record<string, readonly string[]>> = {
   strategies: [],
   exits: [],
   risk: ['node:crypto'], // HMAC approval tokens and plan hashes (CRYPTO_ALLOWED only)
+  chain: [], // step 7: timers, clocks and the transports are handed in; only NETWORK_FILES name their globals
 };
+/**
+ * The only files that reach the network (step 7, CHAIN_DESIGN s.10 rules 1 and 2), each with the only
+ * globals beyond plain ECMAScript it may name: the fetch transport and the WebSocket factory. Every other
+ * file is handed a transport. Telegram and the Anthropic client add their own named file in their step.
+ * Keys are exact (a look-alike name is another file on Linux).
+ */
+const NETWORK_FILES: Readonly<Record<string, ReadonlySet<string>>> = {
+  'chain/http.ts': new Set(['fetch', 'AbortSignal', 'URL', 'Headers']),
+  'chain/ws-socket.ts': new Set(['WebSocket', 'URL']),
+};
+/** Globals that open a connection: named, in every folder, only by the network file allowed it. */
+const NETWORK_GLOBALS = new Set(['fetch', 'WebSocket', 'WebSocketStream', 'EventSource', 'XMLHttpRequest']);
+/** Modules that open connections, run code elsewhere or watch the network, with or without "node:". */
+const NETWORK_MODULES = new Set(['http', 'https', 'http2', 'net', 'tls', 'dgram', 'dns', 'diagnostics_channel', 'worker_threads', 'child_process', 'vm', 'inspector', 'undici']);
+/** chain/ names no method that sends or asks for funds, in any case (step 7, CHAIN_DESIGN s.10 rule 4). */
+const SENDING_METHODS = new Set(['sendtransaction', 'sendrawtransaction', 'requestairdrop']);
+const DOOR = 'reaches the network: only chain/http.ts and chain/ws-socket.ts do (step 7, CHAIN_DESIGN s.10)';
 /** Globals that reach the outside world, the clock or code generation: never named in pure code. */
 const AMBIENT = new Set([
   'process', 'globalThis', 'global', 'fetch', 'crypto', 'performance', 'WebSocket', 'XMLHttpRequest',
@@ -370,10 +392,22 @@ export function checkSource(rel: string, text: string): string[] {
   const pureFile = Object.hasOwn(PURE_FILES, rel.toLowerCase()) ? PURE_FILES[rel.toLowerCase()] : undefined;
   const pure = CLOCK_EXEMPT.has(rel) ? undefined : rel === RNG_FILE ? RNG_BUILTINS : (pureFile ?? PURE[folder]);
   const declared = pure === undefined ? new Set<string>() : declaredNames(source);
+  /** The globals this file alone may name, beyond plain ECMAScript (a network file), or none. */
+  const networkGlobals = Object.hasOwn(NETWORK_FILES, rel) ? NETWORK_FILES[rel] : undefined;
+  const mayName = (name: string): boolean => networkGlobals?.has(name) ?? false;
 
   const checkSpecifier = (spec: string, typeOnly: boolean, reexport = false, dynamic = false): void => {
     if ((spec === 'node:sqlite' || spec === 'sqlite') && (rel !== SQLITE_FILE || reexport)) {
       problems.push(`${rel}: only storage/sqlite.ts may import node:sqlite, types included, and it hands none of it on (everything else uses its checked wrapper)`);
+    }
+    // step 7 rule 2: no module that opens a connection, in any folder, but a network file (types are erased)
+    const moduleName = (spec.startsWith('node:') ? spec.slice('node:'.length) : spec).split('/')[0] ?? '';
+    if (!typeOnly && NETWORK_MODULES.has(moduleName) && networkGlobals === undefined) {
+      problems.push(`${rel}: ${spec} ${DOOR}`);
+    }
+    // step 7 rule 4: no signing in chain/, so not even a type of node:crypto
+    if (folder === 'chain' && (spec === 'node:crypto' || spec === 'crypto')) {
+      problems.push(`${rel}: chain/ never imports node:crypto, types included (nothing in chain/ signs)`);
     }
     if (pureFile !== undefined && !typeOnly && !spec.startsWith('node:')) {
       problems.push(`${rel}: a pure file outside the pure folders imports and re-exports nothing at runtime ("${spec}")`);
@@ -563,12 +597,38 @@ export function checkSource(rel: string, text: string): string[] {
       if (node.text === 'crypto' && !inTypeContext(node)) {
         problems.push(`${rel}: the global crypto (randomness) is never used: core/rng.ts imports randomBytes`);
       }
-      if (pure !== undefined && AMBIENT.has(node.text)) {
+      if (pure !== undefined && AMBIENT.has(node.text) && !mayName(node.text)) {
         problems.push(`${rel}: ${node.text} is not allowed in ${folder}/ (pure code)`);
       }
       const free = !isDeclarationName(node) && !declared.has(node.text) && !inTypeContext(node);
-      if (pure !== undefined && free && !ES_GLOBALS.has(node.text)) {
+      if (pure !== undefined && free && !ES_GLOBALS.has(node.text) && !mayName(node.text)) {
         problems.push(`${rel}: the global ${node.text} is not allowed in ${folder}/ (pure code: plain ECMAScript only)`);
+      }
+      // step 7 rule 2, in every folder: the network's globals only in their network file
+      if (NETWORK_GLOBALS.has(node.text) && !inTypeContext(node) && !isTypePosition(node) && !mayName(node.text)) {
+        problems.push(`${rel}: ${node.text} ${DOOR}`);
+      }
+      // and the global object only through a named member: an alias, a spread or a hand-off of it reaches every global
+      if ((node.text === 'globalThis' || node.text === 'global') && !inTypeContext(node) && !isTypePosition(node)) {
+        const p = node.parent;
+        const named =
+          (ts.isPropertyAccessExpression(p) && p.expression === node) ||
+          (ts.isElementAccessExpression(p) && p.expression === node && ts.isStringLiteralLike(p.argumentExpression));
+        if (!named) {
+          problems.push(`${rel}: a bare ${node.text} (aliased, spread or handed on) reaches every global, the network's included: name its member`);
+        }
+      }
+    }
+    // step 7 rule 4: chain/ never names a sending method, as a name, a member or a string, in any case
+    if (folder === 'chain' && (ts.isIdentifier(node) || ts.isStringLiteralLike(node)) && SENDING_METHODS.has(node.text.toLowerCase())) {
+      problems.push(`${rel}: chain/ never names a sending method (${node.text}): the paper client reads only`);
+    }
+    // step 7 rule 2: globalThis.fetch and global['WebSocket'] are the same doors, in every file
+    if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) && ts.isIdentifier(node.expression)) {
+      const owner = node.expression.text;
+      const member = ts.isPropertyAccessExpression(node) ? node.name.text : ts.isStringLiteralLike(node.argumentExpression) ? node.argumentExpression.text : null;
+      if ((owner === 'globalThis' || owner === 'global') && member !== null && NETWORK_GLOBALS.has(member) && !mayName(member)) {
+        problems.push(`${rel}: ${owner}.${member} ${DOOR}`);
       }
     }
     const dotted = ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression);
@@ -1808,6 +1868,70 @@ describe('architecture: imports and determinism', () => {
       ['strategies/x.ts', "import { type Plan } from '../execution/planner.ts';"],
       ['nowhere/x.ts', 'export {};'],
     ]);
+  });
+
+  it('CANARY: chain/ is pure, only its two network files reach the network, and the real clocks reach only cli/ (step 7a; CHAIN_DESIGN s.10, rules 1 to 5)', () => {
+    const door = 'reaches the network';
+    const modules = [
+      'node:http', 'node:https', 'node:http2', 'node:net', 'node:tls', 'node:dgram', 'node:dns', 'node:diagnostics_channel',
+      'node:worker_threads', 'node:child_process', 'node:vm', 'node:inspector', 'http', 'net', 'undici',
+    ];
+    flaggedFor([
+      // rule 1: chain/ is pure; each network file names only its own globals
+      ['chain/budget.ts', 'export const t = (): void => { setTimeout(() => undefined, 1); };', 'setTimeout is not allowed in chain/ (pure code)'],
+      ['chain/client.ts', 'export const k = (): string | undefined => process.env.KEY;', 'process is not allowed in chain/ (pure code)'],
+      ['chain/client.ts', "export const f = (): Promise<unknown> => fetch('https://x');", 'fetch is not allowed in chain/ (pure code)'],
+      ['chain/ws.ts', "export const w = (): unknown => new WebSocket('wss://x');", 'WebSocket is not allowed in chain/ (pure code)'],
+      ['chain/http.ts', "export const w = (): unknown => new WebSocket('wss://x');", 'WebSocket is not allowed in chain/ (pure code)'],
+      ['chain/ws-socket.ts', "export const f = (): Promise<unknown> => fetch('https://x');", 'fetch is not allowed in chain/ (pure code)'],
+      ['chain/ws-socket.ts', "export const h = (): unknown => new Headers();", 'the global Headers is not allowed in chain/ (pure code'],
+      ['chain/http.ts', 'export const t = (): void => { setTimeout(() => undefined, 1); };', 'setTimeout is not allowed in chain/ (pure code)'],
+      ['chain/x.ts', "export const u = (s: string): unknown => new URL(s);", 'the global URL is not allowed in chain/ (pure code'],
+      // rule 2: the network door, in every folder
+      ['app/x.ts', "export const f = (): Promise<unknown> => fetch('https://x');", door],
+      ['cli/x.ts', "export const w = (): unknown => new WebSocket('wss://x');", door],
+      ['ops/x.ts', "export const e = (): unknown => new EventSource('https://x');", door],
+      ['app/x.ts', 'export const x = (): unknown => new XMLHttpRequest();', door],
+      ['app/x.ts', "export const s = (): unknown => new WebSocketStream('wss://x');", door],
+      ['app/x.ts', "export const f = (): Promise<unknown> => globalThis.fetch('https://x');", door],
+      ['storage/x.ts', "export const f = (): Promise<unknown> => globalThis['fetch']('https://x');", door],
+      ['cli/x.ts', "export const w = (): unknown => new global.WebSocket('wss://x');", door],
+      ['app/x.ts', "const g = globalThis;\nexport const f = (): Promise<unknown> => g.fetch('https://x');", 'a bare globalThis'],
+      ['app/x.ts', 'export const f = (o: object | undefined): object => o ?? global;', 'a bare global'],
+      ['app/x.ts', 'export const f = (): object => ({ ...globalThis });', 'a bare globalThis'],
+      ...modules.map((spec): readonly [string, string, string] => ['app/x.ts', `import * as m from '${spec}';\nexport const x = m;`, door]),
+      ['app/x.ts', "export const m = (): Promise<unknown> => import('node:https');", door],
+      ['ops/x.ts', "export * from 'node:net';", door],
+      // rule 3: chain/ imports core/ only
+      ['chain/x.ts', "import { TUNABLES } from '../config/tunables.ts';\nexport const t = TUNABLES;", 'chain/ may not import config/'],
+      // rule 4: no crypto and no sending in chain/
+      ['chain/x.ts', "import { createHash } from 'node:crypto';\nexport const h = createHash;", 'chain/ never imports node:crypto'],
+      ['chain/x.ts', "import type { Hash } from 'node:crypto';\nexport type H = Hash;", 'chain/ never imports node:crypto'],
+      ['chain/x.ts', "export const m = 'sendTransaction';", 'chain/ never names a sending method'],
+      ['chain/x.ts', "export const m = 'SENDRAWTRANSACTION';", 'chain/ never names a sending method'],
+      ['chain/x.ts', 'export const m = `requestAirdrop`;', 'chain/ never names a sending method'],
+      ['chain/x.ts', 'export interface C { sendTransaction(t: string): void }', 'chain/ never names a sending method'],
+      // rule 5: the real clocks only from cli/
+      ['app/engine.ts', "import { systemWall } from '../core/clock.ts';\nexport const c = systemWall;", 'core/clock.ts may be imported at runtime only by cli/'],
+      ['chain/x.ts', "import { systemMono } from '../core/clock.ts';\nexport const c = systemMono;", 'core/clock.ts may be imported at runtime only by cli/'],
+      ['storage/x.ts', "export { systemWall } from '../core/clock.ts';", 'core/clock.ts may be imported at runtime only by cli/'],
+      ['cli/x.ts', "export { systemWall } from '../core/clock.ts';", 'core/clock.ts may be imported at runtime only by cli/'], // and re-exported by none
+    ]);
+    for (const [rel, text] of [
+      ['chain/http.ts', "export const f = (u: string, s: AbortSignal): Promise<unknown> => fetch(new URL(u), { signal: AbortSignal.any([s]), headers: new Headers(), redirect: 'error' });"],
+      ['chain/ws-socket.ts', 'export const w = (u: string): unknown => new WebSocket(new URL(u));'],
+      ['chain/x.ts', "import type { MonoClock, Timers } from '../core/clock.ts';\nexport const n = (c: MonoClock, t: Timers): number => { void t; return c.nowMs(); };"],
+      ['chain/x.ts', "import { parseLossless } from '../core/json.ts';\nexport const p = parseLossless;"],
+      ['chain/x.ts', "export const m = 'getMultipleAccounts';"],
+      ['cli/start.ts', "import { systemMono, systemTimers, systemWall } from '../core/clock.ts';\nexport const c = [systemWall, systemMono, systemTimers];"],
+      ['app/x.ts', "import type { WallClock } from '../core/clock.ts';\nexport const c = (w: WallClock): number => w.now();"],
+      ['app/x.ts', "import type { IncomingMessage } from 'node:http';\nexport type M = IncomingMessage;"], // a type is erased
+      ['app/x.ts', 'export const f = (deps: { fetch(): number }): number => deps.fetch();'], // a member named fetch is not the global
+      ['app/x.ts', 'export const s = (v: string): string => globalThis.encodeURIComponent(v);'], // a named member of globalThis
+      ['core/clock.ts', 'export const now = (): number => Date.now();'],
+    ] as const) {
+      assert.deepEqual(checkSource(rel, text), [], `${rel}: ${text}`);
+    }
   });
 
   it('CANARY: catches every way to read the clock or randomness outside core/clock.ts and core/rng.ts', () => {

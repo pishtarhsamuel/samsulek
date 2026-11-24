@@ -557,3 +557,41 @@ Each is recommended as written.
 
 Owner question: none. The one trade-off the owner may care about (R7): strict checking can pause
 paper trading after a provider upgrade until a small fix ships. It never trades on a misread answer.
+
+## 16. As built in step 7a, and what changed
+
+Status: UNREVIEWED, on `claude/exciting-hamilton-2d7lto-6d2-unreviewed`; reviewed with this design.
+
+Built, tests first: core/json.ts (`parseLossless`, `stringifyLossless`, `JSON_MAX_DEPTH` = 64, `Json`),
+core/solana.ts (`Address`, `Signature`, `Slot`, `BlockHeight` and their makers), core/encode.ts
+(`base58Exact`, `base64Strict`), core/clock.ts (`WallClock`, `MonoClock`, `Timers`, `systemWall`,
+`systemMono`, `systemTimers`), and rules 1 to 5 of s.10 with their canaries.
+
+Differences from s.3 and s.10:
+- Deep nesting is refused before the parse, by a scan that counts brackets outside strings, not by
+  catching V8's RangeError: the reviver's walk is recursive, and a check that comes first is
+  deterministic. Every parsed array and object is frozen.
+- `stringifyLossless` is written by hand instead of through `JSON.rawJSON`: it refuses what
+  JSON.stringify would drop or rewrite (NaN, the infinities, undefined, functions, symbols, array holes,
+  objects with a prototype other than Object's or none) and nesting deeper than 64.
+- The decoders return null for bad data and throw a TypeError only for a call that is not a string, or
+  a bad length or bound; each checks its size bound before decoding (base58 needs at most two characters
+  per byte).
+- The timers refuse a delay that is not whole milliseconds from 0 to 2^31 - 1 (Node fires a longer one
+  at once).
+- Rule 2: `globalThis` and `global` are allowed only directly followed by a named member (a dot, or an
+  index that is a string literal), in every folder; the module list holds the bare names too (`http`,
+  `net`, `undici`).
+- Rule 4 is stricter than written: any name, member, method signature or string in chain/ that equals a
+  sending method in any case is refused.
+
+Written down, for the reviewers:
+- The docs that this design says to correct (ARCHITECTURE s.3, s.6 and s.12, THREAT_MODEL A9) are left as
+  they are until the reviewers rule on R3, R6, R8 and R9; TEST_PLAN's chain row no longer names zod.
+- core/clock.ts has no importer yet: cli/ hands the clocks in when the start command exists (Phase 7).
+
+Tests: TEST_PLAN.md s.3, "Done in step 7a". Planted bugs (scratchpad `mut/run40.py`): 50 in the first
+run, 46 caught; one weak test (a foreign character in the middle of a base58 text) was fixed, one
+unreachable line was removed, and two are equivalent (base64's character and length checks, which its
+re-encoding also enforces). Final: 49, 47 caught, 2 equivalent. Coverage: every line and branch of the
+four files.
