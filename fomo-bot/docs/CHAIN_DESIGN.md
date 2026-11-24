@@ -199,7 +199,7 @@ Transport (chain/http.ts), each rule a test:
 - `fetch(httpUrl, { method: 'POST', body, redirect: 'error', credentials: 'omit', signal:
   AbortSignal.any([timers.timeoutSignal(rule.timeoutMs), shutdown]), headers: { 'content-type':
   'application/json', accept: 'application/json' } })`. Keep-alive is undici's default (connection reuse
-  UNVERIFIED, U8). No proxy (the VPS needs none).
+  UNVERIFIED, U8). No proxy (the VPS needs none), enforced at the start (review X, security 1; s.17).
 - Request: `stringifyLossless` text, UTF-8 length at most 49,152 bytes (under the 50 KiB cap); longer
   is refused before acquire as `our-bug` 413.
 - Response: a `content-length` over the cap is refused unread. Otherwise `getReader()` counts decoded
@@ -276,7 +276,9 @@ strictly, and their other keys are ignored. Specific rules:
   (R10). An RPC could broadcast a signed transaction it was asked to simulate.
 
 Reads never go backwards. The client keeps one high-water mark of `confirmed` context slots (from
-context-bearing results and getSlot) and sends it as `minContextSlot`. A result whose `context.slot` is
+context-bearing results and getSlot) and sends it as `minContextSlot`. The mark rises only with slots
+the feed accepts: by at most `feed.currentSlot()`, never by a raw answer alone, so one wild answer
+cannot make every honest node look behind (review X, risk 1; s.17). A result whose `context.slot` is
 below what we sent is `went-back` (the node ignored it). Reads are 2-5 s apart, so only a node more
 than about 9-23 slots behind answers -32016 (how often: U3). Staleness: when the feed's slot is known
 and `context.slot + 150 < currentSlot()`, the result is `stale` (ARCHITECTURE s.12). Consumers keep
@@ -435,7 +437,7 @@ Clock (contract 8, security 5, security W1 note 4):
 
 | What fails | Detected by | What the bot does |
 |---|---|---|
-| Wrong cluster or a hostile endpoint | genesis hash differs (start, hourly, after unblock) | boot refuses or `wrong-cluster` latched; every call fails; entries off; alert |
+| Wrong cluster (a devnet or testnet URL, a misconfigured node) | genesis hash differs (start, hourly, after unblock) | boot refuses or `wrong-cluster` latched; every call fails; entries off; alert. It does not catch a hostile endpoint, which can return the right hash and lie about the rest: TLS, the provider choice and Phase 8's independent second provider are the defenses there (review X, security 2) |
 | Genesis unreadable at start | verifyCluster failure | every call `unverified`; retry every 10 s; entries off |
 | 429 | status 429 or body code 429 | method closed for Retry-After, shed +1, event; P0 denied: entries off |
 | 403 (IP blocked) | status 403 | provider blocked 15 min, entries off, alert; one P0 probe after |
@@ -449,7 +451,8 @@ Clock (contract 8, security 5, security W1 note 4):
 | Our request is wrong; new transaction version | -32600/-32601/-32602/-32700, 400/405/413/415, size checks; -32015 | `our-bug`, bug event, never retried; -32015 also "upgrade needed" (DECODE breaker, app) |
 | apiVersion changes | `context.apiVersion` | info event; strict decoders catch real shape changes |
 | WebSocket drops, never fires close, or flaps | error/close, watchdog 5 s, ack timeout; over 6 reconnects in 10 min | terminate, backoff 1-60 s with jitter, resubscribe; DATA_STALE entries off (app); exits on HTTP; flapping: entries stay off |
-| WebSocket flood, huge frame, unknown subscription | length over 65,536, queue over 5,000 (7h), per-generation id map | dropped and counted after receipt; breaker (app); memory limit (ops) |
+| WebSocket flood, unknown subscription | length over 65,536, queue over 5,000 (7h), per-generation id map | dropped and counted after receipt; breaker (app) |
+| A huge WebSocket frame | none before receipt: the built-in WebSocket buffers a whole frame first | a crash, not a drop: memory can run out and the process dies, exits stopping until the restart and boot; the ops memory limit is the guard, unless 7f reads frames by hand (review X, security 3; s.17) |
 | Clock wrong, or block time missing | TimeGuard verdict; getBlockTime null or error | skew: halt (contract 8); no or stale reading (after 10 min): entries off; exits continue |
 | A key in a URL or header (later) | `registerOwnSecret` at construction | refused everywhere it could leak; codes only in events |
 | Ticket never settled (bug); shutdown mid-call | connection slots full; shutdown signal | P0 denied, entries off, bug event on double settle; `shutdown`, nothing retried |
@@ -471,6 +474,7 @@ Clock (contract 8, security 5, security W1 note 4):
 | U11 | `api.mainnet.solana.com` from the VPS, and whether it is a separate pool | getGenesisHash and headers from the VPS | not used; 'http-2' stays unfed |
 | U12 | Whether WebSocket bytes count toward the 100 MB/30 s | not testable cheaply | counted anyway (`chargeStream`) |
 | U13 | The order of getRecentPrioritizationFees entries | from the recorded live answer, or one call | sorted locally, duplicates refused |
+| U14 | Whether Node 26.13.0's fetch follows `HTTPS_PROXY` without `NODE_USE_ENV_PROXY` (review X, security 1) | a local proxy on 127.0.0.1: fetch with each variable set and unset, counting what reaches the proxy | the start refuses every proxy variable either way |
 
 ## 13. Tests to write first (unit tests only, fake transports and in-process fake servers, never the network)
 
@@ -595,3 +599,43 @@ run, 46 caught; one weak test (a foreign character in the middle of a base58 tex
 unreachable line was removed, and two are equivalent (base64's character and length checks, which its
 re-encoding also enforces). Final: 49, 47 caught, 2 equivalent. Coverage: every line and branch of the
 four files.
+
+## 17. Review X: the design changes, and the conditions for later sub-steps
+
+Review X (REVIEWS.md X), of this design, 7a and security's N1: both reviewers APPROVED WITH NOTES;
+nothing blocks, and the design, 7a and N1 join the working branch. Changed in this design now:
+- s.5 (risk 1, MEDIUM): the minContextSlot high-water mark rises only with slots the feed accepts (at
+  most `feed.currentSlot()`), never with a raw answer. Due by 7e, with a test: one wild `context.slot`,
+  then honest reads still succeed. U3 (how often nodes lag) decides later between the exact mark and a
+  small margin.
+- s.4 (security 1): "no proxy" is enforced. cli/'s start command refuses to start while
+  `NODE_TLS_REJECT_UNAUTHORIZED` is set to anything but 1, or `NODE_EXTRA_CA_CERTS`, `NODE_USE_ENV_PROXY`,
+  `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (any case) are set: they would switch off certificate checks,
+  add trusted authorities or reroute traffic. Written in 7c's design notes, built with the start
+  command (Phase 7), tested there. New U14: does Node 26.13.0's fetch follow `HTTPS_PROXY` without
+  `NODE_USE_ENV_PROXY`? (scratch test with a local proxy; until then, refused either way).
+- s.11 (security 2): the genesis check catches a wrong cluster, not a hostile endpoint.
+- s.7 and s.11 (security 3): a huge WebSocket frame is a crash risk, guarded by the ops memory limit. 7f
+  decides between the built-in WebSocket with that limit and a hand-written frame reader over a
+  `node:http` upgrade (which would need its own network-file exception and review).
+
+Conditions, each due by the sub-step or phase named:
+- 7d (security 4 and 5): `parseLossless` keeps a plain-digit source of more than 20 digits a JS number
+  (a u64 needs at most 20), so a huge digit string costs nothing; `stringifyLossless` refuses -0.
+- The step that builds marks, Phase 3's exit loop (risk 2): a mark's age counts from its context slot
+  (the current slot minus `context.slot`, in slot time), not from its receipt.
+- Before 7g (risk, on R9): the owner decides the clock thresholds against RISK_POLICY s.8's CLOCK row
+  (2 s entries off, 10 s halt). Recommended: against block time (1 s steps, seconds behind once
+  finalized) halt beyond 60 s, as contract 8 says ("about a minute"); wall against monotonic keeps s.8's
+  shape (over 2 s entries off, clearing itself; over 10 s halt), never a halt at 2 s.
+- Before a second keyed provider (security 6): count the own-secret forms again (each key takes up to 5
+  of the 32).
+- Before Phase 8:
+  - Risk 3: the second, independent provider (decision 3) takes P0 exit reads while the first is closed
+    by a 429 or blocked by a 403, with a test.
+  - Risk 4: on the exit path, extra keys on the account object and `context` are counted and alerted,
+    not refused; missing or mistyped keys are still refused (R7 stays as written for paper).
+  - Security 7: a live simulateTransaction shows the planned trade to the RPC: live simulations go to a
+    trusted RPC, or the owner accepts that risk explicitly.
+
+Kept as the reviewers accepted: R1 to R8 and R10 to R15; R9 waits for the owner.

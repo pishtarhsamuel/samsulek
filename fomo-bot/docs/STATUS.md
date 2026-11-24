@@ -334,8 +334,14 @@ can trade, and no key or account exists anywhere.
     never even name a "send" method, and only the start command gets the real clock.
   - 49 deliberate bugs were planted: 47 caught, and the other 2 cannot change any result (each reason is
     written down). One weak test was found and fixed.
-- Next: both reviewers check the design and part 7a together; then parts 7b to 7g (the request budget,
-  the internet connection, reading the answers, the live block feed, the clock check).
+- The design and part 7a are REVIEWED (Nov 24): both reviewers approved with notes (REVIEWS.md X), and
+  they join the main work. Their notes are written into the design (CHAIN_DESIGN.md s.17), each with the
+  part it is due by. The main ones: one wild answer from a node must never be able to stop every read,
+  selling included (fixed in the design before part 7e); the start command will refuse settings that
+  switch off the internet connection's certificate checks or reroute it; and a huge message on the live
+  block feed is a crash risk, guarded by the memory limit.
+- Next: parts 7b to 7g (the request budget, the internet connection, reading the answers, the live block
+  feed, the clock check). One question for you is due before part 7g (the clock thresholds).
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
