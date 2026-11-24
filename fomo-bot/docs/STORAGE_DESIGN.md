@@ -5524,7 +5524,8 @@ clock behind, and that test was added. On the final code 42, two of them for the
 Review W (REVIEWS.md W), in two halves: W1 (this design, 6e-1, 6e-2) and W2 (6e-3, 6e-4). Both reviewers
 APPROVED WITH NOTES in both halves; security W1 finding 1 was to be fixed before 6e joins the working
 branch. Fixed on the unreviewed branch (commit f722d26 and the next), each with its tests and planted
-bugs, and re-checked by both reviewers before the merge:
+bugs, and re-checked by both reviewers before the merge: both CONFIRMED on 2026-11-24 (REVIEWS.md, "W
+fix"), with one new note for later (N1, below).
 
 Only the confirmation clears a held jump (security W1 finding 1; risk W1 finding 1), as built:
 - `storage/repo-day.ts` only reads: `readDayState`, `checkPeakRestart`, `snapshotNear`,
@@ -5579,9 +5580,13 @@ Conditions from review W, each with the step it is due by:
 - cli/'s confirm command and the verification routine (Phase 3 and Phase 7): risk W1 3 and security W1
   5: the value is parsed and refused before `confirmJumpTx`, so a typo cannot set the day-state-error
   halt. Security W1 2: a confirmation writes a `server:` audit row and moves the anchor.
-- Before Phase 3 wires app/owner.ts: security W2 1: the owner's actor is fixed by the importer (app/owner.ts
-  only `'owner-telegram'`, cli/ only `'owner-server'`), by a typed rule or split entry points, with
-  canaries.
+- Before Phase 3 wires app/owner.ts:
+  - Security W2 1: the owner's actor is fixed by the importer (app/owner.ts only `'owner-telegram'`,
+    cli/ only `'owner-server'`), by a typed rule or split entry points, with canaries.
+  - Security N1 (the W-fix re-check): only repo-observe.ts (from parameters, refused in its code) and
+    repo-jump.ts (its pinned UPDATE) may set the `jump_*` columns of day_state; the owner's and the
+    server's writers (today the peak and the streak only) may not, with a canary. repo-owner.ts is
+    reachable from Telegram, so a later edit there must not be able to clear a hold unseen.
 - Phase 7 (the server's commands and the owner's guide): security W2 4 and risk W2 3: one far-future
   stored time dates every later command and stalls the due step (fails closed); the guide gives the
   server step that recovers it.

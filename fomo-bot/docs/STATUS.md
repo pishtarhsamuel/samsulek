@@ -293,7 +293,8 @@ can trade, and no key or account exists anywhere.
     Building it also found a blind spot in one of the automatic code checks (it could not see code
     handed into a database step as a function); the check is now stricter, and nothing else tripped it.
 - Step 6e is REVIEWED (Nov 23): both reviewers approved all four parts with notes (REVIEWS.md W). One
-  thing had to be fixed before it joins the main work, and it is fixed, waiting for their re-check:
+  thing had to be fixed before it could join the main work; it is fixed, both reviewers CONFIRMED the
+  fix on Nov 24, and 6e has joined the main work:
   - The rule "only the server clears a held +50% jump" was enforced on the command, but the database
     writer under it could have been called by other parts of the bot, with a time of its own choosing.
     Now that writer sits in its own file that only the confirmation may use, it stamps its own time,
@@ -305,7 +306,9 @@ can trade, and no key or account exists anywhere.
   - 48 deliberate bugs were planted in the fixes; every one is caught (after one test was added).
   - Their other notes are conditions for later parts, each written down with the step it is due by
     (STORAGE_DESIGN.md s.17.16). For example: a money check right before every buy, Telegram can never
-    act as the server, and before live, setting changes that wait 24 hours need a trusted clock.
+    act as the server, and before live, setting changes that wait 24 hours need a trusted clock. The
+    re-check added one small one: before Telegram is wired in, the code that handles your commands
+    must be unable to touch the "+50% jump" fields at all.
 - For you to know: in paper, a setting change from Telegram applies at once (within its allowed range);
   the 24-hour wait applies only once something is live.
 - Your answer of Nov 24 is recorded as D14: the full double review and planted-bug tests stay for
@@ -318,17 +321,16 @@ can trade, and no key or account exists anywhere.
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: both reviewers re-check the fix to 6e they asked for (only the confirmation clears a held
-  "+50%" jump, and a stricter check that no code can swallow an error inside a database step); once
-  they approve, 6e joins the main work. Then chain clients, the paper engine, Telegram and logging.
+- Next: the rest of Phase 2: chain clients, the paper engine, Telegram and logging, each designed
+  first and reviewed as decision D14 says.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
 - Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 70% (settings,
   accounting, risk engine, the storage files, the approval transactions, the start-up checks, the
-  daily money check, the bot's settings step and your setting commands done and reviewed; the fix to
-  the last one awaiting re-check); the whole build about 33%. At the pace so far (Nov 4 to Nov 24),
+  daily money check, the bot's settings step and your setting commands done, reviewed and in the
+  main work); the whole build about 33%. At the pace so far (Nov 4 to Nov 24),
   building takes roughly 6 more weeks (5 to 9), and proving an edge on paper at least 1 to 3 weeks
   more: at least 50 closed paper trades over at least 7 days per strategy before any live decision.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.
