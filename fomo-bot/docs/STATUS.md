@@ -292,6 +292,25 @@ can trade, and no key or account exists anywhere.
   - 42 deliberate bugs were planted, and every one is caught (after one missing test was added).
     Building it also found a blind spot in one of the automatic code checks (it could not see code
     handed into a database step as a function); the check is now stricter, and nothing else tripped it.
+- Step 6e is REVIEWED (Nov 23): both reviewers approved all four parts with notes (REVIEWS.md W). One
+  thing had to be fixed before it joins the main work, and it is fixed, waiting for their re-check:
+  - The rule "only the server clears a held +50% jump" was enforced on the command, but the database
+    writer under it could have been called by other parts of the bot, with a time of its own choosing.
+    Now that writer sits in its own file that only the confirmation may use, it stamps its own time,
+    and it refuses more than 5 minutes after the hold. The everyday money check can no longer clear a
+    hold, and only it can write the money-check record that buys rely on. Nothing did this before; now
+    nothing can.
+  - While fixing a second, smaller note, I found that the automatic check "no code may swallow an error
+    inside a database step" could be fooled by calling a function indirectly. It now covers those ways.
+  - 48 deliberate bugs were planted in the fixes; every one is caught (after one test was added).
+  - Their other notes are conditions for later parts, each written down with the step it is due by
+    (STORAGE_DESIGN.md s.17.16). For example: a money check right before every buy, Telegram can never
+    act as the server, and before live, setting changes that wait 24 hours need a trusted clock.
+- For you to know: in paper, a setting change from Telegram applies at once (within its allowed range);
+  the 24-hour wait applies only once something is live.
+- Your answer of Nov 24 is recorded as D14: the full double review and planted-bug tests stay for
+  everything touching money, keys, the risk engine, your commands, the network or the server; the rest
+  gets only the reviews the rules require.
 - For you to know: in paper, the "free SOL" limit can never be the one that stops a buy, because the
   50% exposure limit always stops it first. That is fine, and the reason is written down for the
   reviewers.
@@ -306,8 +325,10 @@ can trade, and no key or account exists anywhere.
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
-- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 66% (settings,
+- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 70% (settings,
   accounting, risk engine, the storage files, the approval transactions, the start-up checks, the
-  daily money check, the bot's settings step and your setting commands done, the last six parts
-  awaiting review); the whole build about 31-33%. Proving an edge on paper takes weeks on top of that.
+  daily money check, the bot's settings step and your setting commands done and reviewed; the fix to
+  the last one awaiting re-check); the whole build about 33%. At the pace so far (Nov 4 to Nov 24),
+  building takes roughly 6 more weeks (5 to 9), and proving an edge on paper at least 1 to 3 weeks
+  more: at least 50 closed paper trades over at least 7 days per strategy before any live decision.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.
