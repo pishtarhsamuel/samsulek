@@ -311,6 +311,8 @@ can trade, and no key or account exists anywhere.
     must be unable to touch the "+50% jump" fields at all.
 - For you to know: in paper, a setting change from Telegram applies at once (within its allowed range);
   the 24-hour wait applies only once something is live.
+- Your answer of Nov 24 is recorded as D15: if the money check itself breaks, only you at the server can
+  restart buying (as built).
 - Your answer of Nov 24 is recorded as D14: the full double review and planted-bug tests stay for
   everything touching money, keys, the risk engine, your commands, the network or the server; the rest
   gets only the reviews the rules require.

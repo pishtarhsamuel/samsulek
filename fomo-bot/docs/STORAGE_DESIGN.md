@@ -5284,7 +5284,7 @@ Owner question (plain English, one at a time):
 
 Decided since this design was written: s.16.11 Q1 (refuse to start when the safety log is shorter than
 its bookmark), yes (owner decision D12); s.15.16 question 2 (no other person's wallet in the trade
-records), yes (D13). Q1 above is not asked yet.
+records), yes (D13). Q1 above: yes, the server only (owner decision D15, 2026-11-24).
 
 Decisions the reviewers should challenge:
 - R1. The equity is valued inside `observeDayTx` from the stored book and the marks, never passed by
@@ -5599,8 +5599,8 @@ Conditions from review W, each with the step it is due by:
 - For the owner (risk W2 2): in paper, a loosening from Telegram applies at once, inside its bound.
 
 Kept as the reviewers accepted: R1 to R17. Q1 (only the server restarts buying after the money check
-itself breaks) is still the owner's to answer; both reviewers support the recommended yes, which is how
-it is built.
+itself breaks): the owner answered yes on 2026-11-24 (D15), as both reviewers recommended; it is built
+that way.
 
 Tests: TEST_PLAN.md s.3, "Done in the review W fix". Planted bugs: 33 in the split (scratchpad
 `mut/run38.py`), 32 caught on the first run; the one left (no row-count check) cannot happen with a real
