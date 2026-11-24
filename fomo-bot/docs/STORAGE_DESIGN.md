@@ -4475,6 +4475,27 @@ Conditions for later steps from this one:
 - The engine loop: the slot reported before T1 exit (C4), the health loop's alert on an unknown slot
   (C63), the run loop's exit on `onFatal`, and T3 settling an opening that has an order (C67).
 
+Review V (REVIEWS.md V, 2026-11-23): both reviewers APPROVED WITH NOTES, and both accept the boot's
+abandon without a slot (atomic with the buy-order check; an old process's token is refused by T2). Their
+findings are conditions for the cli/ start command (the ops step), each with a test:
+- `startPaperEngine` refuses a second start in one process (both reviewers: two authorities and two
+  latches otherwise), released by `close()`.
+- The data folder's parent folders are checked like OpenSSH's StrictModes: each owned by root or the
+  bot's user, and writable by group or others only with the sticky bit (security 1; its probe booted
+  under a 0777 parent without the sticky bit).
+- Platforms other than linux and win32 are refused until verified (security 2: they skip the
+  file-system check).
+- The boot refuses a strategy stored in live mode, as it refuses live money and live positions (risk 2).
+- The start message and alerts carry only the BootError's code, never its message or cause (security 5).
+- The anchor: a rolled-back database plus a deleted anchor clears a stored KILL with only the
+  `no-audit-anchor` warning (D10); keep a second anchor outside the data folder, or alert it loudly and
+  show the audit id in the start message so the owner sees it drop (security 4).
+- Windows: synced folders other than OneDrive (Dropbox, Google Drive, iCloudDrive) are refused too or
+  the owner is told; ACLs stay unchecked until V4 runs (security 6). The anchor's temp file is
+  unlinked first and written with `wx` (security 7, optional).
+- C18 is recorded as run, not skipped: it skips itself where uid 65534 cannot read the checkout, so it
+  runs in the main checkout or CI (both reviewers).
+
 Tests: TEST_PLAN.md s.3, "Done in step 6d-3". Planted bugs (scratchpad `mut/run31.py` and
 `mut/run32.py`): 122 in the first run, 107 caught and 5 marked equivalent before it ran. Of the other
 ten, five showed four weak tests (a data folder on a network share under a redirected profile, in both

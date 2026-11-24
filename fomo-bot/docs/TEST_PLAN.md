@@ -344,8 +344,8 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    - Two buy tokens for one position are refused by `buyTokenExpiry`.
    - Planted bugs for these fixes: 10, all caught.
 
-   Done in step 6d-3 (the boot and the engine start, STORAGE_DESIGN s.16.16; UNREVIEWED, owner decision
-   D10, on the same branch as 6d-2):
+   Done in step 6d-3 (the boot and the engine start, STORAGE_DESIGN s.16.16; built unreviewed under owner
+   decision D10, reviewed 2026-11-23 (REVIEWS.md V), both approved with notes):
    - The run files: the KILL file reads present for any error but "no such file"; the anchor is
      written 0600 through a temp file and a rename (a leftover 0666 temp made 0600), read back strictly
      (extra keys, an id of 0 or a fraction, an upper-case hash, a time out of range, bad JSON, an

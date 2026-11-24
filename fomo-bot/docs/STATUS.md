@@ -218,9 +218,10 @@ can trade, and no key or account exists anywhere.
     fee budget is spent) no longer uses up the position's sell numbers, so it can always still be sold
     later; and the check that no code inside a database step can swallow an error now also catches
     three sneakier ways of handing that step on. Their other notes are conditions for later parts.
-- Part 6d-3 is built (tests first), and NOT YET REVIEWED: with your OK (decision D10) it sits on the
-  same separate branch as 6d-2 and joins the main work only after both reviewers approve. It holds the
-  start-up checks and the engine's start:
+- Part 6d-3 is built (tests first) and REVIEWED: both reviewers approved it with notes on Nov 23,
+  and it joined the main work. Their notes are small fixes for the start command, which comes
+  later (refuse a second start in one process, check the folders above the data folder, refuse
+  untested systems, and a few more). It holds the start-up checks and the engine's start:
   - Before it does anything, the bot checks its data folder: on this computer (not a network share or
     OneDrive), private to the bot's own user, with no shortcut or second name for the database. Then the
     database's health and layout, every record it needs, its safety log, that KILL and every halt point
@@ -237,9 +238,9 @@ can trade, and no key or account exists anywhere.
     nothing because another check already does their job (each reason is written down). The first run
     found four weak tests and one missing check (a live position with an empty live account would have
     passed the start); all fixed.
-  - Flagged for the reviewers: at start-up the bot cancels a stale buy without knowing the chain's
-    clock, which differs from an earlier note. The old run's approvals died with it, and a test shows
-    the database refuses such an approval even if the old run were somehow still alive.
+  - At start-up the bot cancels a stale buy without knowing the chain's clock; both reviewers
+    accepted that: the old run's approvals died with it, and a test shows the database refuses
+    such an approval even if the old run were somehow still alive.
   - The Windows-only checks (shortcuts called junctions, OneDrive, network paths) are tested with a
     stand-in for Windows; a real run on your PC comes with the setup guide. If a guess is wrong, the bot
     refuses to start rather than running somewhere unsafe.
@@ -298,9 +299,9 @@ can trade, and no key or account exists anywhere.
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: the reviews of 6d-3 (the start-up checks) and 6e (the settings and day-state transactions),
-  both built on the separate branch (6d-1 and 6d-2 are reviewed and in the main work); then chain
-  clients, the paper engine, Telegram and logging.
+- Next: both reviewers re-check the fix to 6e they asked for (only the confirmation clears a held
+  "+50%" jump, and a stricter check that no code can swallow an error inside a database step); once
+  they approve, 6e joins the main work. Then chain clients, the paper engine, Telegram and logging.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
