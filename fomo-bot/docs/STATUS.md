@@ -323,8 +323,25 @@ can trade, and no key or account exists anywhere.
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: the rest of Phase 2: chain clients, the paper engine, Telegram and logging, each designed
-  first and reviewed as decision D14 says.
+- Step 7 (the bot's connection to the Solana blockchain) has started. The researcher checked today's
+  facts (the free public server's limits, the exact form of its answers); the architect designed it in
+  eight small parts (docs/CHAIN_DESIGN.md). Part 7a is built (tests first), NOT YET REVIEWED, on the
+  separate branch:
+  - Numbers in the blockchain's answers are read exactly, never rounded; anything that only looks like
+    a whole number is refused rather than guessed.
+  - Solana addresses and signatures are checked strictly: a typo or a non-standard form is refused.
+  - New automatic checks: only two named files may ever talk to the internet, the blockchain code can
+    never even name a "send" method, and only the start command gets the real clock.
+  - 49 deliberate bugs were planted: 47 caught, and the other 2 cannot change any result (each reason is
+    written down). One weak test was found and fixed.
+- The design and part 7a are REVIEWED (Nov 24): both reviewers approved with notes (REVIEWS.md X), and
+  they join the main work. Their notes are written into the design (CHAIN_DESIGN.md s.17), each with the
+  part it is due by. The main ones: one wild answer from a node must never be able to stop every read,
+  selling included (fixed in the design before part 7e); the start command will refuse settings that
+  switch off the internet connection's certificate checks or reroute it; and a huge message on the live
+  block feed is a crash risk, guarded by the memory limit.
+- Next: parts 7b to 7g (the request budget, the internet connection, reading the answers, the live block
+  feed, the clock check). One question for you is due before part 7g (the clock thresholds).
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;

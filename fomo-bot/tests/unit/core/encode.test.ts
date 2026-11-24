@@ -36,8 +36,8 @@ function base58ByCarry(bytes: Uint8Array): string {
 const text = (s: string): Uint8Array => new TextEncoder().encode(s);
 
 describe('the encoders file: only what it may do', () => {
-  it('exports the four encoders and nothing else', () => {
-    assert.deepEqual(Object.keys(encodeFile).sort(), ['base58Of', 'base64Of', 'base64UrlOf', 'hexOf']);
+  it('exports the four encoders and the two strict decoders (step 7a), and nothing else', () => {
+    assert.deepEqual(Object.keys(encodeFile).sort(), ['base58Exact', 'base58Of', 'base64Of', 'base64Strict', 'base64UrlOf', 'hexOf']);
   });
 });
 

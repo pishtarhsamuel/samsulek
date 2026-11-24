@@ -539,6 +539,46 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      pair, so a test with a write that finds no row was added: 33 of 33. 15 in the rule (`mut/run39.py`):
      15 of 15 on the first run.
 
+   Done in step 7a (the building blocks of chain/, CHAIN_DESIGN.md s.16; UNREVIEWED, on the unreviewed
+   branch, reviewed with the design):
+   - `parseLossless`: 2^64 - 1, 9007199254740993 and a 30-digit number exact; `1e3`, `1E3`, `1.50`,
+     `1.0`, `2e-1`, `-0` and `1e400` stay numbers; `-32016` is a bigint; inside arrays and objects, all
+     frozen; strings, booleans and null untouched; a `__proto__` key stays an own property; nesting of 64
+     passes and 65 (arrays or objects) or 200,000 is a SyntaxError, brackets inside strings (escaped
+     quotes included) not counted; eleven kinds of invalid JSON are SyntaxErrors, a non-string a
+     TypeError. Property (1,000 runs each): random integers around the u53, i64 and u64 edges in seven
+     spellings, alone and in arrays: a bigint exactly when the source is plain digits, equal to it.
+   - `stringifyLossless`: bigints as digits, an RPC request written exactly, escapes as JSON.stringify;
+     round trip; NaN, the infinities, undefined, functions, symbols, an array hole, a Date, a Map, an
+     object with a prototype and a typed array refused (an object without a prototype is plain); 64 deep
+     passes, 65 refused.
+   - `base58Exact`: the system program, the wSOL mint, the token program and the genesis hash decode to 32
+     bytes and encode back; 500 random 32- and 64-byte values with leading zero bytes round-trip and never
+     decode as the other length; a short number without its leading "1", an extra "1", 31 and 33 bytes,
+     ten foreign characters first or anywhere in an address, an empty text and a text too long for its
+     length (refused at once, under 50 ms for 200,000 characters) are null; a non-string or a bad length
+     is a TypeError.
+   - `base64Strict`: 500 random values up to 300 bytes agree with Buffer; an empty account; stray bits,
+     bad padding, whitespace, base64url and foreign characters null; the byte bound exact and checked
+     before decoding; a non-string or a bad bound a TypeError.
+   - core/solana.ts: program ids, mints and the genesis hash are addresses; signatures of 64 bytes; other
+     lengths, a padded short number, foreign characters and non-strings refused without the value in the
+     message; slots and block heights from 0 to 2^63 - 1, numbers, negatives and 2^63 refused; the types
+     keep slots, block heights, bigints and strings apart (compile-time).
+   - core/clock.ts: whole UTC milliseconds; a monotonic clock that never goes back and does not count from
+     the epoch; frozen; a timeout signal and a timer that fire on time and not before; a cancel that
+     works (twice harmlessly); delays that are not whole milliseconds from 0 to 2^31 - 1 refused.
+   - The architecture rules 1 to 5 (CHAIN_DESIGN s.10): 48 canaries (chain/ pure, each network file with
+     only its globals, the network globals, `globalThis.` and `global[...]` members, a bare global object,
+     fifteen network modules, dynamic imports and re-exports, chain/ importing config/, node:crypto even
+     as a type, sending method names in any case, the real clocks outside cli/) and eleven fine cases; the
+     real src/ is clean.
+   - Planted bugs (scratchpad `mut/run40.py`): 50 in the first run, 46 caught. One weak test (a foreign
+     character in the middle of a base58 text, where the decoded number keeps its length) was fixed; one
+     unreachable line was removed (a RangeError conversion that the depth check makes impossible); two are
+     equivalent (base64's character and length checks, which its final re-encoding also enforces). Final:
+     49, 47 caught, 2 equivalent, each with its reason in the script.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |
@@ -575,7 +615,7 @@ counterexamples become fixed regression tests.
 
 | Module | Must cover |
 |---|---|
-| chain/ | budget buckets, P0 reserve, shed levels 1-3, header learning, Retry-After, 403 handling, every getTransaction/getBlock carries `maxSupportedTransactionVersion: 1`, getTokenLargestAccounts refused, timeouts, zod rejection, context-slot staleness, block-height expiry; the paper ProviderClient type has no send method (type test) |
+| chain/ | budget buckets, P0 reserve, shed levels 1-3, header learning, Retry-After, 403 handling, every getTransaction/getBlock carries `maxSupportedTransactionVersion: 1`, getTokenLargestAccounts refused, timeouts, strict rejection by the hand-written decoders (no zod: CHAIN_DESIGN.md R8), context-slot staleness, block-height expiry; the paper ProviderClient type has no send method (type test); the full list per sub-step is CHAIN_DESIGN.md s.13 |
 | fomo/ | invoke-stack parser (nested CPIs, truncated logs, failed tx), pump TradeEvent and PumpSwap Buy/Sell decoding by discriminator, unknown discriminator, completeness flags, pool-to-mint cache, user tags never leave memory, raw samples never persisted, decoder error logs without addresses or signatures, windows 1/5/15, sybil metrics, watermark and late events, anchors and ratios, coverage audit |
 | safety/ | raw TLV parser for all 29 extension types, the REJECT/ALLOW/ALLOW-IF table, unknown type 29+, bad lengths, jsonParsed-without-extensions trap, authorities, metadata mutability, holder exclusions (curve, pool vaults, PDAs off-curve, mayhem vault), holder-sim picks (never creator, top-10 or launch-slot buyers; holder not logged), probe bytes with zeroed signatures, sell-probe result parsing, cost rule items, TTL |
 | strategies/ | pure: same input, same output; no imports outside the allowed list; each entry rule and its reasons |
