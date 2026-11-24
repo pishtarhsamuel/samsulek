@@ -5498,3 +5498,87 @@ dated by the raw clock instead of the command's time) showed that no test demote
 clock behind, and that test was added. On the final code 42, two of them for the rule's new clause:
 42 of 42 caught. Coverage: every line and branch of app/owner-tx.ts.
 
+### 17.16 Review W: the fix before 6e joins the working branch, and the conditions for later steps
+
+Review W (REVIEWS.md W), in two halves: W1 (this design, 6e-1, 6e-2) and W2 (6e-3, 6e-4). Both reviewers
+APPROVED WITH NOTES in both halves; security W1 finding 1 was to be fixed before 6e joins the working
+branch. Fixed on the unreviewed branch (commit f722d26 and the next), each with its tests and planted
+bugs, and re-checked by both reviewers before the merge:
+
+Only the confirmation clears a held jump (security W1 finding 1; risk W1 finding 1), as built:
+- `storage/repo-day.ts` only reads: `readDayState`, `checkPeakRestart`, `snapshotNear`,
+  `newestSnapshot` and the `LedgerMode` type. Anyone may import it.
+- `storage/repo-observe.ts` holds the observation's writes: `writeDayState`, `insertSnapshot`,
+  `pruneSnapshots`, `SNAPSHOT_KEEP_MS`. Only app/day-tx.ts may import it, so no other path can write a
+  snapshot that T1's 30 s rule would take as a money check, nor a day state. `writeDayState` now also
+  refuses to clear a held jump ("a held jump is cleared only by its confirmation (storage/repo-jump.ts),
+  never by an observation") and any change to the acknowledgement ("the jump acknowledgement changes
+  only with a confirmation"); every other rule of review R stays.
+- `storage/repo-jump.ts` holds `confirmHeldJump(tx, mode, ackEquity, at)`, the only writer that clears a
+  held jump. Only app/jump-tx.ts may import it (and only cli/ may import that), so contract 3 is enforced
+  on the writer, not only on its caller. It writes the jump columns and nothing else: one UPDATE, pinned
+  by an architecture rule (`jump_pending = 0`, the held pair NULL, the acknowledgement and `updated_at`
+  from parameters, `WHERE mode = ? AND jump_pending = 1`). The acknowledgement's time is the write's own
+  `at`: there is no separate time to name, which is the reviewer's fix (a) built into the signature. It
+  refuses, with nothing written: no held jump, `at` before the hold or more than 5 minutes after it, an
+  `ackEquity` above the held level, and a write that changes no row.
+- `app/jump-tx.ts` calls it with `confirmEquityJump`'s reference and its one clock reading.
+- The reviewer's fixes (b) (split the writer) and (c) (restrict the writers) are built stricter than
+  asked: each writer has its one caller, not two.
+
+The no-catch rule's indirect calls (security W2 note 2, with one more way found while fixing it): a
+function the lib runs for the caller ran unseen, and the lib's own call, apply and Reflect.apply carried
+the transaction past rule 4, so `helper.call(undefined, tx)` reached a function the rule never read. The
+reviewer judged the clause defense in depth because rule 4 kept the transaction from such functions; it
+did not keep it from the lib's forwarders. Now:
+- call, apply and bind of the lib, and Reflect.apply and Reflect.construct, are calls of the function
+  they hand on: it is followed, or flagged when it cannot be;
+- casts, parentheses and `!` hide no callee;
+- a namespace member that is a function value (`lib.run()`) is flagged like a name;
+- a function the rule cannot name (an element, the result of a call, a conditional) is never called;
+- a function of app/ or cli/ handed on by name (to the lib's map, say) is followed, and a function value
+  the rule cannot follow is handed only to code it follows;
+- a lib method called on a value that holds the transaction (`[tx].forEach(f)`) gets only a function
+  written in place or one of storage/, app/ or cli/ with a body.
+The LIMIT now also names a handle inside a lib container (a Map, a Set) and one stored outside the
+callback and read later by code behind an interface: review is the guard there. The real src/ is clean
+under the stricter rule.
+
+Conditions from review W, each with the step it is due by:
+- Before the run loop (Phase 3, the engine's loop):
+  - Risk W1 2: an observation runs right before every `approveBuyTx`, in the same tick, binding, with a
+    test that no buy is approved without one. Optional backstop: T1 also refuses when its own valuation
+    is below the stored day start minus the daily stop.
+  - Security W1 4 (R17): the loop uses contract 8's TimeGuard, never a trust-everything fake, pinned by a
+    start-up check or an architecture rule.
+  - Security W2 3: `config-clock-behind` in the due step rate-limited (as the day watch does) before
+    `applyDueTx` runs every minute.
+- The health loop (C63): security W1 3: it alerts on a stale money check (or `day-state-stale` warns,
+  rate-limited), so a dead tick loop does not fail quietly.
+- cli/'s confirm command and the verification routine (Phase 3 and Phase 7): risk W1 3 and security W1
+  5: the value is parsed and refused before `confirmJumpTx`, so a typo cannot set the day-state-error
+  halt. Security W1 2: a confirmation writes a `server:` audit row and moves the anchor.
+- Before Phase 3 wires app/owner.ts: security W2 1: the owner's actor is fixed by the importer (app/owner.ts
+  only `'owner-telegram'`, cli/ only `'owner-server'`), by a typed rule or split entry points, with
+  canaries.
+- Phase 7 (the server's commands and the owner's guide): security W2 4 and risk W2 3: one far-future
+  stored time dates every later command and stalls the due step (fails closed); the guide gives the
+  server step that recovers it.
+- Before Phase 8:
+  - Risk W2 1: a command that queues a waiting row, and the live /resume with its 24 h wait, run only on
+    a clock reading the TimeGuard trusts; tightenings stay unguarded; tests for both.
+  - Risk W1, on R15: RISK_POLICY s.15 invariant 11's "restores the earlier values exactly" wording is
+    amended, with the owner informed, and a test shows that a /rollback of a due step waits 24 h for
+    every unsafe field.
+- For the owner (risk W2 2): in paper, a loosening from Telegram applies at once, inside its bound.
+
+Kept as the reviewers accepted: R1 to R17. Q1 (only the server restarts buying after the money check
+itself breaks) is still the owner's to answer; both reviewers support the recommended yes, which is how
+it is built.
+
+Tests: TEST_PLAN.md s.3, "Done in the review W fix". Planted bugs: 33 in the split (scratchpad
+`mut/run38.py`), 32 caught on the first run; the one left (no row-count check) cannot happen with a real
+database (the schema's CHECK ties `jump_pending` to the held pair), so a test with a write that finds no
+row was added: 33 of 33. 15 in the rule (`mut/run39.py`): 15 of 15 on the first run. Coverage: every
+line and branch of the three day-state files.
+

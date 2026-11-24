@@ -505,6 +505,40 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    - Planted bugs: 42 on the final code, every one caught; the first draft's run found one missing test
      (a demotion with the clock behind), added.
 
+   Done in the review W fix (STORAGE_DESIGN s.17.16; on the unreviewed branch, re-checked by both
+   reviewers before 6e joins the working branch):
+   - The three day-state files: their exports pinned (the readers in repo-day.ts, the observation's
+     writes in repo-observe.ts, the confirmation's write in repo-jump.ts).
+   - The observation's writer never clears a held jump, not even in a confirmation's exact shape, and
+     refuses the reviewer's reproduction (two hours after the hold, the acknowledgement dated at the
+     hold); the acknowledgement changes at no other time (not moved, raised, cleared, or set with a new
+     hold; a new hold keeps it).
+   - The confirmation's writer: refused with nothing written (even when a careless caller catches the
+     refusal and commits) with no held jump, a time before the hold, more than 5 minutes after it, the
+     reviewer's case, or an equity above the held level; at the edges (the held level, exactly 5 minutes,
+     a level of 0 at the hold itself) only the jump columns change, the acknowledgement and updated_at at
+     the write's own time, the other mode untouched; a write that finds no row is refused (row-count);
+     risk/daystate.ts's confirmation at the 5-minute edge is written exactly as it makes it.
+   - The day-sequence property confirms through the confirmation's writer; every 6e-1 and 6e-2 test
+     runs on the split files unchanged.
+   - The import rules: repo-observe.ts only from app/day-tx.ts, repo-jump.ts only from app/jump-tx.ts
+     (nine canaries, a re-export among them; three allowed imports); the write rules: only repo-observe.ts
+     adds and prunes snapshots, the day state is written only by repo-observe.ts, repo-jump.ts,
+     repo-owner.ts and repo-server.ts, and repo-jump.ts runs only its one clearing UPDATE (eight canaries,
+     the readers' file writing nothing among them).
+   - The no-catch rule's indirect calls (security W2 note 2): a handed-in function called through call,
+     apply or Reflect.apply, through an element, the result of a call or a namespace import, or under a
+     cast; a function with a try reached through call, Reflect.apply, bind, a lib method given it by name,
+     or a lib method on a value holding the transaction; a function value handed to the lib; an interface
+     method handed to a lib method on a value holding the transaction: each flagged (15 canaries). A
+     function written in place and called at once, call and Reflect.apply of a function the rule follows,
+     the lib's own apply, and a named function handed to the lib are not (seven fine cases), and the real
+     src/ is clean.
+   - Planted bugs: 33 in the split (scratchpad `mut/run38.py`), 32 caught on the first run; the one left
+     (no row-count check) cannot happen with a real database, whose CHECK ties jump_pending to the held
+     pair, so a test with a write that finds no row was added: 33 of 33. 15 in the rule (`mut/run39.py`):
+     15 of 15 on the first run.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |
