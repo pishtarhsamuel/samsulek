@@ -11,7 +11,7 @@ import { cancelPendingTx, resumeTx, rollbackTx, setTx, type OwnerDeps } from '..
 import { athensDay } from '../../../src/core/day.ts';
 import { lamports } from '../../../src/core/units.ts';
 import { emptyEquityState } from '../../../src/risk/daystate.ts';
-import { insertSnapshot } from '../../../src/storage/repo-day.ts';
+import { insertSnapshot } from '../../../src/storage/repo-observe.ts';
 import { setHalt } from '../../../src/storage/repo-flags.ts';
 import { setStrategyMode } from '../../../src/storage/repo-owner.ts';
 import type { Db } from '../../../src/storage/sqlite.ts';

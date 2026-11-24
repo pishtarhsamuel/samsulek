@@ -74,7 +74,7 @@ export function setPaperSol(w: DayWorld, sol: bigint): void {
   w.db.transaction((tx) => tx.run("UPDATE ledger_accounts SET sol = ? WHERE mode = 'paper'", sol.toString()));
 }
 
-/** A day state written by hand, past repo-day.ts's guard: a stand-in for an edited or damaged row. */
+/** A day state written by hand, past the writers' guards (repo-observe.ts, repo-jump.ts): a stand-in for an edited or damaged row. */
 export function plantDayState(db: Db, s: EquityState, at = T): void {
   const b = (v: boolean): bigint => (v ? 1n : 0n);
   db.transaction((tx) =>

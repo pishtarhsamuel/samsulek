@@ -3,16 +3,19 @@
 // fresh, fully valued read (never the held observation). In one locked step: the clock read once, the
 // stored day state and the paper policy, risk/daystate.ts confirmEquityJump (the lower of the verified
 // and the held level is the reference, at most 5 minutes after the hold, never before it), and the one
-// day-state write. It reads no flag, halt or KILL, so it works while halted (C41). A refusal writes
-// nothing and sets no halt: the hold keeps blocking entries, which fails closed. Any other failure but
-// busy is the day-state-error halt, as in the observation. Only cli/ may import this file (the
-// architecture test): no strategy, Telegram or AI path can clear a hold (contract 3); Phase 3 adds the
-// verification routine by name.
+// write, through storage/repo-jump.ts: the jump columns only, the acknowledgement at this step's own
+// clock reading, the window and the level checked again there. It reads no flag, halt or KILL, so it
+// works while halted (C41). A refusal writes nothing and sets no halt: the hold keeps blocking entries,
+// which fails closed. Any other failure but busy is the day-state-error halt, as in the observation.
+// Only cli/ may import this file, and only this file may import storage/repo-jump.ts (the architecture
+// test): no strategy, Telegram or AI path can clear a hold, not even through storage (contract 3; review
+// W1, security 1); Phase 3 adds the verification routine by name.
 import { lamports, type Lamports } from '../core/units.ts';
 import { confirmEquityJump } from '../risk/daystate.ts';
 import { RiskError } from '../risk/reserve.ts';
 import { readAccount } from '../storage/repo-book.ts';
-import { readDayState, writeDayState } from '../storage/repo-day.ts';
+import { readDayState } from '../storage/repo-day.ts';
+import { confirmHeldJump } from '../storage/repo-jump.ts';
 import { alertSafely, persistHaltTx } from './approve-tx.ts';
 import { dayPolicyOf } from './caps.ts';
 import { DAY_STATE_ERROR_HALT, type DayDeps } from './day-tx.ts';
@@ -42,9 +45,11 @@ export function confirmJumpTx(deps: DayDeps, verifiedEquity: Lamports): ConfirmO
       const state = readDayState(tx, 'paper');
       const { tunables } = readActiveConfig(tx);
       const next = confirmEquityJump(state, level, at, dayPolicyOf('paper', tunables, readAccount(tx, 'paper')));
-      writeDayState(tx, 'paper', next, at); // its guard accepts exactly this move (repo-day.ts)
-      // confirmEquityJump always sets the reference it returns
-      return Object.freeze({ kind: 'confirmed', at, ackEquity: (next.jumpAck as { readonly equity: Lamports }).equity });
+      // confirmEquityJump always sets the reference, at this clock reading; storage writes only the jump
+      // columns, the acknowledgement at `at` itself, and re-checks the window and the level (repo-jump.ts)
+      const ackEquity = (next.jumpAck as { readonly equity: Lamports }).equity;
+      confirmHeldJump(tx, 'paper', ackEquity, at);
+      return Object.freeze({ kind: 'confirmed', at, ackEquity });
     });
   } catch (e) {
     if (e instanceof RiskError) {

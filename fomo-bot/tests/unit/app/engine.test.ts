@@ -20,7 +20,7 @@ import { verifyAuditChain } from '../../../src/storage/repo-audit.ts';
 import { readHalts, setKill } from '../../../src/storage/repo-flags.ts';
 import { buyOrderOf } from '../../../src/storage/repo-orders.ts';
 import { setStrategyMode } from '../../../src/storage/repo-owner.ts';
-import { insertSnapshot } from '../../../src/storage/repo-day.ts';
+import { insertSnapshot } from '../../../src/storage/repo-observe.ts';
 import { lamports } from '../../../src/core/units.ts';
 import { StorageError, type Db } from '../../../src/storage/sqlite.ts';
 import { WSOL } from '../risk/fixtures.ts';

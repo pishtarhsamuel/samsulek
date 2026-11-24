@@ -13,7 +13,7 @@ import { bps, lamports, microLamportsPerCu, type Lamports } from '../../../src/c
 import type { Mark } from '../../../src/portfolio/equity.ts';
 import type { OrderPlan } from '../../../src/risk/plan.ts';
 import { insertOpening } from '../../../src/storage/repo-book.ts';
-import { insertSnapshot } from '../../../src/storage/repo-day.ts';
+import { insertSnapshot } from '../../../src/storage/repo-observe.ts';
 import { setStrategyMode } from '../../../src/storage/repo-owner.ts';
 import type { Db } from '../../../src/storage/sqlite.ts';
 import { WSOL } from '../risk/fixtures.ts';

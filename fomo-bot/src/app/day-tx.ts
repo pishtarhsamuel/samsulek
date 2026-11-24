@@ -13,7 +13,8 @@
 import { valueEquity } from '../portfolio/equity.ts';
 import { observeEquity, type EquityTrip } from '../risk/daystate.ts';
 import { readAccount, readActivePositions } from '../storage/repo-book.ts';
-import { insertSnapshot, pruneSnapshots, readDayState, snapshotNear, writeDayState } from '../storage/repo-day.ts';
+import { readDayState, snapshotNear } from '../storage/repo-day.ts';
+import { insertSnapshot, pruneSnapshots, writeDayState } from '../storage/repo-observe.ts';
 import { setEntriesStopped, setHalt } from '../storage/repo-flags.ts';
 import { alertSafely, anchorAfter, persistHaltTx, type EngineDeps, type StoreDeps } from './approve-tx.ts';
 import { MARK_POLICY, dayPolicyOf, lowEquityStopOf } from './caps.ts';

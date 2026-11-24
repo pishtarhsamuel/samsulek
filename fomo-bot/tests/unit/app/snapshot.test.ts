@@ -19,7 +19,7 @@ import { lamports, tokenUnits } from '../../../src/core/units.ts';
 import type { Mark } from '../../../src/portfolio/equity.ts';
 import type { BreakerState } from '../../../src/risk/blocks.ts';
 import { insertOpening, readBook } from '../../../src/storage/repo-book.ts';
-import { insertSnapshot } from '../../../src/storage/repo-day.ts';
+import { insertSnapshot } from '../../../src/storage/repo-observe.ts';
 import { addBan, countEntry, setEntriesStopped, setHalt, setKill, setPaused } from '../../../src/storage/repo-flags.ts';
 import { setStrategyMode, writeOwnerConfig } from '../../../src/storage/repo-owner.ts';
 import { clearKill, setUpConfig } from '../../../src/storage/repo-server.ts';

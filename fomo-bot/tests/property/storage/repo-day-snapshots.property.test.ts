@@ -7,7 +7,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fc from 'fast-check';
 import { lamports } from '../../../src/core/units.ts';
-import { insertSnapshot, newestSnapshot, snapshotNear } from '../../../src/storage/repo-day.ts';
+import { newestSnapshot, snapshotNear } from '../../../src/storage/repo-day.ts';
+import { insertSnapshot } from '../../../src/storage/repo-observe.ts';
 import { TEST_NOW, migratedDb } from '../../unit/storage/helpers.ts';
 
 interface Snap {

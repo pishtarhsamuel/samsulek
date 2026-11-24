@@ -12,8 +12,12 @@ import { applyTransfer, confirmEquityJump, emptyEquityState, observeEquity, type
 import { RiskError } from '../../../src/risk/reserve.ts';
 import { amountParam, boolParam, dayParam, intParam, msParam } from '../../../src/storage/codec.ts';
 import * as dayFile from '../../../src/storage/repo-day.ts';
-import { SNAPSHOT_KEEP_MS, insertSnapshot, newestSnapshot, pruneSnapshots, readDayState, snapshotNear, writeDayState } from '../../../src/storage/repo-day.ts';
-import type { Db } from '../../../src/storage/sqlite.ts';
+import { newestSnapshot, readDayState, snapshotNear } from '../../../src/storage/repo-day.ts';
+import * as jumpFile from '../../../src/storage/repo-jump.ts';
+import { confirmHeldJump } from '../../../src/storage/repo-jump.ts';
+import * as observeFile from '../../../src/storage/repo-observe.ts';
+import { SNAPSHOT_KEEP_MS, insertSnapshot, pruneSnapshots, writeDayState } from '../../../src/storage/repo-observe.ts';
+import type { Db, Tx } from '../../../src/storage/sqlite.ts';
 import { TEST_NOW, count, migratedDb, removeDir, storageError, tamper, tempDir } from './helpers.ts';
 
 const T = TEST_NOW;
@@ -40,10 +44,21 @@ const FULL = WALK[WALK.length - 1] as EquityState;
 /** FULL before its new jump: the acknowledgement set, no hold. */
 const ROSE = WALK[WALK.length - 2] as EquityState;
 
-/** Writes the walk to FULL into one mode, one step per transaction, up to `upTo` (the whole walk by default). */
+/**
+ * Writes the walk to FULL into one mode, one step per transaction, up to `upTo` (the whole walk by
+ * default): the confirmation through its own writer, at its acknowledgement's time, the rest through the
+ * observation's.
+ */
 function walk(db: Db, mode: 'paper' | 'live', upTo: EquityState = FULL): void {
   for (const s of WALK.slice(0, WALK.indexOf(upTo) + 1)) {
-    db.transaction((tx) => writeDayState(tx, mode, s, T));
+    db.transaction((tx) => {
+      const before = readDayState(tx, mode);
+      if (before.jumpPending && !s.jumpPending && s.jumpAck !== null) {
+        confirmHeldJump(tx, mode, s.jumpAck.equity, s.jumpAck.at);
+      } else {
+        writeDayState(tx, mode, s, T);
+      }
+    });
   }
   assert.deepEqual(readDayState(db, mode), upTo);
 }
@@ -75,8 +90,10 @@ function withTampered(script: string, fn: (db: Db) => void): void {
 }
 
 describe('the engine\'s day-state file: only what it may do', () => {
-  it('exports the day state\'s read and write, the peak-restart check and the snapshots\', and nothing else: a new export here is a reviewed change', () => {
-    assert.deepEqual(Object.keys(dayFile).sort(), ['SNAPSHOT_KEEP_MS', 'checkPeakRestart', 'insertSnapshot', 'newestSnapshot', 'pruneSnapshots', 'readDayState', 'snapshotNear', 'writeDayState']);
+  it('the readers, the observation\'s writes and the confirmation\'s write are three files, and nothing else is exported: a new export here is a reviewed change (review W1)', () => {
+    assert.deepEqual(Object.keys(dayFile).sort(), ['checkPeakRestart', 'newestSnapshot', 'readDayState', 'snapshotNear']);
+    assert.deepEqual(Object.keys(observeFile).sort(), ['SNAPSHOT_KEEP_MS', 'insertSnapshot', 'pruneSnapshots', 'writeDayState']);
+    assert.deepEqual(Object.keys(jumpFile).sort(), ['confirmHeldJump']);
   });
 });
 
@@ -97,8 +114,8 @@ describe('the day state: one row per ledger mode, read back exactly as risk/days
       const read = readDayState(db, 'live');
       assert.ok(Object.isFrozen(read.jumpHeld) && Object.isFrozen(read.jumpAck));
       assert.deepEqual(readDayState(db, 'paper'), emptyEquityState());
-      const settled: EquityState = { ...FULL, jumpPending: false, jumpHeld: null, jumpAck: { equity: lamports(3n * SOL + SOL / 2n), at: T } }; // confirmed
-      db.transaction((tx) => writeDayState(tx, 'live', settled, T + 1));
+      const settled: EquityState = { ...FULL, jumpPending: false, jumpHeld: null, jumpAck: { equity: lamports(3n * SOL + SOL / 2n), at: T + 1 } }; // confirmed
+      db.transaction((tx) => confirmHeldJump(tx, 'live', lamports(3n * SOL + SOL / 2n), T + 1));
       assert.deepEqual(readDayState(db, 'live'), settled);
       assert.equal(db.get("SELECT updated_at FROM day_state WHERE mode = 'live'")?.['updated_at'], BigInt(T + 1));
     });
@@ -287,16 +304,56 @@ describe('the engine\'s write is never looser than the step of risk/daystate.ts 
     from({ ...BASE, dailyStopStreak: 0 }, (db) => accepted(db, { ...BASE, dailyStopDay: '2026-11-16', dailyStopStreak: 1 }));
   });
 
-  it('a held jump is cleared only by its confirmation, at most 5 minutes after the hold and never above it; the acknowledgement changes at no other time', () => {
+  it('the observation\'s writer never clears a held jump, not even as a confirmation would (review W1, security 1)', () => {
     const heldEquity = SOL + SOL / 2n;
     const held: EquityState = { ...BASE, jumpPending: true, jumpHeld: { equity: lamports(heldEquity), at: T - MIN } };
-    const confirmed = (equity: bigint, at: number): EquityState => ({ ...held, jumpPending: false, jumpHeld: null, jumpAck: { equity: lamports(equity), at } });
     from(held, (db) => {
-      refused(db, { ...held, jumpPending: false, jumpHeld: null }, /cleared only by its confirmation/);
-      refused(db, confirmed(SOL, T - MIN - 1), /cleared only by its confirmation/); // before the hold
-      refused(db, confirmed(SOL, T - MIN + 5 * MIN + 1), /cleared only by its confirmation/); // more than 5 minutes after it
-      refused(db, confirmed(heldEquity + 1n, T), /cleared only by its confirmation/); // above what the hold saw
-      accepted(db, confirmed(heldEquity, T - MIN + 5 * MIN)); // the edges: the held equity itself, 5 minutes after
+      refused(db, { ...held, jumpPending: false, jumpHeld: null }, /never by an observation/);
+      // a confirmation's exact shape, inside the window, at the held level: still only repo-jump.ts may write it
+      refused(db, { ...held, jumpPending: false, jumpHeld: null, jumpAck: { equity: lamports(heldEquity), at: T } }, /never by an observation/, T);
+      // the reviewer's reproduction: two hours after the hold, with the acknowledgement dated at the hold
+      refused(db, { ...held, jumpPending: false, jumpHeld: null, jumpAck: { equity: lamports(heldEquity), at: T - MIN } }, /never by an observation/, T + 2 * HOUR);
+    });
+  });
+
+  it('the confirmation\'s writer clears a hold only at its own time, at most 5 minutes after the hold and never above it, and writes only the jump columns', () => {
+    const heldEquity = SOL + SOL / 2n;
+    const held: EquityState = { ...BASE, jumpPending: true, jumpHeld: { equity: lamports(heldEquity), at: T - MIN } };
+    /** Refused with nothing written, even when a careless caller catches the refusal and commits. */
+    const confirmRefused = (db: Db, equity: bigint, at: number, why: RegExp): void => {
+      const before = readDayState(db, 'paper');
+      db.transaction((tx) => {
+        assert.match(storageError(() => confirmHeldJump(tx, 'paper', lamports(equity), at), 'bad-param').detail, why);
+      });
+      assert.deepEqual(readDayState(db, 'paper'), before);
+    };
+    from(BASE, (db) => confirmRefused(db, SOL, T, /no held jump/));
+    from(held, (db) => {
+      confirmRefused(db, SOL, T - MIN - 1, /never before it/); // before the hold
+      confirmRefused(db, SOL, T - MIN + 5 * MIN + 1, /at most 5 minutes/); // more than 5 minutes after it
+      confirmRefused(db, heldEquity, T + 2 * HOUR, /at most 5 minutes/); // the reviewer's case: long after, at the held level
+      confirmRefused(db, heldEquity + 1n, T, /never vouches for more/); // above what the hold saw
+      // the edges: the held equity itself, 5 minutes after; only the jump columns change, the acknowledgement at the write's time
+      db.transaction((tx) => confirmHeldJump(tx, 'paper', lamports(heldEquity), T - MIN + 5 * MIN));
+      assert.deepEqual(readDayState(db, 'paper'), { ...held, jumpPending: false, jumpHeld: null, jumpAck: { equity: lamports(heldEquity), at: T - MIN + 5 * MIN } });
+      assert.equal(db.get("SELECT updated_at FROM day_state WHERE mode = 'paper'")?.['updated_at'], BigInt(T - MIN + 5 * MIN));
+      assert.deepEqual(readDayState(db, 'live'), emptyEquityState(), 'the other mode stays');
+      confirmRefused(db, SOL, T, /no held jump/); // once cleared, nothing more to confirm
+    });
+    from(held, (db) => {
+      db.transaction((tx) => confirmHeldJump(tx, 'paper', lamports(0n), T - MIN)); // at the hold itself, a verified level of 0
+      assert.deepEqual(readDayState(db, 'paper').jumpAck, { equity: lamports(0n), at: T - MIN });
+      storageError(() => db.transaction((tx) => confirmHeldJump(tx, 'demo' as unknown as 'paper', lamports(SOL), T)), 'bad-param');
+      storageError(() => db.transaction((tx) => confirmHeldJump(tx, 'paper', -1n as unknown as ReturnType<typeof lamports>, T)), 'bad-param');
+      storageError(() => db.transaction((tx) => confirmHeldJump(tx, 'paper', lamports(SOL), Number.NaN)), 'bad-param');
+    });
+  });
+
+  it('the acknowledgement changes at no other time (the observation\'s writer)', () => {
+    const heldEquity = SOL + SOL / 2n;
+    const held: EquityState = { ...BASE, jumpPending: true, jumpHeld: { equity: lamports(heldEquity), at: T - MIN } };
+    from(held, (db) => {
+      db.transaction((tx) => confirmHeldJump(tx, 'paper', lamports(heldEquity), T - MIN + 5 * MIN));
       const ack = readDayState(db, 'paper');
       // with no hold, it changes at no other time: not moved, not cleared, not with a new hold
       refused(db, { ...ack, jumpAck: { equity: lamports(SOL), at: T } }, /changes only with a confirmation/);
@@ -308,11 +365,25 @@ describe('the engine\'s write is never looser than the step of risk/daystate.ts 
     });
   });
 
-  it('the 5 minutes are risk/daystate.ts\'s own: its confirmation at the edge is written, and a millisecond later it refuses itself', () => {
+  it('the 5 minutes are risk/daystate.ts\'s own: its confirmation at the edge is written exactly as it makes it, and a millisecond later it refuses itself', () => {
     const held: EquityState = { ...BASE, jumpPending: true, jumpHeld: { equity: lamports(SOL + SOL / 2n), at: T - MIN } };
     from(held, (db) => {
       assert.throws(() => confirmEquityJump(held, lamports(SOL), T - MIN + 5 * MIN + 1, POLICY), RiskError);
-      accepted(db, confirmEquityJump(held, lamports(SOL), T - MIN + 5 * MIN, POLICY));
+      const next = confirmEquityJump(held, lamports(SOL), T - MIN + 5 * MIN, POLICY);
+      db.transaction((tx) => confirmHeldJump(tx, 'paper', (next.jumpAck as { readonly equity: ReturnType<typeof lamports> }).equity, T - MIN + 5 * MIN));
+      assert.deepEqual(readDayState(db, 'paper'), next);
+    });
+  });
+
+  it('a confirmation whose write changes no row is refused, never taken as done (a database the schema forbids: a held pair without jump_pending)', () => {
+    const held: EquityState = { ...BASE, jumpPending: true, jumpHeld: { equity: lamports(SOL + SOL / 2n), at: T - MIN } };
+    from(held, (db) => {
+      db.transaction((tx) => {
+        // the real reads, and a write that finds no held row: the second line behind the schema's CHECK
+        const noRow: Tx = { get: (sql, ...p) => tx.get(sql, ...p), all: (sql, ...p) => tx.all(sql, ...p), run: () => 0, script: () => undefined };
+        assert.match(storageError(() => confirmHeldJump(noRow, 'paper', lamports(SOL), T), 'row-count').detail, /the confirmed jump/);
+      });
+      assert.deepEqual(readDayState(db, 'paper'), held);
     });
   });
 

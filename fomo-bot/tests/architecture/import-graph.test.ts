@@ -129,6 +129,11 @@ const RESTRICTED_FILES: Readonly<Record<string, { readonly allows: (rel: string)
   // clearing a held equity jump: no strategy, Telegram or AI path may (contract 3; 6e-2, STORAGE_DESIGN
   // s.17.3); the server's confirm command is cli/, and Phase 3 adds its verification file by name
   'app/jump-tx.ts': { allows: (rel) => rel.startsWith('cli/'), who: 'cli/ (the server confirms; Phase 3 names the verification file)' },
+  // and its writer underneath, so contract 3 holds even for code that skips app/jump-tx.ts (review W1,
+  // security 1); the observation's writes (the day state, the snapshots T1's freshness rule trusts) only
+  // from the observation itself (review W1, risk 1 and security 1)
+  'storage/repo-jump.ts': { allows: (rel) => rel === 'app/jump-tx.ts', who: 'app/jump-tx.ts (the jump confirmation)' },
+  'storage/repo-observe.ts': { allows: (rel) => rel === 'app/day-tx.ts', who: 'app/day-tx.ts (the equity observation)' },
   'storage/repo-book.ts': {
     allows: (rel) => rel.startsWith('app/') || rel === 'storage/repo-orders.ts' || rel === 'storage/repo-redeem.ts',
     who: 'app/, storage/repo-orders.ts and storage/repo-redeem.ts',
@@ -853,8 +858,17 @@ function sqlWrites(tokens: readonly SqlToken[]): SqlWrite[] {
 const OWNER_WRITERS: readonly string[] = ['storage/repo-owner.ts', 'storage/repo-server.ts'];
 /** Config versions: the owner's commands, the setup at the server, and the engine's checked due step (STORAGE_DESIGN s.14). */
 const CONFIG_VERSION_WRITERS: readonly string[] = [...OWNER_WRITERS, 'storage/repo-config.ts'];
-/** The day state: the engine's own writer, and the owner's resume and the server's reset with their restarts. */
-const DAY_STATE_WRITERS: readonly string[] = ['storage/repo-day.ts', ...OWNER_WRITERS];
+/** The day state: the engine's observation writer, the jump confirmation's writer (review W1), and the owner's resume and the server's reset with their restarts. */
+const DAY_STATE_WRITERS: readonly string[] = ['storage/repo-observe.ts', 'storage/repo-jump.ts', ...OWNER_WRITERS];
+/** The one statement storage/repo-jump.ts may run on day_state: clear a held jump and set its acknowledgement (review W1). */
+const CLEAR_HOLD_SETS: readonly (readonly [string, string])[] = [
+  ['jump_pending', '0'],
+  ['jump_held_equity', 'NULL'],
+  ['jump_held_at', 'NULL'],
+  ['jump_ack_equity', '?'],
+  ['jump_ack_at', '?'],
+  ['updated_at', '?'],
+];
 /** The start of the one WHERE that may close a position in this step (the abandon's). */
 const OPENING_WHERE = sqlTokens("id = ? AND status = 'opening'");
 /** A position's amounts: in this step only the abandon moves them (review S, risk 5). */
@@ -922,8 +936,8 @@ function writeProblems(rel: string, sql: string): string[] {
         out.push(`${rel}: a waiting change is deleted one at a time, by its path (WHERE path = ?)`);
       }
     } else if (w.table === 'equity_snapshots') {
-      if (w.kind === 'update' || rel !== 'storage/repo-day.ts') {
-        out.push(`${rel}: only repo-day.ts adds and prunes equity snapshots; none is changed`);
+      if (w.kind === 'update' || rel !== 'storage/repo-observe.ts') {
+        out.push(`${rel}: only repo-observe.ts adds and prunes equity snapshots; none is changed`);
       }
     } else if (w.table === 'ledger_accounts') {
       // the setup writes both accounts once; T3's settlement and Phase 8's transfers get their own reviewed rules (6c-2b-2)
@@ -1021,9 +1035,20 @@ function writeProblems(rel: string, sql: string): string[] {
         }
       } else if (w.table === 'day_state') {
         if (!DAY_STATE_WRITERS.includes(rel)) {
-          out.push(`${rel}: only repo-day.ts, repo-owner.ts and repo-server.ts write the day state`);
+          out.push(`${rel}: only repo-observe.ts, repo-jump.ts, repo-owner.ts and repo-server.ts write the day state`);
         }
-        // the engine's writer sets it from a parameter and refuses a lift in its code (repo-day.ts); a written 0 is a lift
+        // the confirmation's writer only clears a held jump: exactly these columns, from a held row
+        const clearsHold =
+          w.sets.length === CLEAR_HOLD_SETS.length &&
+          CLEAR_HOLD_SETS.every(([column, value]) => {
+            const set = items(column);
+            return set.length === 1 && set[0] !== undefined && sameTokens(set[0].value, sqlTokens(value));
+          }) &&
+          sameTokens(w.where, sqlTokens('mode = ? AND jump_pending = 1'));
+        if (rel === 'storage/repo-jump.ts' && !clearsHold) {
+          out.push(`${rel}: repo-jump.ts only clears a held jump (jump_pending = 0, the held pair NULL, the acknowledgement and updated_at from parameters, WHERE mode = ? AND jump_pending = 1)`);
+        }
+        // the engine's writer sets it from a parameter and refuses a lift in its code (repo-observe.ts); a written 0 is a lift
         const lifts = items('streak_halt').some((s) => !sameTokens(s.value, one) && !sameTokens(s.value, sqlTokens('?')));
         if (lifts && !OWNER_WRITERS.includes(rel)) {
           out.push(`${rel}: only repo-owner.ts and repo-server.ts lift the two-day halt (streak_halt set to anything but 1)`);
@@ -2090,6 +2115,16 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['app/x.ts', "import { confirmJumpTx } from './jump-tx.ts'; export function f(): void { confirmJumpTx(); }", `${only} cli/`],
       ['strategies/x.ts', "import { confirmJumpTx } from '../app/jump-tx.ts'; export function f(): void { confirmJumpTx(); }", `${only} cli/`],
       ['app/day-tx.ts', "export { confirmJumpTx } from './jump-tx.ts';", only],
+      // review W1: the writers under them, each only from its one app/ file (the confirmation's and the observation's)
+      ['app/x.ts', "import { confirmHeldJump } from '../storage/repo-jump.ts'; export function f(): void { confirmHeldJump(); }", `${only} app/jump-tx.ts`],
+      ['app/day-tx.ts', "import { confirmHeldJump } from '../storage/repo-jump.ts'; export function f(): void { confirmHeldJump(); }", `${only} app/jump-tx.ts`],
+      ['app/owner.ts', "import { confirmHeldJump } from '../storage/repo-jump.ts'; export function f(): void { confirmHeldJump(); }", `${only} app/jump-tx.ts`],
+      ['cli/confirm.ts', "import { confirmHeldJump } from '../storage/repo-jump.ts'; export function f(): void { confirmHeldJump(); }", `${only} app/jump-tx.ts`],
+      ['app/x.ts', "import { insertSnapshot } from '../storage/repo-observe.ts'; export function f(): void { insertSnapshot(); }", `${only} app/day-tx.ts`],
+      ['app/jump-tx.ts', "import { writeDayState } from '../storage/repo-observe.ts'; export function f(): void { writeDayState(); }", `${only} app/day-tx.ts`],
+      ['app/approve-tx.ts', "import { insertSnapshot } from '../storage/repo-observe.ts'; export function f(): void { insertSnapshot(); }", `${only} app/day-tx.ts`],
+      ['storage/repo-x.ts', "import { writeDayState } from './repo-observe.ts'; export function f(): void { writeDayState(); }", `${only} app/day-tx.ts`],
+      ['app/jump-tx.ts', "export { confirmHeldJump } from '../storage/repo-jump.ts';", only], // the allowed importer, but a re-export
       // 6e-3: the engine's config step holds no owner writer (s.17.3): the owner's commands are app/owner-tx.ts (6e-4)
       ['app/config-tx.ts', "import { writeOwnerConfig } from '../storage/repo-owner.ts'; export function f(): number | null { return writeOwnerConfig(); }", only],
       // 6e-4: the owner's transactions reach only the owner's command paths
@@ -2117,6 +2152,9 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['app/engine.ts', "import { createEngineAuthority } from './authority.ts'; import { bootStorage } from './storage-boot.ts'; export function f(): void { bootStorage(); createEngineAuthority(); }"],
       ['cli/start.ts', "import { startPaperEngine } from '../app/engine.ts'; import { systemRng } from '../core/rng.ts'; export function f(): void { startPaperEngine(systemRng); }"],
       ['cli/confirm.ts', "import { confirmJumpTx } from '../app/jump-tx.ts'; export function f(): void { confirmJumpTx(); }"],
+      ['app/jump-tx.ts', "import { confirmHeldJump } from '../storage/repo-jump.ts'; export function f(): void { confirmHeldJump(); }"],
+      ['app/day-tx.ts', "import { insertSnapshot, writeDayState } from '../storage/repo-observe.ts'; export function f(): void { insertSnapshot(); writeDayState(); }"],
+      ['app/snapshot.ts', "import { newestSnapshot, readDayState } from '../storage/repo-day.ts'; export function f(): void { readDayState(); newestSnapshot(); }"], // the readers stay open
       ['app/x.ts', "import { applyDueTx, readConfigState } from './config-tx.ts'; export function f(): void { readConfigState(); applyDueTx(); }"], // unrestricted: no owner writer in it
       ['app/owner-tx.ts', "import { writeOwnerConfig } from '../storage/repo-owner.ts'; export function f(): number | null { return writeOwnerConfig(); }"],
       ['app/owner.ts', "import { setTx } from './owner-tx.ts'; export function onSet(): void { setTx(); }"],
@@ -2220,16 +2258,25 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['storage/repo-config.ts', 'DELETE FROM pending_changes WHERE apply_at <= ?', 'a waiting change is deleted one at a time, by its path'],
       ['storage/repo-owner.ts', 'DELETE FROM pending_changes WHERE path = ? OR 1 = 1', 'a waiting change is deleted one at a time, by its path'],
       ['storage/repo-owner.ts', 'DELETE FROM pending_changes AS p WHERE p.path = ? RETURNING path', 'a waiting change is deleted one at a time, by its path'],
-      ['storage/repo-flags.ts', 'UPDATE day_state SET peak = ? WHERE mode = ?', 'only repo-day.ts, repo-owner.ts and repo-server.ts write the day state'],
-      ['storage/repo-day.ts', 'UPDATE day_state SET daily_stop_streak = 0, streak_halt = 0 WHERE mode = ?', 'only repo-owner.ts and repo-server.ts lift the two-day halt'],
-      ['storage/repo-day.ts', 'UPDATE day_state SET streak_halt = ?, streak_halt = 0 WHERE mode = ?', 'set each column of day_state once'],
-      ['storage/repo-day.ts', 'UPDATE day_state SET (streak_halt, peak) = (0, NULL) WHERE mode = ?', 'set each column of day_state on its own'],
-      ['storage/repo-day.ts', "DELETE FROM day_state WHERE mode = 'paper'", "the day state rows are the migration's"],
-      ['storage/repo-day.ts', "INSERT INTO day_state (mode, shape) VALUES ('paper', 1)", "the day state rows are the migration's"],
+      ['storage/repo-flags.ts', 'UPDATE day_state SET peak = ? WHERE mode = ?', 'only repo-observe.ts, repo-jump.ts, repo-owner.ts and repo-server.ts write the day state'],
+      ['storage/repo-observe.ts', 'UPDATE day_state SET daily_stop_streak = 0, streak_halt = 0 WHERE mode = ?', 'only repo-owner.ts and repo-server.ts lift the two-day halt'],
+      ['storage/repo-observe.ts', 'UPDATE day_state SET streak_halt = ?, streak_halt = 0 WHERE mode = ?', 'set each column of day_state once'],
+      ['storage/repo-observe.ts', 'UPDATE day_state SET (streak_halt, peak) = (0, NULL) WHERE mode = ?', 'set each column of day_state on its own'],
+      ['storage/repo-observe.ts', "DELETE FROM day_state WHERE mode = 'paper'", "the day state rows are the migration's"],
+      ['storage/repo-observe.ts', "INSERT INTO day_state (mode, shape) VALUES ('paper', 1)", "the day state rows are the migration's"],
       ['storage/repo-flags.ts', 'INSERT INTO day_state (mode) VALUES (?)', "the day state rows are the migration's"],
-      ['storage/repo-flags.ts', 'INSERT INTO equity_snapshots (mode, at) VALUES (?, ?)', 'only repo-day.ts adds and prunes equity snapshots'],
-      ['storage/repo-flags.ts', 'DELETE FROM equity_snapshots WHERE at < ?', 'only repo-day.ts adds and prunes equity snapshots'],
-      ['storage/repo-day.ts', 'UPDATE equity_snapshots SET equity = ? WHERE at = ?', 'only repo-day.ts adds and prunes equity snapshots; none is changed'],
+      ['storage/repo-flags.ts', 'INSERT INTO equity_snapshots (mode, at) VALUES (?, ?)', 'only repo-observe.ts adds and prunes equity snapshots'],
+      ['storage/repo-flags.ts', 'DELETE FROM equity_snapshots WHERE at < ?', 'only repo-observe.ts adds and prunes equity snapshots'],
+      ['storage/repo-observe.ts', 'UPDATE equity_snapshots SET equity = ? WHERE at = ?', 'only repo-observe.ts adds and prunes equity snapshots; none is changed'],
+      // review W1: the readers' file writes nothing; the confirmation's writer only clears a held jump, from the held state
+      ['storage/repo-day.ts', 'UPDATE day_state SET day = ? WHERE mode = ?', 'only repo-observe.ts, repo-jump.ts, repo-owner.ts and repo-server.ts write the day state'],
+      ['storage/repo-day.ts', 'INSERT INTO equity_snapshots (mode, at) VALUES (?, ?)', 'only repo-observe.ts adds and prunes equity snapshots'],
+      ['storage/repo-jump.ts', 'INSERT INTO equity_snapshots (mode, at) VALUES (?, ?)', 'only repo-observe.ts adds and prunes equity snapshots'],
+      ['storage/repo-jump.ts', 'UPDATE day_state SET peak = ?, updated_at = ? WHERE mode = ?', 'repo-jump.ts only clears a held jump'],
+      ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = ?, updated_at = ? WHERE mode = ?', 'repo-jump.ts only clears a held jump'],
+      ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = 0, updated_at = ? WHERE mode = ? AND jump_pending = 1', 'repo-jump.ts only clears a held jump'],
+      ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = ?, updated_at = ? WHERE mode = ? AND jump_pending = 1 OR 1 = 1', 'repo-jump.ts only clears a held jump'],
+      ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = ?, updated_at = ?, last_equity = ? WHERE mode = ? AND jump_pending = 1', 'repo-jump.ts only clears a held jump'],
       // the book and the money path (6c-2b-2, STORAGE_DESIGN s.15.11)
       ['storage/repo-day.ts', 'INSERT INTO ledger_accounts (mode) VALUES (?)', 'only repo-server.ts writes the ledger accounts'],
       ['storage/repo-book.ts', 'UPDATE ledger_accounts SET total_deposits = ? WHERE mode = ?', 'only repo-server.ts writes the ledger accounts'],
@@ -2303,11 +2350,12 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['storage/repo-config.ts', 'DELETE FROM pending_changes WHERE path = ?'],
       ['storage/repo-owner.ts', 'INSERT INTO pending_changes (path, from_value, to_value, source, requested_at, apply_at) VALUES (?, ?, ?, ?, ?, ?)'],
       ['storage/repo-owner.ts', 'DELETE FROM pending_changes WHERE path = ?'],
-      ['storage/repo-day.ts', 'UPDATE day_state SET day = ?, peak = ?, daily_stop_streak = ?, streak_halt = ?, updated_at = ? WHERE mode = ?'],
+      ['storage/repo-observe.ts', 'UPDATE day_state SET day = ?, peak = ?, daily_stop_streak = ?, streak_halt = ?, updated_at = ? WHERE mode = ?'],
+      ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = ?, updated_at = ? WHERE mode = ? AND jump_pending = 1'],
       ['storage/repo-owner.ts', 'UPDATE day_state SET daily_stop_streak = 0, streak_halt = 0, updated_at = ? WHERE mode = ?'],
       ['storage/repo-server.ts', "UPDATE day_state SET peak = last_equity, updated_at = ? WHERE mode = ? AND jump_pending = 0 AND last_equity <> '0'"],
-      ['storage/repo-day.ts', 'INSERT INTO equity_snapshots (mode, at, equity, stop_equity) VALUES (?, ?, ?, ?) ON CONFLICT (mode, at) DO NOTHING'],
-      ['storage/repo-day.ts', 'DELETE FROM equity_snapshots WHERE at < ?'],
+      ['storage/repo-observe.ts', 'INSERT INTO equity_snapshots (mode, at, equity, stop_equity) VALUES (?, ?, ?, ?) ON CONFLICT (mode, at) DO NOTHING'],
+      ['storage/repo-observe.ts', 'DELETE FROM equity_snapshots WHERE at < ?'],
       ['storage/repo-server.ts', 'INSERT INTO ledger_accounts (mode, sol, total_deposits, total_withdrawals, updated_at) VALUES (?, ?, ?, ?, ?)'],
       ['storage/repo-book.ts', "INSERT INTO positions (id, mint, strategy, mode, status, opened_at, max_spend, p95_exit_cost, updated_at) VALUES (?, ?, ?, ?, 'opening', ?, ?, ?, ?)"],
       ['storage/repo-book.ts', "UPDATE positions SET exit_seq = exit_seq + 1, updated_at = ? WHERE id = ? AND exit_seq = ? AND status IN ('open', 'exiting')"],
