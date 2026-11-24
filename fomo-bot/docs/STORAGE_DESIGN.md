@@ -5586,7 +5586,9 @@ Conditions from review W, each with the step it is due by:
   - Security N1 (the W-fix re-check): only repo-observe.ts (from parameters, refused in its code) and
     repo-jump.ts (its pinned UPDATE) may set the `jump_*` columns of day_state; the owner's and the
     server's writers (today the peak and the streak only) may not, with a canary. repo-owner.ts is
-    reachable from Telegram, so a later edit there must not be able to clear a hold unseen.
+    reachable from Telegram, so a later edit there must not be able to clear a hold unseen. DONE
+    (2026-11-24, with step 7a, reviewed in REVIEWS.md X): the day_state write rule refuses any of the
+    five jump columns outside those two files; three canaries; planted bugs `mut/run41.py`, 3 of 3.
 - Phase 7 (the server's commands and the owner's guide): security W2 4 and risk W2 3: one far-future
   stored time dates every later command and stalls the due step (fails closed); the guide gives the
   server step that recovers it.

@@ -920,6 +920,8 @@ const OWNER_WRITERS: readonly string[] = ['storage/repo-owner.ts', 'storage/repo
 const CONFIG_VERSION_WRITERS: readonly string[] = [...OWNER_WRITERS, 'storage/repo-config.ts'];
 /** The day state: the engine's observation writer, the jump confirmation's writer (review W1), and the owner's resume and the server's reset with their restarts. */
 const DAY_STATE_WRITERS: readonly string[] = ['storage/repo-observe.ts', 'storage/repo-jump.ts', ...OWNER_WRITERS];
+/** The day state's jump columns: the hold and its acknowledgement (security N1, the W-fix re-check). */
+const JUMP_COLUMNS: readonly string[] = ['jump_pending', 'jump_held_equity', 'jump_held_at', 'jump_ack_equity', 'jump_ack_at'];
 /** The one statement storage/repo-jump.ts may run on day_state: clear a held jump and set its acknowledgement (review W1). */
 const CLEAR_HOLD_SETS: readonly (readonly [string, string])[] = [
   ['jump_pending', '0'],
@@ -1107,6 +1109,11 @@ function writeProblems(rel: string, sql: string): string[] {
           sameTokens(w.where, sqlTokens('mode = ? AND jump_pending = 1'));
         if (rel === 'storage/repo-jump.ts' && !clearsHold) {
           out.push(`${rel}: repo-jump.ts only clears a held jump (jump_pending = 0, the held pair NULL, the acknowledgement and updated_at from parameters, WHERE mode = ? AND jump_pending = 1)`);
+        }
+        // the jump columns only from the observation (which refuses a clear in its code) and the confirmation
+        // (its pinned UPDATE): the owner's writers are reachable from Telegram (security N1, the W-fix re-check)
+        if (has(...JUMP_COLUMNS) && rel !== 'storage/repo-observe.ts' && rel !== 'storage/repo-jump.ts') {
+          out.push(`${rel}: only repo-observe.ts and repo-jump.ts set the jump columns of day_state (the owner's and the server's writers never touch a held jump)`);
         }
         // the engine's writer sets it from a parameter and refuses a lift in its code (repo-observe.ts); a written 0 is a lift
         const lifts = items('streak_halt').some((s) => !sameTokens(s.value, one) && !sameTokens(s.value, sqlTokens('?')));
@@ -2485,6 +2492,10 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['storage/repo-day.ts', 'INSERT INTO equity_snapshots (mode, at) VALUES (?, ?)', 'only repo-observe.ts adds and prunes equity snapshots'],
       ['storage/repo-jump.ts', 'INSERT INTO equity_snapshots (mode, at) VALUES (?, ?)', 'only repo-observe.ts adds and prunes equity snapshots'],
       ['storage/repo-jump.ts', 'UPDATE day_state SET peak = ?, updated_at = ? WHERE mode = ?', 'repo-jump.ts only clears a held jump'],
+      // security N1 (the W-fix re-check): the owner's and the server's writers never touch a held jump
+      ['storage/repo-owner.ts', 'UPDATE day_state SET jump_pending = 0, updated_at = ? WHERE mode = ?', 'only repo-observe.ts and repo-jump.ts set the jump columns'],
+      ['storage/repo-owner.ts', 'UPDATE day_state SET jump_ack_equity = ?, jump_ack_at = ? WHERE mode = ?', 'only repo-observe.ts and repo-jump.ts set the jump columns'],
+      ['storage/repo-server.ts', 'UPDATE day_state SET jump_held_equity = NULL, jump_held_at = NULL, updated_at = ? WHERE mode = ?', 'only repo-observe.ts and repo-jump.ts set the jump columns'],
       ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = ?, updated_at = ? WHERE mode = ?', 'repo-jump.ts only clears a held jump'],
       ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = 0, updated_at = ? WHERE mode = ? AND jump_pending = 1', 'repo-jump.ts only clears a held jump'],
       ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = ?, updated_at = ? WHERE mode = ? AND jump_pending = 1 OR 1 = 1', 'repo-jump.ts only clears a held jump'],
