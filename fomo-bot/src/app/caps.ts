@@ -9,13 +9,14 @@
 // is a Phase 8 change.
 import { HARD_CAPS } from '../config/caps.ts';
 import type { Tunables } from '../config/tunables.ts';
-import { bps, lamports, microLamportsPerCu, type Lamports } from '../core/units.ts';
+import { bps, bpsOfFloor, lamports, microLamportsPerCu, type Lamports } from '../core/units.ts';
 import type { EquityPolicy as MarkPolicy } from '../portfolio/equity.ts';
 import type { BuyCaps } from '../risk/approve.ts';
 import type { EquityPolicy as DayPolicy } from '../risk/daystate.ts';
 import type { Route } from '../risk/plan.ts';
 import type { PlanCaps } from '../risk/recheck.ts';
 import { BASE_FEE_PER_SIGNATURE, attemptCost } from '../risk/reserve.ts';
+import { capsInEffect, tradeMinimum } from '../risk/sizing.ts';
 import type { StoredAccount } from '../storage/repo-book.ts';
 import { AppError } from './faults.ts';
 
@@ -109,4 +110,19 @@ export function dayPolicyOf(mode: 'paper', t: Tunables, paper: StoredAccount): D
     sanityBankrollMultiple: HARD_CAPS.equitySanityBankrollMultiple,
     jumpBps: bps(HARD_CAPS.equityJumpBps),
   });
+}
+
+/**
+ * The low-equity stop (C33; RISK_POLICY s.6 step 4): new entries stop when the per-trade share of the
+ * sizing equity is below the account minimum. Exactly sizeEntry's equity-below-minimum (risk/sizing.ts),
+ * on the caps in effect for paper and approve.ts's sizing equity (the day's baseline when it is above
+ * zero and below the equity, else the equity); the pool's own minimum plays no part (the pool is not
+ * known here). Pure; an agreement property pins it to sizeEntry.
+ */
+export function lowEquityStopOf(dayStart: Lamports, equity: Lamports, t: Tunables): boolean {
+  const start = lamports(dayStart);
+  const now = lamports(equity);
+  const caps = capsInEffect(buyCapsOf(t, lamports(0n)).sizing, 'paper', null);
+  const sizingEquity = start > 0n && start < now ? start : now;
+  return bpsOfFloor(sizingEquity, caps.perTradeBps) < tradeMinimum(lamports(0n), caps);
 }

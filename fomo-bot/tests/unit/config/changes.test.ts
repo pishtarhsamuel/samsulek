@@ -13,6 +13,7 @@ import {
   firstVersion,
   nextVersion,
   planAiApproval,
+  planCancel,
   planRollback,
   planSet,
   type ChangeContext,
@@ -433,6 +434,26 @@ describe('pending rows', () => {
     // inherited fields do not count
     const inherited = Object.create(good) as PendingChange;
     assert.throws(() => applyDuePending(D, [inherited], PAPER), ConfigError);
+  });
+});
+
+describe('/cancel: planCancel (6e-3, STORAGE_DESIGN s.17.4)', () => {
+  const waiting = row('risk.dailyStopBps', D.risk.dailyStopBps, 2_000, NOW + HOUR);
+  it("returns the tunable's waiting loosening, the rest untouched", () => {
+    const other = row('exits.hardStopBps', D.exits.hardStopBps, 500, NOW + 2 * HOUR);
+    assert.deepEqual(planCancel([waiting, other], 'risk.dailyStopBps', LIVE), { ok: true, cancelled: waiting });
+  });
+  it('refuses an unknown tunable and one with nothing waiting', () => {
+    assert.deepEqual(planCancel([waiting], 'risk.noSuchThing', LIVE), { ok: false, reason: 'unknown-parameter' });
+    assert.deepEqual(planCancel([waiting], 42, LIVE), { ok: false, reason: 'unknown-parameter' });
+    assert.deepEqual(planCancel([waiting], 'exits.hardStopBps', LIVE), { ok: false, reason: 'nothing-to-cancel' });
+    assert.deepEqual(planCancel([], 'risk.dailyStopBps', PAPER), { ok: false, reason: 'nothing-to-cancel' });
+  });
+  it('malformed rows and a malformed context throw, as every planner does', () => {
+    assert.throws(() => planCancel([{ ...waiting, path: 'risk.noSuchThing' as TunablePath }], 'risk.dailyStopBps', LIVE), ConfigError);
+    assert.throws(() => planCancel([waiting, waiting], 'risk.dailyStopBps', LIVE), ConfigError);
+    assert.throws(() => planCancel([waiting], 'risk.dailyStopBps', { ...LIVE, now: Number.NaN }), ConfigError);
+    assert.throws(() => planCancel([{ ...waiting, requestedAt: NOW + 1 }], 'risk.dailyStopBps', LIVE), ConfigError); // asked for after now
   });
 });
 

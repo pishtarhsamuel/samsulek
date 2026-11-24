@@ -391,6 +391,154 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      reason written down). The first run showed four weak tests and one missing check (a live
      position), all fixed, and one freeze that did nothing (removed).
 
+   Done in step 6e-1 (the equity observation, STORAGE_DESIGN s.17.12; UNREVIEWED, owner decision D11, on
+   the same branch):
+   - The snapshot readers: the nearest known row at or before now with its own time (the older on a
+     tie, a row after now never used, now before the target, unknown rows skipped), the newest row at or
+     before now with unknown equity; both against a brute-force oracle on 1,000 random row sets.
+   - The low-equity stop: off at 0.2 SOL of sizing equity at 10% per trade, on one lamport below; the
+     day's baseline as the sizing equity; 5% needs 0.4 SOL; agreement with sizeEntry's
+     equity-below-minimum on 1,000 random equities, baselines and shares.
+   - The observation: the first one sets the day, its baseline and the peak, at one clock reading (a
+     clock that would answer differently is read once); each halting trip as its halt row with its own
+     audit row first, level-triggered; two halts in one tick interleave with their rows (C28); the daily
+     stop and the jump hold in the day state; anomalies stored as unknown snapshots; a clock back across
+     midnight halts, stores no snapshot and prunes nothing; a same-day baseline of 0 set again (C39);
+     the base missing, ok at exactly the tolerance, far one millisecond past it, and never a row after
+     now (C42); unknown equity (the stops idle at under 5 minutes, on the stops equity after); the
+     low-equity stop on, kept by the day's baseline, off on a new day, one alert per turn-on (C33).
+   - The failures (C40): an untrusted clock writes nothing and warns at most every 10 minutes; a live
+     position, a day-state write storage refuses (a planted state) and a marks reader that throws each
+     set the day-state-error halt with its row and the anchor, and the next tick observes the stored
+     state again; busy writes nothing and halts nothing; a failed anchor write only warns.
+   - Athens midnight on 2026-03-29 (23 hours) and 2026-10-25 (25 hours): the daily stop lasts until
+     local midnight, never an hour early or late.
+   - The watch: each alert, its severity and codes, the rate limit and its edges, a hold's first tick,
+     unknown equity over 5 minutes, the base alerts only after the first hour, a throwing sink.
+   - Fault injection: every statement of the richest observation (two halts, the stop, a snapshot, the
+     prune) failed in turn with full, io, constraint, bad-param and busy: only the failure's halts and
+     their audit rows stay, and the latch is as s.17.5.6 says.
+   - The day-sequence property: 200 random runs of up to 40 steps (across both time-change nights) and
+     two fixed sequences, against the pure functions on a model, after every step.
+   - Planted bugs: 43; 42 caught, 1 equivalent (paper's caps are inside the hard values). The first run
+     showed two weak tests (a missing live account; the watch's first-hour edge), both fixed.
+
+   Done in step 6e-2 (the jump confirmation and T1's freshness, STORAGE_DESIGN s.17.13; UNREVIEWED, D11):
+   - T1's freshness: refused `day-state-stale` with no paper snapshot (a live one never counts), one
+     30,001 ms old, one with unknown equity, one only after now, or a valued older one behind an unvalued
+     newest one; accepted at 30,000 ms. Every 6d-2 T1 test passes with a fresh snapshot in its world.
+   - The confirmation: at the hold and 5 minutes after it, the lower of the verified and the held level;
+     refused 5 minutes and 1 ms after, before the hold, with no hold and above the sanity limits, writing
+     nothing and setting no halt; it works while KILL, a halt and the pause are set (C41); the clock read
+     once; the next observation moves the baseline and the peak again; an untrusted clock writes
+     nothing; a value that is not lamports halts with day-state-error; busy does not, and three busy
+     confirmations make a busy storm.
+   - The race: inside an observation that trips the daily stop or the peak halt, a buy on a second
+     connection is busy and unrecorded; after the commit it is refused by that stop.
+   - The import rule: only cli/ imports app/jump-tx.ts (three canaries, one allowed import).
+   - Planted bugs: 18, every one caught after two weak tests were fixed.
+
+   Done in step 6e-3 (the engine's config step, STORAGE_DESIGN s.17.14; UNREVIEWED, D11):
+   - `readConfigState`: the setup read back (version 1 active, nothing waiting, nothing live, all frozen);
+     the newest version active; a lamport amount kept as a bigint (up to the u64 maximum) and any other
+     made a number up to 2^53 - 1, one past it refused in `from` or `to`; a paper or off strategy never
+     counted as live; ConfigError for a waiting row that names no tunable, values that do not decode and a
+     `changed` list with a name that is no tunable (each on a database file changed behind the bot's back).
+   - `commandTime`: the latest of now, the active version's time and every waiting row's request time.
+   - `applyDueTx`: nothing waiting and a row 1 ms before its time write nothing; one row applied at its
+     time exactly as queued (the next version by the row's source, undoing to the active one, the row
+     gone, the engine's row, the anchor, an info alert); two rows chained in the order they fall due,
+     then the tunables' order, each undoing to the one before, every stored version decoding to the
+     plan's values; a clock behind the active version dates the step as that version; a stale row and an
+     out-of-bounds row dropped with the engine's row; an exit value demotes every live strategy (not a
+     paper one) and restarts every gate, a risk value neither; the clock read once; an untrusted clock
+     and a waiting row asked for after now write nothing (the second warns, neither latches); a version
+     that does not decode and an amount past 2^53 - 1 are `error:config` with entries latched as a bug; a
+     failed anchor write only warns; `LIVE_ARMED_IN_PAPER` is false.
+   - Fault injection: every statement of the richest step (two versions, a dropped row, a demotion, every
+     gate, a waiting row kept) failed in each of full, io, constraint, bad-param and busy: the database as
+     before (plus only the disk-db halt for full and io), no anchor moved, the latch and the alerts as
+     s.17.5.6 says.
+   - `planCancel`: an unknown name, nothing to cancel, the row returned, malformed rows and context throw.
+   - The import rule: app/config-tx.ts cannot import repo-owner.ts (a canary); app/ may import it.
+   - Planted bugs: 35, every one caught after one missing test (a paper strategy) was added.
+
+   Done in step 6e-4 (the owner's commands, STORAGE_DESIGN s.17.15; UNREVIEWED, D11):
+   - `setTx`: in paper a value applies at once (safer or riskier; a lamport value kept whole; from
+     Telegram or the server), as the next version by the owner, undoing to the active one, with the
+     owner's row and the anchor; a strategy's own value restarts its count, an exit value and the paper
+     model every count; nine refusals (unknown name, a mode, not a number in three forms, out of bounds
+     either side, no change, a paper model less pessimistic) write nothing; while a strategy is live a
+     riskier risk value waits a day and a safer one then applies and replaces it; a /set to the current
+     value cancels its waiting row; a live strategy's own value demotes it, the engine's row after the
+     owner's; a clock behind the active version or a waiting row runs the command at that time and warns,
+     and dates a demotion and a gate restart as the command, not the clock;
+     a stored version that does not decode is `error:config` at the owner site; an actor that is not the
+     owner is a TypeError for all four commands.
+   - `rollbackTx`: nothing to roll back at the setup; one step back (author rollback, the earlier undo
+     target); two steps along the undo chain, then nothing left; a paper-model-only rollback refused;
+     with a strategy live, a rollback whose fields all wait makes only waiting rows.
+   - `cancelPendingTx`: the row deleted with the owner's cancel row; an unknown name and nothing waiting
+     refused; a row the engine applied first is gone.
+   - `resumeTx`: the peak refused, writing nothing and never as a bug, when not halted, with a held jump,
+     no known equity, no money check, one 60,001 ms old, or a newest one that could not value everything;
+     resumed at 60,000 ms exactly as `resumePeak` computes, with the clear time, the owner's row and the
+     anchor; the streak resumed as `resumeStreak` computes without a money check, the live halt left; a
+     halt that storage then cannot find is `error:bad-request`; a wrong kind is a TypeError;
+     `RESUME_FRESH_MS` is 60,000.
+   - The race: the due step and /cancel on one due row, both orders: the inner one is busy and writes
+     nothing; afterwards it finds no row.
+   - Fault injection: every statement of the richest /set, /rollback, /cancel and /resume failed in each
+     of full, io, constraint, bad-param and busy: the database as before (plus only the disk-db halt for
+     full and io), no anchor moved, the latch and the alerts as s.17.5.6 says.
+   - The command-sequence property (200 runs of up to 30 steps, two fixed sequences first): random /set,
+     /rollback, /cancel, due steps, clock moves both ways and strategies set live, against the planners
+     on a model at the same command time: outcomes, history, waiting rows, modes and gates equal after
+     every step; storage never refuses a planner's plan; the owner's row comes first. The day-sequence
+     property now resumes through `resumeTx`.
+   - The import rules: app/owner-tx.ts only from app/owner.ts and cli/ (six canaries, three allowed
+     imports, two "handed on" canaries); nothing in src/ imports it at runtime yet (a scan of the real
+     files, which sees app/owner-tx.ts's own import of app/config-tx.ts).
+   - The no-catch rule's new clause (C32): a function parameter, a variable holding a returned function,
+     a destructured method and a parameter called in a followed helper are each flagged inside a
+     transaction; an interface method and a function written in place in a variable are not.
+   - Planted bugs: 42 on the final code, every one caught; the first draft's run found one missing test
+     (a demotion with the clock behind), added.
+
+   Done in the review W fix (STORAGE_DESIGN s.17.16; on the unreviewed branch, re-checked by both
+   reviewers before 6e joins the working branch):
+   - The three day-state files: their exports pinned (the readers in repo-day.ts, the observation's
+     writes in repo-observe.ts, the confirmation's write in repo-jump.ts).
+   - The observation's writer never clears a held jump, not even in a confirmation's exact shape, and
+     refuses the reviewer's reproduction (two hours after the hold, the acknowledgement dated at the
+     hold); the acknowledgement changes at no other time (not moved, raised, cleared, or set with a new
+     hold; a new hold keeps it).
+   - The confirmation's writer: refused with nothing written (even when a careless caller catches the
+     refusal and commits) with no held jump, a time before the hold, more than 5 minutes after it, the
+     reviewer's case, or an equity above the held level; at the edges (the held level, exactly 5 minutes,
+     a level of 0 at the hold itself) only the jump columns change, the acknowledgement and updated_at at
+     the write's own time, the other mode untouched; a write that finds no row is refused (row-count);
+     risk/daystate.ts's confirmation at the 5-minute edge is written exactly as it makes it.
+   - The day-sequence property confirms through the confirmation's writer; every 6e-1 and 6e-2 test
+     runs on the split files unchanged.
+   - The import rules: repo-observe.ts only from app/day-tx.ts, repo-jump.ts only from app/jump-tx.ts
+     (nine canaries, a re-export among them; three allowed imports); the write rules: only repo-observe.ts
+     adds and prunes snapshots, the day state is written only by repo-observe.ts, repo-jump.ts,
+     repo-owner.ts and repo-server.ts, and repo-jump.ts runs only its one clearing UPDATE (eight canaries,
+     the readers' file writing nothing among them).
+   - The no-catch rule's indirect calls (security W2 note 2): a handed-in function called through call,
+     apply or Reflect.apply, through an element, the result of a call or a namespace import, or under a
+     cast; a function with a try reached through call, Reflect.apply, bind, a lib method given it by name,
+     or a lib method on a value holding the transaction; a function value handed to the lib; an interface
+     method handed to a lib method on a value holding the transaction: each flagged (15 canaries). A
+     function written in place and called at once, call and Reflect.apply of a function the rule follows,
+     the lib's own apply, and a named function handed to the lib are not (seven fine cases), and the real
+     src/ is clean.
+   - Planted bugs: 33 in the split (scratchpad `mut/run38.py`), 32 caught on the first run; the one left
+     (no row-count check) cannot happen with a real database, whose CHECK ties jump_pending to the held
+     pair, so a test with a write that finds no row was added: 33 of 33. 15 in the rule (`mut/run39.py`):
+     15 of 15 on the first run.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

@@ -102,7 +102,13 @@ const RESTRICTED_FILES: Readonly<Record<string, { readonly allows: (rel: string)
     allows: (rel) => ['storage/repo-audit.ts', 'storage/repo-owner.ts', 'storage/repo-server.ts'].includes(rel),
     who: 'storage/repo-audit.ts, repo-owner.ts and repo-server.ts',
   },
-  'storage/repo-owner.ts': { allows: (rel) => rel === 'app/owner.ts' || rel.startsWith('cli/'), who: 'app/owner.ts (Telegram, after the owner check) and cli/' },
+  'storage/repo-owner.ts': {
+    allows: (rel) => rel === 'app/owner.ts' || rel === 'app/owner-tx.ts' || rel.startsWith('cli/'),
+    who: 'app/owner.ts (Telegram, after the owner check), app/owner-tx.ts (the owner\'s transactions) and cli/',
+  },
+  // the owner's transactions write the owner's rows, so they are restricted like the writer itself
+  // (6e-4, STORAGE_DESIGN s.17.3): if any app/ file could call them, the engine could forge an owner command
+  'app/owner-tx.ts': { allows: (rel) => rel === 'app/owner.ts' || rel.startsWith('cli/'), who: 'app/owner.ts (Telegram, after the owner check) and cli/' },
   'storage/repo-server.ts': { allows: (rel) => rel.startsWith('cli/'), who: 'cli/ (the owner at the server)' },
   'app/owner.ts': { allows: () => false, who: 'its one Telegram wiring file (Phase 3 names it; none until then)' },
   // the money path (6c-2b-2, STORAGE_DESIGN s.15.11): T1 lives in app/; only the token store bound into
@@ -120,6 +126,14 @@ const RESTRICTED_FILES: Readonly<Record<string, { readonly allows: (rel: string)
   'app/authority.ts': { allows: (rel) => rel === 'app/engine.ts', who: 'app/engine.ts (one authority per process)' },
   'app/storage-boot.ts': { allows: (rel) => rel === 'app/engine.ts', who: 'app/engine.ts (the boot runs once, before the authority)' },
   'app/engine.ts': { allows: (rel) => rel.startsWith('cli/'), who: 'cli/ (the process entry)' },
+  // clearing a held equity jump: no strategy, Telegram or AI path may (contract 3; 6e-2, STORAGE_DESIGN
+  // s.17.3); the server's confirm command is cli/, and Phase 3 adds its verification file by name
+  'app/jump-tx.ts': { allows: (rel) => rel.startsWith('cli/'), who: 'cli/ (the server confirms; Phase 3 names the verification file)' },
+  // and its writer underneath, so contract 3 holds even for code that skips app/jump-tx.ts (review W1,
+  // security 1); the observation's writes (the day state, the snapshots T1's freshness rule trusts) only
+  // from the observation itself (review W1, risk 1 and security 1)
+  'storage/repo-jump.ts': { allows: (rel) => rel === 'app/jump-tx.ts', who: 'app/jump-tx.ts (the jump confirmation)' },
+  'storage/repo-observe.ts': { allows: (rel) => rel === 'app/day-tx.ts', who: 'app/day-tx.ts (the equity observation)' },
   'storage/repo-book.ts': {
     allows: (rel) => rel.startsWith('app/') || rel === 'storage/repo-orders.ts' || rel === 'storage/repo-redeem.ts',
     who: 'app/, storage/repo-orders.ts and storage/repo-redeem.ts',
@@ -844,8 +858,17 @@ function sqlWrites(tokens: readonly SqlToken[]): SqlWrite[] {
 const OWNER_WRITERS: readonly string[] = ['storage/repo-owner.ts', 'storage/repo-server.ts'];
 /** Config versions: the owner's commands, the setup at the server, and the engine's checked due step (STORAGE_DESIGN s.14). */
 const CONFIG_VERSION_WRITERS: readonly string[] = [...OWNER_WRITERS, 'storage/repo-config.ts'];
-/** The day state: the engine's own writer, and the owner's resume and the server's reset with their restarts. */
-const DAY_STATE_WRITERS: readonly string[] = ['storage/repo-day.ts', ...OWNER_WRITERS];
+/** The day state: the engine's observation writer, the jump confirmation's writer (review W1), and the owner's resume and the server's reset with their restarts. */
+const DAY_STATE_WRITERS: readonly string[] = ['storage/repo-observe.ts', 'storage/repo-jump.ts', ...OWNER_WRITERS];
+/** The one statement storage/repo-jump.ts may run on day_state: clear a held jump and set its acknowledgement (review W1). */
+const CLEAR_HOLD_SETS: readonly (readonly [string, string])[] = [
+  ['jump_pending', '0'],
+  ['jump_held_equity', 'NULL'],
+  ['jump_held_at', 'NULL'],
+  ['jump_ack_equity', '?'],
+  ['jump_ack_at', '?'],
+  ['updated_at', '?'],
+];
 /** The start of the one WHERE that may close a position in this step (the abandon's). */
 const OPENING_WHERE = sqlTokens("id = ? AND status = 'opening'");
 /** A position's amounts: in this step only the abandon moves them (review S, risk 5). */
@@ -913,8 +936,8 @@ function writeProblems(rel: string, sql: string): string[] {
         out.push(`${rel}: a waiting change is deleted one at a time, by its path (WHERE path = ?)`);
       }
     } else if (w.table === 'equity_snapshots') {
-      if (w.kind === 'update' || rel !== 'storage/repo-day.ts') {
-        out.push(`${rel}: only repo-day.ts adds and prunes equity snapshots; none is changed`);
+      if (w.kind === 'update' || rel !== 'storage/repo-observe.ts') {
+        out.push(`${rel}: only repo-observe.ts adds and prunes equity snapshots; none is changed`);
       }
     } else if (w.table === 'ledger_accounts') {
       // the setup writes both accounts once; T3's settlement and Phase 8's transfers get their own reviewed rules (6c-2b-2)
@@ -1012,9 +1035,20 @@ function writeProblems(rel: string, sql: string): string[] {
         }
       } else if (w.table === 'day_state') {
         if (!DAY_STATE_WRITERS.includes(rel)) {
-          out.push(`${rel}: only repo-day.ts, repo-owner.ts and repo-server.ts write the day state`);
+          out.push(`${rel}: only repo-observe.ts, repo-jump.ts, repo-owner.ts and repo-server.ts write the day state`);
         }
-        // the engine's writer sets it from a parameter and refuses a lift in its code (repo-day.ts); a written 0 is a lift
+        // the confirmation's writer only clears a held jump: exactly these columns, from a held row
+        const clearsHold =
+          w.sets.length === CLEAR_HOLD_SETS.length &&
+          CLEAR_HOLD_SETS.every(([column, value]) => {
+            const set = items(column);
+            return set.length === 1 && set[0] !== undefined && sameTokens(set[0].value, sqlTokens(value));
+          }) &&
+          sameTokens(w.where, sqlTokens('mode = ? AND jump_pending = 1'));
+        if (rel === 'storage/repo-jump.ts' && !clearsHold) {
+          out.push(`${rel}: repo-jump.ts only clears a held jump (jump_pending = 0, the held pair NULL, the acknowledgement and updated_at from parameters, WHERE mode = ? AND jump_pending = 1)`);
+        }
+        // the engine's writer sets it from a parameter and refuses a lift in its code (repo-observe.ts); a written 0 is a lift
         const lifts = items('streak_halt').some((s) => !sameTokens(s.value, one) && !sameTokens(s.value, sqlTokens('?')));
         if (lifts && !OWNER_WRITERS.includes(rel)) {
           out.push(`${rel}: only repo-owner.ts and repo-server.ts lift the two-day halt (streak_halt set to anything but 1)`);
@@ -1394,7 +1428,14 @@ export interface NoCatchResult {
  * 2. its body, nested functions included, has no try statement and calls no member named catch, then
  *    or finally;
  * 3. every call (or `new`) in it of a function, method or class declared in app/ or cli/ is followed,
- *    with a visited set, and that body is held to rules 2 to 4;
+ *    with a visited set, and that body is held to rules 2 to 4; a function value of app/ or cli/ that
+ *    cannot be followed (a parameter, or a variable that holds no function written in place) is never
+ *    called there (6e-4: a planner handed in as a closure would run unseen). Review W (security W2 note
+ *    2): a call through the lib's call, apply or bind, or through Reflect.apply or Reflect.construct, is a
+ *    call of the function it hands on, and a cast or parentheses change nothing; a function of app/ or
+ *    cli/ handed on by name (to map, say) is followed too, and a function value the rule cannot follow is
+ *    handed only to code it follows; a function it cannot name (an element, the result of a call) is
+ *    never called;
  * 4. an argument that could hand the transaction on is passed only to a function declared in
  *    storage/, app/ or cli/ (followed by rule 3) or in TypeScript's own lib files (Promise's members
  *    excepted): a function written in place, any value that can be called (a closure over the
@@ -1402,12 +1443,15 @@ export interface NoCatchResult {
  *    of storage/sqlite.ts (the handle itself, or an object or array holding one, three levels deep).
  *    So an interface method, a parameter or a variable of function type never receives the
  *    transaction or a closure over it (review U, security 1: a closure in a variable, an object
- *    holding the handle and a bound function used to get past);
+ *    holding the handle and a bound function used to get past). A lib method called on a value that
+ *    holds the handle (`[tx].forEach(f)`) gets only a function written in place or one of storage/,
+ *    app/ or cli/ with a body (review W);
  * 5. in storage/ (sqlite.ts and migrations.ts excepted) every catch block ends with a throw.
  * LIMIT, written down: code behind an interface or reached through `this` is not followed; rule 4
  * keeps the transaction and every function value from it, but not a handle hidden deeper than three
- * levels or behind a type rewritten by hand (app/ has no classes with such methods); review is the
- * guard there.
+ * levels or behind a type rewritten by hand (app/ has no classes with such methods), nor one inside a
+ * lib container (a Map or a Set) or stored outside the callback (in an outer variable or property, or
+ * pushed into an outer array) and read later by code behind an interface; review is the guard there.
  */
 export function noCatchProblems(program: ts.Program, srcRoot: string): NoCatchResult {
   const checker = program.getTypeChecker();
@@ -1482,31 +1526,115 @@ export function noCatchProblems(program: ts.Program, srcRoot: string): NoCatchRe
     return d !== undefined && relOf(d.getSourceFile()) === SQLITE_FILE;
   };
 
+  /** Parentheses, casts and `!` change no call: the expression under them is what runs. */
+  const strip = (e: ts.Expression): ts.Expression => {
+    let x = e;
+    while (ts.isParenthesizedExpression(x) || ts.isAsExpression(x) || ts.isTypeAssertionExpression(x) || ts.isNonNullExpression(x) || ts.isSatisfiesExpression(x)) {
+      x = x.expression;
+    }
+    return x;
+  };
+  const inLib = (d: ts.Declaration | undefined): d is ts.Declaration => d !== undefined && program.isSourceFileDefaultLibrary(d.getSourceFile());
+  const isFunctionValue = (d: ts.Declaration): boolean => ts.isParameter(d) || ts.isVariableDeclaration(d) || ts.isBindingElement(d);
+  const ofAppOrCli = (rel: string): boolean => inSrc(rel) && ['app', 'cli'].includes(folderOf(rel));
+  /**
+   * The function a call runs (review W, security W2 note 2): its callee, or, for the lib's call, apply and
+   * bind and for Reflect.apply and Reflect.construct, the function they hand the call to.
+   */
+  const targetOf = (node: ts.CallExpression | ts.NewExpression): { readonly target: ts.Expression | undefined; readonly forwarded: boolean } => {
+    const callee = strip(node.expression);
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(callee) && inLib(declarationOf(callee))) {
+      const name = callee.name.text;
+      if (ts.isIdentifier(callee.expression) && callee.expression.text === 'Reflect' && (name === 'apply' || name === 'construct')) {
+        const first = node.arguments[0];
+        return { target: first === undefined ? undefined : strip(first), forwarded: true };
+      }
+      if (name === 'call' || name === 'apply' || name === 'bind') {
+        return { target: strip(callee.expression), forwarded: true };
+      }
+    }
+    return { target: callee, forwarded: false };
+  };
+
   const checkBody = (rel: string, where: string, root: ts.Node): void => {
+    const follow = (dRel: string, body: ts.Node): void => {
+      if (!visited.has(body)) {
+        visited.add(body);
+        followed += 1;
+        checkBody(dRel, `followed from ${rel}`, body);
+      }
+    };
     const visit = (node: ts.Node): void => {
       if (ts.isTryStatement(node)) {
         problems.push(`${rel}: no try inside a transaction callback (${where})`);
       }
       if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
-        const callee = node.expression;
+        const callee = strip(node.expression);
         if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(callee) && ['catch', 'then', 'finally'].includes(callee.name.text)) {
           problems.push(`${rel}: no .${callee.name.text}( inside a transaction callback (${where})`);
         }
-        const d = declarationOf(callee);
+        const { target, forwarded } = targetOf(node);
+        const d = target === undefined ? undefined : declarationOf(target);
         const dRel = d === undefined ? '' : relOf(d.getSourceFile());
         const body = d === undefined ? undefined : bodyOf(d);
-        const carries = (node.arguments ?? []).some(handsOn);
-        if (carries) {
+        const unfollowable = d !== undefined && body === undefined && isFunctionValue(d);
+        // a name, a namespace member (`lib.run`) or a forwarded target; an interface's methods resolve to signatures, not values
+        if (unfollowable && ofAppOrCli(dRel)) {
+          problems.push(`${rel}: a function value of app/ or cli/ (a parameter or a variable) is called inside a transaction callback, where the rule cannot follow it (${where})`);
+        }
+        // review W: a function the rule cannot name (an element, a call's result, a conditional) is never called
+        const named =
+          target === undefined ||
+          ts.isIdentifier(target) ||
+          ts.isPropertyAccessExpression(target) ||
+          ts.isArrowFunction(target) ||
+          ts.isFunctionExpression(target) ||
+          target.kind === ts.SyntaxKind.SuperKeyword ||
+          target.kind === ts.SyntaxKind.ImportKeyword;
+        if (!named) {
+          problems.push(`${rel}: a function the rule cannot name (an element, the result of a call, or another expression) is called inside a transaction callback (${where})`);
+        }
+        const args = node.arguments ?? [];
+        const followedHere = body !== undefined && ofAppOrCli(dRel);
+        if (args.some(handsOn)) {
           const ours = d !== undefined && body !== undefined && inSrc(dRel) && ['storage', 'app', 'cli'].includes(folderOf(dRel));
-          const lib = d !== undefined && program.isSourceFileDefaultLibrary(d.getSourceFile()) && !isPromiseMember(d);
+          const lib = inLib(d) && !isPromiseMember(d);
           if (!ours && !lib) {
             problems.push(`${rel}: the transaction, a function or a value holding the transaction goes only to a function of storage/, app/ or cli/, or of TypeScript's own lib (${where})`);
           }
         }
-        if (body !== undefined && inSrc(dRel) && ['app', 'cli'].includes(folderOf(dRel)) && !visited.has(body)) {
-          visited.add(body);
-          followed += 1;
-          checkBody(dRel, `followed from ${rel}`, body);
+        // review W: a lib method on a value holding the transaction hands it to the function it is given
+        if (!forwarded && ts.isPropertyAccessExpression(callee) && inLib(d) && holdsHandle(checker.getTypeAtLocation(callee.expression), 3)) {
+          for (const a of args) {
+            const s = strip(a);
+            if (ts.isArrowFunction(s) || ts.isFunctionExpression(s) || !isCallable(checker.getTypeAtLocation(s))) {
+              continue; // written in place (read where it stands), or no function at all
+            }
+            const da = ts.isIdentifier(s) || ts.isPropertyAccessExpression(s) ? declarationOf(s) : undefined;
+            const aRel = da === undefined ? '' : relOf(da.getSourceFile());
+            if (da === undefined || bodyOf(da) === undefined || !inSrc(aRel) || !['storage', 'app', 'cli'].includes(folderOf(aRel))) {
+              problems.push(`${rel}: the transaction, a function or a value holding the transaction goes only to a function of storage/, app/ or cli/, or of TypeScript's own lib (a lib method on a value holding it calls the function it is given) (${where})`);
+            }
+          }
+        }
+        // review W: a function of app/ or cli/ handed on by name runs too, so it is followed; a function
+        // value the rule cannot follow is handed only to code the rule follows (which never calls it unseen)
+        for (const a of args) {
+          const s = strip(a);
+          const da = s !== target && (ts.isIdentifier(s) || ts.isPropertyAccessExpression(s)) ? declarationOf(s) : undefined;
+          const aRel = da === undefined ? '' : relOf(da.getSourceFile());
+          if (da === undefined || !ofAppOrCli(aRel)) {
+            continue;
+          }
+          const aBody = bodyOf(da);
+          if (aBody !== undefined) {
+            follow(aRel, aBody);
+          } else if (isFunctionValue(da) && isCallable(checker.getTypeAtLocation(s)) && !followedHere) {
+            problems.push(`${rel}: a function value of app/ or cli/ (a parameter or a variable) is handed on inside a transaction callback to a function that calls it where the rule cannot follow it (${where})`);
+          }
+        }
+        if (followedHere) {
+          follow(dRel, body);
         }
       }
       ts.forEachChild(node, visit);
@@ -2007,6 +2135,31 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
     assert.deepEqual(symlinksUnder(SRC), []);
   });
 
+  it('nothing in src/ imports the owner\'s transactions at runtime yet: Phase 3\'s app/owner.ts and Phase 7\'s cli/ will (6e-4, s.17.3)', () => {
+    /** The real source files that load `target` at runtime: an import that is not type-only, a re-export or a dynamic import. */
+    const importersOf = (target: string): string[] =>
+      sourceFiles().filter((rel) => {
+        const source = ts.createSourceFile(rel, readFileSync(path.join(SRC, rel), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+        const hits = (spec: ts.Node | undefined): boolean =>
+          spec !== undefined && ts.isStringLiteral(spec) && spec.text.startsWith('.') && path.relative(SRC, path.resolve(SRC, path.dirname(rel), spec.text)).split(path.sep).join('/').toLowerCase() === target;
+        let found = false;
+        const visit = (node: ts.Node): void => {
+          if (ts.isImportDeclaration(node) && node.importClause?.isTypeOnly !== true && hits(node.moduleSpecifier)) {
+            found = true;
+          } else if (ts.isExportDeclaration(node) && !node.isTypeOnly && hits(node.moduleSpecifier)) {
+            found = true;
+          } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword && hits(node.arguments[0])) {
+            found = true;
+          }
+          ts.forEachChild(node, visit);
+        };
+        visit(source);
+        return found;
+      });
+    assert.deepEqual(importersOf('app/owner-tx.ts'), []);
+    assert.deepEqual(importersOf('app/config-tx.ts'), ['app/owner-tx.ts'], 'the scan sees a real import');
+  });
+
   it('CANARY: the audit writers reach only their callers: the chain only its three files, the owner\'s only app/owner.ts and cli/, the server\'s only cli/, app/owner.ts only its wiring file; none is re-exported or imported dynamically (reviews P, Q)', () => {
     const only = 'may be imported at runtime only by';
     flaggedFor([
@@ -2046,6 +2199,29 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['app/approve-tx.ts', "import { bootStorage } from './storage-boot.ts'; export function f(): void { bootStorage(); }", `${only} app/engine.ts`],
       ['app/x.ts', "import { startPaperEngine } from './engine.ts'; export function f(): void { startPaperEngine(); }", `${only} cli/`],
       ['app/engine.ts', "export { createEngineAuthority } from './authority.ts';", only],
+      // 6e-2: a held equity jump is cleared only from cli/ (contract 3)
+      ['app/x.ts', "import { confirmJumpTx } from './jump-tx.ts'; export function f(): void { confirmJumpTx(); }", `${only} cli/`],
+      ['strategies/x.ts', "import { confirmJumpTx } from '../app/jump-tx.ts'; export function f(): void { confirmJumpTx(); }", `${only} cli/`],
+      ['app/day-tx.ts', "export { confirmJumpTx } from './jump-tx.ts';", only],
+      // review W1: the writers under them, each only from its one app/ file (the confirmation's and the observation's)
+      ['app/x.ts', "import { confirmHeldJump } from '../storage/repo-jump.ts'; export function f(): void { confirmHeldJump(); }", `${only} app/jump-tx.ts`],
+      ['app/day-tx.ts', "import { confirmHeldJump } from '../storage/repo-jump.ts'; export function f(): void { confirmHeldJump(); }", `${only} app/jump-tx.ts`],
+      ['app/owner.ts', "import { confirmHeldJump } from '../storage/repo-jump.ts'; export function f(): void { confirmHeldJump(); }", `${only} app/jump-tx.ts`],
+      ['cli/confirm.ts', "import { confirmHeldJump } from '../storage/repo-jump.ts'; export function f(): void { confirmHeldJump(); }", `${only} app/jump-tx.ts`],
+      ['app/x.ts', "import { insertSnapshot } from '../storage/repo-observe.ts'; export function f(): void { insertSnapshot(); }", `${only} app/day-tx.ts`],
+      ['app/jump-tx.ts', "import { writeDayState } from '../storage/repo-observe.ts'; export function f(): void { writeDayState(); }", `${only} app/day-tx.ts`],
+      ['app/approve-tx.ts', "import { insertSnapshot } from '../storage/repo-observe.ts'; export function f(): void { insertSnapshot(); }", `${only} app/day-tx.ts`],
+      ['storage/repo-x.ts', "import { writeDayState } from './repo-observe.ts'; export function f(): void { writeDayState(); }", `${only} app/day-tx.ts`],
+      ['app/jump-tx.ts', "export { confirmHeldJump } from '../storage/repo-jump.ts';", only], // the allowed importer, but a re-export
+      // 6e-3: the engine's config step holds no owner writer (s.17.3): the owner's commands are app/owner-tx.ts (6e-4)
+      ['app/config-tx.ts', "import { writeOwnerConfig } from '../storage/repo-owner.ts'; export function f(): number | null { return writeOwnerConfig(); }", only],
+      // 6e-4: the owner's transactions reach only the owner's command paths
+      ['app/x.ts', "import { setTx } from './owner-tx.ts'; export function f(): void { setTx(); }", `${only} app/owner.ts`],
+      ['app/engine.ts', "import { resumeTx } from './owner-tx.ts'; export function f(): void { resumeTx(); }", `${only} app/owner.ts`],
+      ['app/config-tx.ts', "import { cancelPendingTx } from './owner-tx.ts'; export function f(): void { cancelPendingTx(); }", `${only} app/owner.ts`],
+      ['telegram/x.ts', "import { setTx } from '../app/owner-tx.ts'; export function f(): void { setTx(); }", `${only} app/owner.ts`],
+      ['app/owner.ts', "export { setTx } from './owner-tx.ts';", only], // an allowed importer, but a re-export
+      ['app/owner-tx.ts', "import { clearKill } from '../storage/repo-server.ts'; export function f(): void { clearKill(); }", `${only} cli/`], // never the server's writers
     ]);
     // the typed rule (below) checks that what is imported is only called; these are the import rules alone
     const fine: [string, string][] = [
@@ -2063,6 +2239,15 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['execution/x.ts', "import type { StoredOrder } from '../storage/repo-orders.ts'; export const x = (o: StoredOrder): StoredOrder => o;"],
       ['app/engine.ts', "import { createEngineAuthority } from './authority.ts'; import { bootStorage } from './storage-boot.ts'; export function f(): void { bootStorage(); createEngineAuthority(); }"],
       ['cli/start.ts', "import { startPaperEngine } from '../app/engine.ts'; import { systemRng } from '../core/rng.ts'; export function f(): void { startPaperEngine(systemRng); }"],
+      ['cli/confirm.ts', "import { confirmJumpTx } from '../app/jump-tx.ts'; export function f(): void { confirmJumpTx(); }"],
+      ['app/jump-tx.ts', "import { confirmHeldJump } from '../storage/repo-jump.ts'; export function f(): void { confirmHeldJump(); }"],
+      ['app/day-tx.ts', "import { insertSnapshot, writeDayState } from '../storage/repo-observe.ts'; export function f(): void { insertSnapshot(); writeDayState(); }"],
+      ['app/snapshot.ts', "import { newestSnapshot, readDayState } from '../storage/repo-day.ts'; export function f(): void { readDayState(); newestSnapshot(); }"], // the readers stay open
+      ['app/x.ts', "import { applyDueTx, readConfigState } from './config-tx.ts'; export function f(): void { readConfigState(); applyDueTx(); }"], // unrestricted: no owner writer in it
+      ['app/owner-tx.ts', "import { writeOwnerConfig } from '../storage/repo-owner.ts'; export function f(): number | null { return writeOwnerConfig(); }"],
+      ['app/owner.ts', "import { setTx } from './owner-tx.ts'; export function onSet(): void { setTx(); }"],
+      ['cli/config.ts', "import { rollbackTx } from '../app/owner-tx.ts'; export function f(): void { rollbackTx(); }"],
+      ['app/x.ts', "import type { OwnerConfigOutcome } from './owner-tx.ts'; export const x = (o: OwnerConfigOutcome): OwnerConfigOutcome => o;"],
       ['app/x.ts', "import { newId } from '../core/rng.ts'; export function f(): string { return newId('token'); }"],
       ['app/faults.ts', "import { RngError } from '../core/rng.ts'; export const isRng = (e: unknown): boolean => e instanceof RngError;"],
       ['execution/x.ts', "import type { Rng } from '../core/rng.ts'; export const x = (r: Rng): string => r.orderId();"],
@@ -2161,16 +2346,25 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['storage/repo-config.ts', 'DELETE FROM pending_changes WHERE apply_at <= ?', 'a waiting change is deleted one at a time, by its path'],
       ['storage/repo-owner.ts', 'DELETE FROM pending_changes WHERE path = ? OR 1 = 1', 'a waiting change is deleted one at a time, by its path'],
       ['storage/repo-owner.ts', 'DELETE FROM pending_changes AS p WHERE p.path = ? RETURNING path', 'a waiting change is deleted one at a time, by its path'],
-      ['storage/repo-flags.ts', 'UPDATE day_state SET peak = ? WHERE mode = ?', 'only repo-day.ts, repo-owner.ts and repo-server.ts write the day state'],
-      ['storage/repo-day.ts', 'UPDATE day_state SET daily_stop_streak = 0, streak_halt = 0 WHERE mode = ?', 'only repo-owner.ts and repo-server.ts lift the two-day halt'],
-      ['storage/repo-day.ts', 'UPDATE day_state SET streak_halt = ?, streak_halt = 0 WHERE mode = ?', 'set each column of day_state once'],
-      ['storage/repo-day.ts', 'UPDATE day_state SET (streak_halt, peak) = (0, NULL) WHERE mode = ?', 'set each column of day_state on its own'],
-      ['storage/repo-day.ts', "DELETE FROM day_state WHERE mode = 'paper'", "the day state rows are the migration's"],
-      ['storage/repo-day.ts', "INSERT INTO day_state (mode, shape) VALUES ('paper', 1)", "the day state rows are the migration's"],
+      ['storage/repo-flags.ts', 'UPDATE day_state SET peak = ? WHERE mode = ?', 'only repo-observe.ts, repo-jump.ts, repo-owner.ts and repo-server.ts write the day state'],
+      ['storage/repo-observe.ts', 'UPDATE day_state SET daily_stop_streak = 0, streak_halt = 0 WHERE mode = ?', 'only repo-owner.ts and repo-server.ts lift the two-day halt'],
+      ['storage/repo-observe.ts', 'UPDATE day_state SET streak_halt = ?, streak_halt = 0 WHERE mode = ?', 'set each column of day_state once'],
+      ['storage/repo-observe.ts', 'UPDATE day_state SET (streak_halt, peak) = (0, NULL) WHERE mode = ?', 'set each column of day_state on its own'],
+      ['storage/repo-observe.ts', "DELETE FROM day_state WHERE mode = 'paper'", "the day state rows are the migration's"],
+      ['storage/repo-observe.ts', "INSERT INTO day_state (mode, shape) VALUES ('paper', 1)", "the day state rows are the migration's"],
       ['storage/repo-flags.ts', 'INSERT INTO day_state (mode) VALUES (?)', "the day state rows are the migration's"],
-      ['storage/repo-flags.ts', 'INSERT INTO equity_snapshots (mode, at) VALUES (?, ?)', 'only repo-day.ts adds and prunes equity snapshots'],
-      ['storage/repo-flags.ts', 'DELETE FROM equity_snapshots WHERE at < ?', 'only repo-day.ts adds and prunes equity snapshots'],
-      ['storage/repo-day.ts', 'UPDATE equity_snapshots SET equity = ? WHERE at = ?', 'only repo-day.ts adds and prunes equity snapshots; none is changed'],
+      ['storage/repo-flags.ts', 'INSERT INTO equity_snapshots (mode, at) VALUES (?, ?)', 'only repo-observe.ts adds and prunes equity snapshots'],
+      ['storage/repo-flags.ts', 'DELETE FROM equity_snapshots WHERE at < ?', 'only repo-observe.ts adds and prunes equity snapshots'],
+      ['storage/repo-observe.ts', 'UPDATE equity_snapshots SET equity = ? WHERE at = ?', 'only repo-observe.ts adds and prunes equity snapshots; none is changed'],
+      // review W1: the readers' file writes nothing; the confirmation's writer only clears a held jump, from the held state
+      ['storage/repo-day.ts', 'UPDATE day_state SET day = ? WHERE mode = ?', 'only repo-observe.ts, repo-jump.ts, repo-owner.ts and repo-server.ts write the day state'],
+      ['storage/repo-day.ts', 'INSERT INTO equity_snapshots (mode, at) VALUES (?, ?)', 'only repo-observe.ts adds and prunes equity snapshots'],
+      ['storage/repo-jump.ts', 'INSERT INTO equity_snapshots (mode, at) VALUES (?, ?)', 'only repo-observe.ts adds and prunes equity snapshots'],
+      ['storage/repo-jump.ts', 'UPDATE day_state SET peak = ?, updated_at = ? WHERE mode = ?', 'repo-jump.ts only clears a held jump'],
+      ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = ?, updated_at = ? WHERE mode = ?', 'repo-jump.ts only clears a held jump'],
+      ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = 0, updated_at = ? WHERE mode = ? AND jump_pending = 1', 'repo-jump.ts only clears a held jump'],
+      ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = ?, updated_at = ? WHERE mode = ? AND jump_pending = 1 OR 1 = 1', 'repo-jump.ts only clears a held jump'],
+      ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = ?, updated_at = ?, last_equity = ? WHERE mode = ? AND jump_pending = 1', 'repo-jump.ts only clears a held jump'],
       // the book and the money path (6c-2b-2, STORAGE_DESIGN s.15.11)
       ['storage/repo-day.ts', 'INSERT INTO ledger_accounts (mode) VALUES (?)', 'only repo-server.ts writes the ledger accounts'],
       ['storage/repo-book.ts', 'UPDATE ledger_accounts SET total_deposits = ? WHERE mode = ?', 'only repo-server.ts writes the ledger accounts'],
@@ -2244,11 +2438,12 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       ['storage/repo-config.ts', 'DELETE FROM pending_changes WHERE path = ?'],
       ['storage/repo-owner.ts', 'INSERT INTO pending_changes (path, from_value, to_value, source, requested_at, apply_at) VALUES (?, ?, ?, ?, ?, ?)'],
       ['storage/repo-owner.ts', 'DELETE FROM pending_changes WHERE path = ?'],
-      ['storage/repo-day.ts', 'UPDATE day_state SET day = ?, peak = ?, daily_stop_streak = ?, streak_halt = ?, updated_at = ? WHERE mode = ?'],
+      ['storage/repo-observe.ts', 'UPDATE day_state SET day = ?, peak = ?, daily_stop_streak = ?, streak_halt = ?, updated_at = ? WHERE mode = ?'],
+      ['storage/repo-jump.ts', 'UPDATE day_state SET jump_pending = 0, jump_held_equity = NULL, jump_held_at = NULL, jump_ack_equity = ?, jump_ack_at = ?, updated_at = ? WHERE mode = ? AND jump_pending = 1'],
       ['storage/repo-owner.ts', 'UPDATE day_state SET daily_stop_streak = 0, streak_halt = 0, updated_at = ? WHERE mode = ?'],
       ['storage/repo-server.ts', "UPDATE day_state SET peak = last_equity, updated_at = ? WHERE mode = ? AND jump_pending = 0 AND last_equity <> '0'"],
-      ['storage/repo-day.ts', 'INSERT INTO equity_snapshots (mode, at, equity, stop_equity) VALUES (?, ?, ?, ?) ON CONFLICT (mode, at) DO NOTHING'],
-      ['storage/repo-day.ts', 'DELETE FROM equity_snapshots WHERE at < ?'],
+      ['storage/repo-observe.ts', 'INSERT INTO equity_snapshots (mode, at, equity, stop_equity) VALUES (?, ?, ?, ?) ON CONFLICT (mode, at) DO NOTHING'],
+      ['storage/repo-observe.ts', 'DELETE FROM equity_snapshots WHERE at < ?'],
       ['storage/repo-server.ts', 'INSERT INTO ledger_accounts (mode, sol, total_deposits, total_withdrawals, updated_at) VALUES (?, ?, ?, ?, ?)'],
       ['storage/repo-book.ts', "INSERT INTO positions (id, mint, strategy, mode, status, opened_at, max_spend, p95_exit_cost, updated_at) VALUES (?, ?, ?, ?, 'opening', ?, ?, ?, ?)"],
       ['storage/repo-book.ts', "UPDATE positions SET exit_seq = exit_seq + 1, updated_at = ? WHERE id = ? AND exit_seq = ? AND status IN ('open', 'exiting')"],
@@ -2446,6 +2641,9 @@ describe('architecture: purity across imports, re-exports and links (REVIEWS.md 
       'app/token-store.ts': ["import { redeemApproval } from '../storage/repo-redeem.ts';\nexport const r = redeemApproval;", handed],
       // the key maker handed on to whoever imports this app/ file (6d-1, STORAGE_DESIGN s.16.7.4)
       'app/x.ts': ["import { newApprovalKey } from '../core/rng.ts';\nexport const k = newApprovalKey;", handed],
+      // the owner's transactions handing an owner writer on, and an owner path handing them on (6e-4)
+      'app/owner-tx.ts': ["import { unpause } from '../storage/repo-owner.ts';\nexport const u = unpause;\nexport function setTx(): number { return 1; }", handed],
+      'cli/b13.ts': ["import { setTx } from '../app/owner-tx.ts';\nexport const s = setTx;", handed],
     };
     const { program, srcRoot } = virtualProgram({ ...files, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])) });
     const { problems, restrictedCalls } = sqlProblems(program, srcRoot);
@@ -2577,6 +2775,9 @@ describe('architecture: the approval transactions of step 6d-2 (STORAGE_DESIGN s
     const HEAD = "import type { Db, Tx } from '../storage/sqlite.ts';\nimport { write } from '../storage/repo-ok.ts';\n";
     const tryIn = 'no try inside a transaction callback';
     const handed = 'goes only to a function of storage/, app/ or cli/';
+    const unseen = 'is called inside a transaction callback, where the rule cannot follow it';
+    const unresolved = 'a function the rule cannot name (an element, the result of a call, or another expression) is called inside a transaction callback';
+    const handedOn = 'is handed on inside a transaction callback to a function that calls it where the rule cannot follow it';
     const bad: Record<string, readonly [string, ...string[]]> = {
       'app/c1.ts': [`${HEAD}export const f = (db: Db): number => db.transaction(() => { try { return 1; } catch { return 2; } });`, tryIn],
       'app/c2.ts': [`${HEAD}export const f = (db: Db): number => db.transaction(() => { const g = (): number => { try { return 1; } catch { return 2; } }; return g(); });`, tryIn],
@@ -2605,10 +2806,34 @@ describe('architecture: the approval transactions of step 6d-2 (STORAGE_DESIGN s
       'app/c19.ts': [`${HEAD}interface Each { each(fn: () => void): void }\nexport const f = (db: Db, e: Each): void => db.transaction((tx) => e.each(write.bind(null, tx, '')));`, handed],
       'app/c20.ts': [`${HEAD}interface Holder { run(o: unknown): void }\nexport const f = (db: Db, h: Holder): void => db.transaction((tx) => { const box = { inner: { tx } }; h.run(box); });`, handed],
       'app/c21.ts': [`${HEAD}interface Holder { run(o: readonly Tx[]): void }\nexport const f = (db: Db, h: Holder): void => db.transaction((tx) => h.run([tx]));`, handed],
+      // 6e-4: a function handed in, or held in a variable, runs code the rule cannot follow
+      'app/c22.ts': [`${HEAD}export const f = (db: Db, plan: () => number): number => db.transaction(() => plan());`, unseen],
+      'app/c23.ts': [`${HEAD}const pick = (): (() => number) => () => { try { return 1; } catch { return 2; } };\nexport const f = (db: Db): number => db.transaction(() => { const g = pick(); return g(); });`, unseen],
+      'app/c24.ts': [`${HEAD}export const f = (db: Db, o: { readonly run: () => number }): number => db.transaction(() => { const { run } = o; return run(); });`, unseen],
+      'app/c25.ts': [`${HEAD}const outer = (plan: () => number): number => plan();\nexport const f = (db: Db): number => db.transaction(() => outer(() => 1));`, `${unseen} (followed from app/c25.ts)`],
+      // review W, security W2 note 2: the reviewer's h6 to h8, a handed-in function called indirectly
+      'app/c26.ts': [`${HEAD}export const f = (db: Db, plan: () => number): number => db.transaction(() => plan.call(undefined));`, unseen],
+      'app/c27.ts': [`${HEAD}export const f = (db: Db, plan: () => number): number => db.transaction(() => Reflect.apply(plan, undefined, []));`, unseen],
+      'app/c28.ts': [`${HEAD}export const f = (db: Db, plans: readonly (() => number)[]): number => db.transaction(() => (plans.at(0) as () => number)());`, unresolved],
+      'app/c29.ts': [`${HEAD}export const f = (db: Db, plan: () => number): number => db.transaction(() => plan.apply(undefined, []));`, unseen],
+      'app/c30.ts': [`${HEAD}export const f = (db: Db, plans: readonly (() => number)[]): number => db.transaction(() => { const i = 0; return (plans[i] as () => number)(); });`, unresolved],
+      // and the transaction itself, handed through the lib to a function the rule did not follow
+      'app/c31.ts': [`${HEAD}const swallow = (t: Tx): void => { try { write(t, 'x'); } catch { void 0; } };\nexport const f = (db: Db): void => db.transaction((tx) => swallow.call(undefined, tx));`, `${tryIn} (followed from app/c31.ts)`],
+      'app/c32.ts': [`${HEAD}const swallow = (t: Tx): void => { try { write(t, 'x'); } catch { void 0; } };\nexport const f = (db: Db): void => db.transaction((tx) => { Reflect.apply(swallow, undefined, [tx]); });`, `${tryIn} (followed from app/c32.ts)`],
+      'app/c33.ts': [`${HEAD}const swallow = (t: Tx): void => { try { write(t, 'x'); } catch { void 0; } };\nexport const f = (db: Db): void => db.transaction((tx) => { swallow.bind(undefined, tx)(); });`, `${tryIn} (followed from app/c33.ts)`, unresolved],
+      'app/c34.ts': [`${HEAD}const swallow = (n: number): number => { try { return n; } catch { return 0; } };\nexport const f = (db: Db): number[] => db.transaction(() => [1, 2].map(swallow));`, `${tryIn} (followed from app/c34.ts)`],
+      'app/c35.ts': [`${HEAD}export const f = (db: Db, plan: (n: number) => number): number[] => db.transaction(() => [1, 2].map(plan));`, handedOn],
+      'app/c36.ts': [`${HEAD}interface Taker { take(t: Tx): void }\nexport const f = (db: Db, h: Taker): void => db.transaction((tx) => { [tx].forEach(h.take); });`, handed],
+      'app/c37.ts': [`${HEAD}const swallow = (t: Tx): void => { try { write(t, 'x'); } catch { void 0; } };\nexport const f = (db: Db): void => db.transaction((tx) => { [tx].forEach(swallow); });`, `${tryIn} (followed from app/c37.ts)`],
+      'app/c38.ts': [`${HEAD}export const f = (db: Db, plan: () => number): number => db.transaction(() => (plan as () => number)());`, unseen], // a cast does not hide it
+      // a function value reached through a namespace import, called directly or through call
+      'app/c39.ts': [`${HEAD}import * as lib from './c39-lib.ts';\nexport const f = (db: Db): number => db.transaction(() => lib.run());`, unseen],
+      'app/c40.ts': [`${HEAD}import * as lib from './c39-lib.ts';\nexport const f = (db: Db): number => db.transaction(() => lib.run.call(undefined));`, unseen],
     };
     const callers: Record<string, string> = {
       'app/c13.ts': `${HEAD}import { risky as r } from './c13-lib.ts';\nexport const f = (db: Db): number => db.transaction(() => r());`,
       'app/c14.ts': `${HEAD}import * as lib from './c14-lib.ts';\nexport const f = (db: Db): number => db.transaction(() => lib.risky());`,
+      'app/c39-lib.ts': 'const make = (): (() => number) => () => 1;\nexport const run = make();',
     };
     const ok: Record<string, string> = {
       'storage/repo-ok.ts': [
@@ -2628,6 +2853,23 @@ describe('architecture: the approval transactions of step 6d-2 (STORAGE_DESIGN s
         'interface Issuer { issue(x: string): string }',
         'interface Risk { decide(input: { readonly n: number }, issuer: Issuer): string }',
         "export const e = (db: Db, risk: Risk, issuer: Issuer): string => db.transaction((tx) => { write(tx, 'y'); return risk.decide({ n: 1 }, issuer); });",
+        // an interface method (the clock, the guard) is called, never followed, and never gets the handle
+        'interface Clock { now(): number }',
+        'export const g = (db: Db, clock: Clock): number => db.transaction(() => clock.now());',
+        // a function written in place in a variable is followed
+        'const local = (): number => 1;',
+        'export const h = (db: Db): number => db.transaction(() => local());',
+        // review W: a function written in place and called at once is read where it stands; call, apply and
+        // Reflect.apply of a function the rule follows, and of the lib's own; a named function to the lib is
+        // followed; the lib on a value holding the transaction with a function written in place
+        'export const i = (db: Db): number => db.transaction(() => (() => 1)());',
+        "const plain = (t: Tx): void => write(t, 'z');",
+        'export const j = (db: Db): void => db.transaction((tx) => plain.call(undefined, tx));',
+        'export const k = (db: Db): void => db.transaction((tx) => { Reflect.apply(plain, undefined, [tx]); });',
+        'export const l = (db: Db): number => db.transaction(() => Math.max.apply(null, [1, 2]));',
+        'export const m = (db: Db): number[] => db.transaction(() => [1, 2].map(local));',
+        "export const n = (db: Db): void => db.transaction((tx) => { [tx].forEach((t) => write(t, 'w')); });",
+        'export const o = (db: Db): void => db.transaction((tx) => { [tx].forEach(plain); });',
       ].join('\n'),
     };
     const { program, srcRoot } = virtualProgram({ 'storage/sqlite.ts': STUB, ...Object.fromEntries(Object.entries(bad).map(([rel, [text]]) => [rel, text])), ...callers, ...ok });

@@ -7,6 +7,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { AppError, classify, createEntryLatch, createFaultSink, isSecretRefusal, type Alert, type Fault } from '../../../src/app/faults.ts';
+import { ConfigError } from '../../../src/config/tunables.ts';
 import { AmountError } from '../../../src/core/units.ts';
 import { RngError } from '../../../src/core/rng.ts';
 import { LedgerError } from '../../../src/portfolio/ledger.ts';
@@ -78,6 +79,7 @@ describe('classify: each throw to its code, scope and alerts', () => {
       'abandon-token-valid': fault('error:abandon-token-valid', 'intent'),
       'position-not-sellable': fault('error:position-not-sellable', 'intent'),
       'entries-latched': fault('error:entries-latched', 'intent'),
+      'day-state-stale': fault('error:day-state-stale', 'intent'), // quiet: the stopped tick alerts on its own (6e)
       'rent-unknown': fault('error:rent-unknown', 'intent', { warn: true }),
       'p95-below-base-fee': fault('error:p95-below-base-fee', 'intent', { warn: true }),
       'stale-opening-has-order': fault('error:stale-opening-has-order', 'intent', { warn: true }),
@@ -113,6 +115,10 @@ describe('classify: each throw to its code, scope and alerts', () => {
     assert.deepEqual(classify(new RngError('rng-filter', 'x')), fault('error:rng-filter', 'intent', { warn: true }));
     assert.deepEqual(classify(new RngError('rng-zero-key', 'x')), fault('error:rng-zero-key', 'intent', { warn: true }));
     assert.deepEqual(classify(new RngError('rng-bad-bytes', 'x')), fault('error:rng-bad-bytes', 'intent', { bug: true }));
+  });
+
+  it('a stored config that does not decode is named error:config: entries latch, as a bug (6e, s.17.3)', () => {
+    assert.deepEqual(classify(new ConfigError('versions must come in order of their ids, without gaps')), fault('error:config', 'latch', { bug: true }));
   });
 
   it('anything else, and anything shaped to fool the check, is unexpected: a latch and a bug', () => {

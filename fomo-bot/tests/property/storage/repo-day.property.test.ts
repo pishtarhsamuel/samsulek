@@ -1,7 +1,7 @@
 // The engine's day-state write against risk/daystate.ts itself (review R, risk 1): every state the
 // risk module's steps make from the stored one (an observation, a confirmed jump, a deposit) is
-// written and read back unchanged, also around the owner's resumes, so the guard in repo-day.ts never
-// refuses what the risk module does. The steps run as the engine will run them (STORAGE_DESIGN.md
+// written and read back unchanged, also around the owner's resumes, so the guards in repo-observe.ts and
+// repo-jump.ts (review W1) never refuse what the risk module does. The steps run as the engine will run them (STORAGE_DESIGN.md
 // s.3.5): the hour-ago base from the stored snapshots, one write per step, the halt rows of the trips.
 // The refusals themselves are tested one by one in tests/unit/storage/repo-day.test.ts.
 import { describe, it } from 'node:test';
@@ -19,7 +19,9 @@ import {
   type EquityTrip,
 } from '../../../src/risk/daystate.ts';
 import { RiskError } from '../../../src/risk/reserve.ts';
-import { insertSnapshot, readDayState, snapshotNear, writeDayState } from '../../../src/storage/repo-day.ts';
+import { readDayState, snapshotNear } from '../../../src/storage/repo-day.ts';
+import { insertSnapshot, writeDayState } from '../../../src/storage/repo-observe.ts';
+import { confirmHeldJump } from '../../../src/storage/repo-jump.ts';
 import { setHalt } from '../../../src/storage/repo-flags.ts';
 import { resumeHalt } from '../../../src/storage/repo-owner.ts';
 import { StorageError, type Tx } from '../../../src/storage/sqlite.ts';
@@ -137,7 +139,7 @@ function step(tx: Tx, now: number, s: Step): void {
         now,
         equity: s.equity === null ? null : lamports(s.equity),
         stopEquity: stopEquity === null ? null : lamports(stopEquity),
-        equityAnHourAgo: snapshotNear(tx, 'paper', now - HOUR),
+        equityAnHourAgo: snapshotNear(tx, 'paper', now - HOUR, now)?.equity ?? null,
       };
       ({ state: next, trips } = observeEquity(before, observation, POLICY));
     } else if (s.kind === 'confirm') {
@@ -151,7 +153,12 @@ function step(tx: Tx, now: number, s: Step): void {
     }
     throw e;
   }
-  writeDayState(tx, 'paper', next, now); // never refused
+  if (s.kind === 'confirm') {
+    // the confirmation's own writer (review W1): the jump columns, the acknowledgement at this reading
+    confirmHeldJump(tx, 'paper', (next.jumpAck as { readonly equity: ReturnType<typeof lamports> }).equity, now); // never refused
+  } else {
+    writeDayState(tx, 'paper', next, now); // never refused
+  }
   assert.deepEqual(readDayState(tx, 'paper'), next);
   note(before, next, s.kind);
   if (s.kind === 'observe') {

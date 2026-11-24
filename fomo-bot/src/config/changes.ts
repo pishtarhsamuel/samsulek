@@ -109,7 +109,8 @@ export type RefusalReason =
   | 'duplicate-parameter'
   | 'too-many'
   | 'malformed'
-  | 'nothing-to-roll-back';
+  | 'nothing-to-roll-back'
+  | 'nothing-to-cancel';
 
 export interface Refusal {
   readonly ok: false;
@@ -543,6 +544,24 @@ export function planRollback(historyRaw: readonly ConfigVersion[], activeId: num
     return refuse(planned.kept.length > 0 ? 'paper-only-more-pessimistic' : 'no-change');
   }
   return Object.freeze({ ok: true as const, target: target.id, undoTo: target.undoTo, ...planned });
+}
+
+export type CancelResult = { readonly ok: true; readonly cancelled: PendingChange } | Refusal;
+
+/**
+ * /cancel <tunable> (6e-3, STORAGE_DESIGN s.17.4): its waiting loosening is removed, which leaves the
+ * config as strict as it is; refused for an unknown tunable or when nothing waits for it. The rows and
+ * the context are checked as every planner checks them. Engine contract: the owner's command writes
+ * the owner's row and deletes exactly the returned row.
+ */
+export function planCancel(pendingRaw: readonly PendingChange[], pathRaw: unknown, contextRaw: ChangeContext): CancelResult {
+  const ctx = checkContext(contextRaw);
+  const pending = checkPending(pendingRaw, ctx.now);
+  if (!isTunablePath(pathRaw)) {
+    return refuse('unknown-parameter');
+  }
+  const row = pending.find((p) => p.path === pathRaw);
+  return row === undefined ? refuse('nothing-to-cancel') : Object.freeze({ ok: true as const, cancelled: row });
 }
 
 // ---------------------------------------------------------------- pending live loosenings

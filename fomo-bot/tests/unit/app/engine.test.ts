@@ -20,6 +20,8 @@ import { verifyAuditChain } from '../../../src/storage/repo-audit.ts';
 import { readHalts, setKill } from '../../../src/storage/repo-flags.ts';
 import { buyOrderOf } from '../../../src/storage/repo-orders.ts';
 import { setStrategyMode } from '../../../src/storage/repo-owner.ts';
+import { insertSnapshot } from '../../../src/storage/repo-observe.ts';
+import { lamports } from '../../../src/core/units.ts';
 import { StorageError, type Db } from '../../../src/storage/sqlite.ts';
 import { WSOL } from '../risk/fixtures.ts';
 import { removeDir, tempDir } from '../storage/helpers.ts';
@@ -43,7 +45,10 @@ function engineWorld(prepare: (db: Db) => void = () => undefined, seed = 1): Eng
   mkdirSync(path.join(dir, 'db-copies'), { mode: 0o700 });
   const file = path.join(dir, 'bot.sqlite');
   const db = setUpDb(file);
-  db.transaction((tx) => setStrategyMode(tx, T - 1, 'owner-telegram', 'momentum', 'paper'));
+  db.transaction((tx) => {
+    setStrategyMode(tx, T - 1, 'owner-telegram', 'momentum', 'paper');
+    insertSnapshot(tx, 'paper', T, lamports(550_000_000n), lamports(550_000_000n)); // the money check T1 needs fresh (6e-2)
+  });
   prepare(db);
   db.close();
   const clock = testClock(T);

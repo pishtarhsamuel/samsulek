@@ -188,8 +188,8 @@ export function exitIntentId(positionId: string, exitSeq: number): string {
   return `ex_${hash40(`exit|${positionId}|${exitSeq}`)}`;
 }
 
-/** An alert outside the database; a sink that throws latches entries as a bug instead of escaping. */
-function alertSafely(alerts: AlertSink, latch: EntryLatch, a: Alert): void {
+/** An alert outside the database; a sink that throws latches entries as a bug instead of escaping. Exported for app/day-tx.ts (6e). */
+export function alertSafely(alerts: AlertSink, latch: EntryLatch, a: Alert): void {
   try {
     alerts.alert(Object.freeze(a));
   } catch {
@@ -252,8 +252,10 @@ function readExit(req: ExitRequest): ExitRequest {
  * After the engine wrote an audit row (a KILL or a halt), the anchor moves to the newest row (16.5.4,
  * C36), from a check of the whole chain. A failure only alerts: an anchor that is behind still passes
  * the next boot's check (the chain may grow past it), so a missed write only weakens the tripwire.
+ * Exported for the 6e transactions, which write audit rows inside their own steps; it takes only what it
+ * uses, so the owner's commands (which read no slot) can call it too.
  */
-function anchorAfter(deps: StoreDeps): void {
+export function anchorAfter(deps: Pick<StoreDeps, 'db' | 'latch' | 'alerts' | 'anchors'>): void {
   try {
     const chain = verifyAuditChain(deps.db);
     // after a write newestAt is a time; the anchor store refuses anything else

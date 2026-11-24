@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { buyCapsOf } from '../../../src/app/caps.ts';
 import { AppError } from '../../../src/app/faults.ts';
-import { ledgerOf, readActiveConfig, readBuySnapshot, type BuySnapshot, type BuySnapshotInput } from '../../../src/app/snapshot.ts';
+import { DAY_STATE_MAX_AGE_MS, ledgerOf, readActiveConfig, readBuySnapshot, type BuySnapshot, type BuySnapshotInput } from '../../../src/app/snapshot.ts';
 import { firstVersion, nextVersion } from '../../../src/config/changes.ts';
 import { DEFAULT_TUNABLES, withValue } from '../../../src/config/tunables.ts';
 import { athensDay } from '../../../src/core/day.ts';
@@ -19,6 +19,7 @@ import { lamports, tokenUnits } from '../../../src/core/units.ts';
 import type { Mark } from '../../../src/portfolio/equity.ts';
 import type { BreakerState } from '../../../src/risk/blocks.ts';
 import { insertOpening, readBook } from '../../../src/storage/repo-book.ts';
+import { insertSnapshot } from '../../../src/storage/repo-observe.ts';
 import { addBan, countEntry, setEntriesStopped, setHalt, setKill, setPaused } from '../../../src/storage/repo-flags.ts';
 import { setStrategyMode, writeOwnerConfig } from '../../../src/storage/repo-owner.ts';
 import { clearKill, setUpConfig } from '../../../src/storage/repo-server.ts';
@@ -37,9 +38,15 @@ function snap(db: Db, over: Partial<BuySnapshotInput> = {}): BuySnapshot {
   );
 }
 
+/** The money check of 6e: a fresh, valued paper snapshot at T (T1 refuses without one, s.17.6). */
+function observed(db: Db, at = T): void {
+  db.transaction((tx) => insertSnapshot(tx, 'paper', at, lamports(BANKROLL), lamports(BANKROLL)));
+}
+
 function withDb(fn: (db: Db) => void): void {
   const db = setUpDb();
   try {
+    observed(db);
     fn(db);
   } finally {
     db.close();
@@ -315,6 +322,37 @@ describe('app/snapshot.ts: positions and equity (one freshness rule)', () => {
     } finally {
       nothing.close();
     }
+  });
+});
+
+describe('app/snapshot.ts: the money check is fresh (6e-2, s.17.6, R2)', () => {
+  const stale = (fn: () => unknown, why: string): void => {
+    assert.throws(fn, (e: unknown) => e instanceof AppError && e.code === 'day-state-stale', why);
+  };
+  /** A set-up database with exactly these paper snapshots (and a live one at T, which never counts). */
+  const withRows = (rows: readonly (readonly [number, bigint | null])[], fn: (db: Db) => void): void => {
+    const db = setUpDb();
+    try {
+      db.transaction((tx) => {
+        insertSnapshot(tx, 'live', T, lamports(BANKROLL), null);
+        for (const [at, equity] of rows) {
+          insertSnapshot(tx, 'paper', at, equity === null ? null : lamports(equity), null);
+        }
+      });
+      fn(db);
+    } finally {
+      db.close();
+    }
+  };
+
+  it('refuses entries with no snapshot, one 30,001 ms old, one with unknown equity or one only after now; 30,000 ms passes', () => {
+    assert.equal(DAY_STATE_MAX_AGE_MS, 30_000);
+    withRows([], (db) => stale(() => snap(db), 'no paper snapshot (the live one does not count)'));
+    withRows([[T - 30_001, BANKROLL]], (db) => stale(() => snap(db), '30,001 ms old'));
+    withRows([[T, null]], (db) => stale(() => snap(db), 'unknown equity'));
+    withRows([[T + 1, BANKROLL]], (db) => stale(() => snap(db), 'only after now'));
+    withRows([[T - 10_000, BANKROLL], [T - 5_000, null]], (db) => stale(() => snap(db), 'a valued older one does not rescue an unvalued newest one'));
+    withRows([[T - 30_000, BANKROLL]], (db) => assert.equal(snap(db).world.equity.current, BANKROLL));
   });
 });
 

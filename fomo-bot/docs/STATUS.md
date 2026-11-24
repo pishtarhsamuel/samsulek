@@ -244,6 +244,76 @@ can trade, and no key or account exists anywhere.
   - The Windows-only checks (shortcuts called junctions, OneDrive, network paths) are tested with a
     stand-in for Windows; a real run on your PC comes with the setup guide. If a guess is wrong, the bot
     refuses to start rather than running somewhere unsafe.
+- Your answers of Nov 23 are recorded: D11 (build 6e now, on the same separate branch), D12 (refuse to
+  start on a shorter safety log) and D13 (never another person's wallet address in the trade records).
+- Step 6e (saving the daily money check and your setting changes) is designed by the architect, in four
+  parts (STORAGE_DESIGN.md s.17), and its first part, 6e-1, is built (tests first) and NOT YET REVIEWED,
+  on the same separate branch (D11):
+  - Every few seconds the bot will write down, in one all-or-nothing step, what its paper money is
+    worth, the day's starting value, the highest value so far, and any stop that this triggers: -30% in
+    a day, -50% from the high, two stop days in a row, an impossible value (zero, above 2 SOL, over three
+    times the bankroll) or a clock that ran backwards. A stop is saved in the same step as the value
+    that caused it.
+  - A value that cannot be real is never used as the reference for the "+50% in an hour" check.
+  - If the check itself fails in any way (other than the database being busy for a moment), new buys
+    halt and you get an alert; only the server can restart them. It never retries with edited numbers.
+  - The time changes work: on the 23- and 25-hour days the daily stop lasts exactly until local midnight.
+  - Nothing calls it yet: the bot's main loop comes later, and it needs a trustworthy clock first.
+  - 43 deliberate bugs were planted: the tests catch 42, and the last one cannot matter in paper. The
+    first run found two weak tests, both fixed.
+- Part 6e-2 is built (tests first), NOT YET REVIEWED, on the same branch:
+  - A buy is now refused when the last money check is more than 30 seconds old or could not value
+    everything, so a stop can never be missed between two checks, and a broken check stops buying fast.
+  - A held "+50% in an hour" jump is cleared only by a fresh check of the real balance within 5 minutes,
+    from the server or (later) the verification routine; never by a strategy, Telegram or the AI. It
+    never vouches for more than was seen, and it works even while the bot is halted.
+  - 18 deliberate bugs were planted, and every one is caught (after two weak tests were fixed).
+- Part 6e-3 is built (tests first), NOT YET REVIEWED, on the same branch:
+  - The bot's own settings step: once a setting change you made while live trading was possible has
+    waited its 24 hours, the bot applies it exactly as you asked, one saved version per change, each one
+    undoable with /rollback. A change that no longer fits (the value moved since, or is now out of the
+    allowed range) is dropped, never applied, and you are told either way.
+  - A live strategy whose settings change goes back to paper at once, and its go-live count starts
+    again; you get an alert.
+  - Nothing applies on a doubtful clock, or when the clock is behind a saved change (it waits, and you
+    are warned). A damaged settings row stops new buys and alerts you; it is never repaired by guessing.
+  - In paper nothing ever waits (no strategy is live), so this step does nothing until Phase 8.
+  - 35 deliberate bugs were planted, and every one is caught (after one missing test was added).
+- Part 6e-4 is built (tests first), NOT YET REVIEWED, on the same branch. Step 6e is now complete:
+  - Your setting commands are saved as all-or-nothing steps: /set, /rollback (one step back each time)
+    and /cancel (drop a change that is still waiting). A bad name or value changes nothing. In paper a
+    change applies at once; once anything is live, a riskier risk or exit change waits 24 hours.
+  - The paper model can only become more cautious, whatever the command.
+  - /resume restarts buying after the -50% halt only right after a money check (at most one minute
+    old) that valued everything, and never while a "+50% jump" is unconfirmed. After two stop days in a
+    row it needs no such check.
+  - These commands work even while buying is blocked, and only your Telegram (after the owner check)
+    and the server will be able to call them. Nothing calls them yet (Telegram comes in Phase 3).
+  - 42 deliberate bugs were planted, and every one is caught (after one missing test was added).
+    Building it also found a blind spot in one of the automatic code checks (it could not see code
+    handed into a database step as a function); the check is now stricter, and nothing else tripped it.
+- Step 6e is REVIEWED (Nov 23): both reviewers approved all four parts with notes (REVIEWS.md W). One
+  thing had to be fixed before it could join the main work; it is fixed, both reviewers CONFIRMED the
+  fix on Nov 24, and 6e has joined the main work:
+  - The rule "only the server clears a held +50% jump" was enforced on the command, but the database
+    writer under it could have been called by other parts of the bot, with a time of its own choosing.
+    Now that writer sits in its own file that only the confirmation may use, it stamps its own time,
+    and it refuses more than 5 minutes after the hold. The everyday money check can no longer clear a
+    hold, and only it can write the money-check record that buys rely on. Nothing did this before; now
+    nothing can.
+  - While fixing a second, smaller note, I found that the automatic check "no code may swallow an error
+    inside a database step" could be fooled by calling a function indirectly. It now covers those ways.
+  - 48 deliberate bugs were planted in the fixes; every one is caught (after one test was added).
+  - Their other notes are conditions for later parts, each written down with the step it is due by
+    (STORAGE_DESIGN.md s.17.16). For example: a money check right before every buy, Telegram can never
+    act as the server, and before live, setting changes that wait 24 hours need a trusted clock. The
+    re-check added one small one: before Telegram is wired in, the code that handles your commands
+    must be unable to touch the "+50% jump" fields at all.
+- For you to know: in paper, a setting change from Telegram applies at once (within its allowed range);
+  the 24-hour wait applies only once something is live.
+- Your answer of Nov 24 is recorded as D14: the full double review and planted-bug tests stay for
+  everything touching money, keys, the risk engine, your commands, the network or the server; the rest
+  gets only the reviews the rules require.
 - For you to know: in paper, the "free SOL" limit can never be the one that stops a buy, because the
   50% exposure limit always stops it first. That is fine, and the reason is written down for the
   reviewers.
@@ -251,15 +321,16 @@ can trade, and no key or account exists anywhere.
   account with the 0.02 SOL minimum trade (0.2 SOL if you lower it to 0.01); below that the
   bot makes no trades. Paper and live entries share one daily count, so paper trades can use
   up the 5 live entries, never the reverse (separate counts would need your OK).
-- Next: the review of 6e (the settings and day-state transactions), built on the separate branch;
-  then chain clients, the paper engine, Telegram and
-  logging.
+- Next: the rest of Phase 2: chain clients, the paper engine, Telegram and logging, each designed
+  first and reviewed as decision D14 says.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
-- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 60% (settings,
-  accounting, risk engine, the storage files, the approval transactions and the start-up checks done,
-  the last three parts awaiting review; 6e next); the whole build about 28-31%. Proving an edge on
-  paper takes weeks on top of that.
+- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 70% (settings,
+  accounting, risk engine, the storage files, the approval transactions, the start-up checks, the
+  daily money check, the bot's settings step and your setting commands done, reviewed and in the
+  main work); the whole build about 33%. At the pace so far (Nov 4 to Nov 24),
+  building takes roughly 6 more weeks (5 to 9), and proving an edge on paper at least 1 to 3 weeks
+  more: at least 50 closed paper trades over at least 7 days per strategy before any live decision.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.
