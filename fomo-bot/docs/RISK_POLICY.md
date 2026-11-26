@@ -311,7 +311,7 @@ All breakers stop entries only; exits continue. Every trip and clear is logged a
 | PROVIDER_BLOCKED | HTTP 403 | all entries | retry after 15 min |
 | PRICE_DIVERGENCE | reserve price vs Jupiter over 3% for 2 min | that token | 5 min agreement |
 | VENUE_CHANGED | program redeploy, unknown discriminator or account size, fee layout change | that venue | self-test passes 30 min (paper); owner tap (live) |
-| CLOCK | drift over 2 s (over 10 s: HALT) | all entries | drift under 1 s for 5 min; HALT: owner |
+| CLOCK | wall clock against the monotonic clock: drift over 2 s (over 10 s: HALT); against block time: over 60 s, HALT (D16: block time moves in whole seconds and runs seconds behind) | all entries | drift under 1 s for 5 min; HALT: owner |
 | SEND_FAILURES (live) | 3 failed landings in a row for a strategy; 5 across strategies in 1 h | that strategy to paper; all live entries | owner |
 | RECONCILE_MISMATCH (live) | any token amount mismatch, or unexplained SOL differences over 0.0005 SOL cumulative since the last owner reset | HALT | owner at the server (`fomo reset-halt`) |
 | UNEXPECTED_BALANCE | SOL or held-mint balance change without a matching fill, withdraw or confirmed deposit; equity jump not explained (section 4) | HALT | owner at the server |

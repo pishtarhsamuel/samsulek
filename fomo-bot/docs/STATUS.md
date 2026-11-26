@@ -365,8 +365,10 @@ can trade, and no key or account exists anywhere.
   A new test makes sure no real person's wallet address can ever sit in the code or the tests. 106
   deliberate bugs were planted: 102 caught, 4 cannot change anything (each reason written down); two
   weak tests were found and fixed.
-- Next: part 7e (the read client, with the review notes due there). One question for you is due before
-  part 7g (the clock thresholds).
+- Your answer of Nov 26 is recorded as D16: against the blockchain's clock the bot halts only beyond 60
+  seconds of difference; against the computer's own timer, over 2 seconds stops new buys (clearing by
+  itself) and over 10 seconds halts. Built in part 7g.
+- Next: part 7e (the read client, with the review notes due there). No question is open.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;

@@ -627,7 +627,9 @@ Conditions, each due by the sub-step or phase named:
 - Before 7g (risk, on R9): the owner decides the clock thresholds against RISK_POLICY s.8's CLOCK row
   (2 s entries off, 10 s halt). Recommended: against block time (1 s steps, seconds behind once
   finalized) halt beyond 60 s, as contract 8 says ("about a minute"); wall against monotonic keeps s.8's
-  shape (over 2 s entries off, clearing itself; over 10 s halt), never a halt at 2 s.
+  shape (over 2 s entries off, clearing itself; over 10 s halt), never a halt at 2 s. ANSWERED
+  2026-11-26: the owner accepted the recommendation (DECISIONS.md D16); RISK_POLICY s.8 and ARCHITECTURE
+  s.12 updated; 7g builds it.
 - Before a second keyed provider (security 6): count the own-secret forms again (each key takes up to 5
   of the 32).
 - Before Phase 8:
@@ -638,7 +640,7 @@ Conditions, each due by the sub-step or phase named:
   - Security 7: a live simulateTransaction shows the planned trade to the RPC: live simulations go to a
     trusted RPC, or the owner accepts that risk explicitly.
 
-Kept as the reviewers accepted: R1 to R8 and R10 to R15; R9 waits for the owner.
+Kept as the reviewers accepted: R1 to R8 and R10 to R15; R9 waits for the owner (answered: D16).
 
 ## 18. As built in step 7b (the budget governor), and what changed
 
