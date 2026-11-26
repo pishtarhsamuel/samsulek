@@ -6,7 +6,7 @@
 // from synthetic fixtures; the real budget governor runs on a hand clock. Written before src/chain/client.ts.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createBudgetGovernor } from '../../../src/chain/budget.ts';
+import { createBudgetGovernor, type BudgetGovernor, type Ticket } from '../../../src/chain/budget.ts';
 import {
   createReadClient,
   FAILURE_RULES,
@@ -92,7 +92,7 @@ const fixtures: Answer = (s, w) => {
   }
 };
 
-function world(o: { tighten?: { maxRequestBytes?: number }; throwingSink?: boolean } = {}): World {
+function world(o: { tighten?: { maxRequestBytes?: number }; throwingSink?: boolean; budget?: BudgetGovernor } = {}): World {
   const w = {
     sent: [] as Sent[],
     events: [] as ChainEvent[],
@@ -112,7 +112,7 @@ function world(o: { tighten?: { maxRequestBytes?: number }; throwingSink?: boole
     },
   };
   const mono = { nowMs: (): number => w.mono };
-  const budget = createBudgetGovernor({ provider: 'public-mainnet', mono, events: sink });
+  const budget = o.budget ?? createBudgetGovernor({ provider: 'public-mainnet', mono, events: sink });
   const transport: HttpTransport = {
     post: (r: HttpRequest) => {
       const body = parseLossless(r.bodyText) as { readonly id: bigint; readonly method: ReadMethod; readonly params: readonly Json[] };
@@ -189,6 +189,33 @@ describe('the genesis lock (s.8)', () => {
     v.mono += 10_000;
     v.answer = fixtures;
     assert.equal(value(await v.client.verifyCluster()), 'mainnet-beta');
+  });
+
+  it('a check that lands after the latch cannot undo it (review Z, security 1)', async () => {
+    // a budget that always grants, so two checks can be in flight at once (the real one allows 1 per 10 s)
+    const always: BudgetGovernor = {
+      acquire: () => Object.freeze({ ok: true, ticket: Object.freeze({ __ticket: 'budget-ticket' }) as Ticket }),
+      settle: () => undefined,
+      chargeStream: () => undefined,
+      shedLevel: () => 0,
+      usage: () => [],
+    };
+    const w = world({ budget: always });
+    const waiting: ((o: HttpOutcome) => void)[] = [];
+    w.answer = () => new Promise<HttpOutcome>((resolve) => waiting.push(resolve));
+    const first = w.client.verifyCluster();
+    const second = w.client.verifyCluster();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(waiting.length, 2);
+    const [a, b] = w.sent;
+    (waiting[0] as (o: HttpOutcome) => void)(result(a as Sent, DEVNET)); // the wrong hash lands first
+    assert.deepEqual(failed(await first), { kind: 'wrong-cluster' });
+    (waiting[1] as (o: HttpOutcome) => void)(result(b as Sent, MAINNET_GENESIS_HASH)); // then the right one
+    assert.deepEqual(failed(await second), { kind: 'wrong-cluster' }, 'still latched');
+    w.answer = fixtures;
+    assert.deepEqual(failed(await w.client.slot(P0)), { kind: 'wrong-cluster' });
+    assert.equal(w.sent.length, 2, 'no read was sent');
+    assert.equal(w.events.filter((e) => e.code === 'chain-wrong-cluster').length, 1);
   });
 
   it('the check is due again after an hour; a wrong hash then latches too, while a failed re-check keeps the calls open', async () => {

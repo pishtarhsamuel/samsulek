@@ -273,11 +273,19 @@ export function createReadClient(o: ReadClientOptions): ReadClient {
     return cluster === 'verified' ? null : fail({ kind: cluster });
   };
 
+  /** Read through a call, so the check after an await sees what another check may have set meanwhile. */
+  const isWrongCluster = (): boolean => cluster === 'wrong-cluster';
+
   const verifyCluster = async (): Promise<ChainResult<'mainnet-beta'>> => {
     if (cluster === 'wrong-cluster') {
       return fail({ kind: 'wrong-cluster' }); // latched until a restart: nothing is asked again
     }
     const r = await run(calls.genesisHash(), { priority: 'P0', feature: 'boot' }, (x) => bare(decodeGenesisHash(x)), null);
+    if (isWrongCluster()) {
+      // another check latched while this one was in flight: its answer cannot undo the latch (review Z,
+      // security 1; the real governor allows one check per 10 s, so this guards the code, not the timing)
+      return fail({ kind: 'wrong-cluster' });
+    }
     if (!r.ok) {
       return r;
     }
