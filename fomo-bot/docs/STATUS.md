@@ -340,8 +340,14 @@ can trade, and no key or account exists anywhere.
   selling included (fixed in the design before part 7e); the start command will refuse settings that
   switch off the internet connection's certificate checks or reroute it; and a huge message on the live
   block feed is a crash risk, guarded by the memory limit.
-- Next: parts 7b to 7g (the request budget, the internet connection, reading the answers, the live block
-  feed, the clock check). One question for you is due before part 7g (the clock thresholds).
+- Part 7b is built (tests first), NOT YET REVIEWED, on the separate branch: the request budget. Every
+  request to the free Solana server asks it first, so the bot stays well under the server's limits; room
+  is always kept for selling and price checks, and the least important work is cut back first when it
+  gets busy. If the server says "slow down" it waits as told; if it blocks the bot, nothing is sent for
+  15 minutes and buying stops. 46 deliberate bugs were planted: 43 caught, 3 cannot change anything
+  (each reason written down); three weak tests were found and fixed.
+- Next: parts 7c (the internet connection) and 7d (reading the answers), then both reviewers check 7b to
+  7d together. One question for you is due before part 7g (the clock thresholds).
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;

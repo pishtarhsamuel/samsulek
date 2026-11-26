@@ -639,3 +639,42 @@ Conditions, each due by the sub-step or phase named:
     trusted RPC, or the owner accepts that risk explicitly.
 
 Kept as the reviewers accepted: R1 to R8 and R10 to R15; R9 waits for the owner.
+
+## 18. As built in step 7b (the budget governor), and what changed
+
+Status: UNREVIEWED, on the unreviewed branch.
+
+Built, tests first: chain/limits.ts (`METHOD_TABLE` as s.5, `REFUSED_METHODS`, `PRIORITIES`,
+`BUDGET_RULES` with the numbers of s.6), chain/events.ts (the `ChainEvent` types of s.3, in their own
+file because the governor, the client and the stream all produce them), chain/budget.ts
+(`createBudgetGovernor`).
+
+Differences from s.3 and s.6:
+- The 80% rule leaves out a method whose whole cap is its P0 reserve (getSlot, getBlockHeight,
+  getBlockTime, getGenesisHash, rent): risk A's 2 s slot polling keeps 5 of getSlot's 6 in every window
+  by design, and counting it would shed P2 to P4 for good. Those methods still count in the total, and
+  the total, data and connection buckets count every priority.
+- A remaining count at or below zero is reported as `retry-after` (the provider asked us to wait), not
+  `method-cap`, which stays our own count. So "P0 refused at method-cap" always means the window is full
+  of grants, at least the P0 reserve of them P0's.
+- Learning keeps no separate record of the lowest limit: a header limit can only lower the cap
+  (`min(table cap, floor(limit / 2))` is taken only when below the current cap).
+- `createBudgetGovernor` takes an optional `tighten` (total cap and reserve, data cap and reserve), each
+  only at or below `BUDGET_RULES` and a reserve never above its cap: the tests reach the total and data
+  caps with it (the method caps add up to 49 of 60, so the total cannot bind with the defaults). The
+  composition root passes none.
+- A denial's `retryAtMs` is exact for a full window, a Retry-After and a block; "never" (Infinity) for a
+  refused method, a method a priority may never use (non-P0 on getSlot) and an answer bigger than the
+  whole data budget; and a 1 s hint where only requests in flight stand in the way.
+- The blocked provider's probe is the first P0 request after the 15 minutes; a 200 reopens it, a 403
+  blocks it again, anything else (a timeout, a 5xx) frees the probe slot for the next P0 request. A 200
+  of a request that was already in flight when the 403 came reopens nothing.
+- The decay takes one step per 5 minutes without a trigger, also over a long quiet stretch (one call
+  after 15 minutes takes the level down three steps, each with its event).
+
+Tests: TEST_PLAN.md s.3, "Done in step 7b". Planted bugs (scratchpad `mut/run42.py`): 46 in the first
+run, 38 caught and 2 equivalent; the six left showed three weak tests (a grant while the clock is
+behind, a probe's 5xx against "unblocked", polling that was never busy for a whole minute), one second
+guard that hid the first (the lowest-limit record, removed), and one more equivalent. Final: 46, 43
+caught, 3 equivalent, each with its reason in the script. Coverage: every line and branch of the two
+files.

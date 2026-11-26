@@ -96,10 +96,9 @@ const isShed = (p: Priority, level: ShedLevel): boolean => RANK[p] >= 2 && RANK[
 interface MethodState {
   /** Grant times in the window, oldest first. */
   readonly log: number[];
+  /** Only ever lowered (by a header limit), never raised within the process. */
   cap: number;
   reserve: number;
-  /** The lowest header limit seen, or null. */
-  lowestLimit: number | null;
   /** Closed by a 429's Retry-After or a remaining count at zero, until this time. */
   closedUntil: number;
 }
@@ -114,7 +113,7 @@ interface Outstanding {
 export function createBudgetGovernor(o: { readonly provider: ProviderId; readonly mono: MonoClock; readonly events: ChainEvents; readonly tighten?: Tightening }): BudgetGovernor {
   const limits = tightened(o.tighten);
   const methods = new Map<ReadMethod, MethodState>(
-    (Object.keys(METHOD_TABLE) as ReadMethod[]).map((m) => [m, { log: [], cap: METHOD_TABLE[m].capPer10s, reserve: METHOD_TABLE[m].p0Reserve, lowestLimit: null, closedUntil: 0 }]),
+    (Object.keys(METHOD_TABLE) as ReadMethod[]).map((m) => [m, { log: [], cap: METHOD_TABLE[m].capPer10s, reserve: METHOD_TABLE[m].p0Reserve, closedUntil: 0 }]),
   );
   const total: number[] = [];
   /** Settled and streamed bytes in the data window, oldest first. */
@@ -295,8 +294,8 @@ export function createBudgetGovernor(o: { readonly provider: ProviderId; readonl
     data.push({ at: now, bytes: st.decodedBytes });
     const s = methods.get(out.method) as MethodState;
     const limit = wholeFrom(st.rate?.methodLimit, 0);
-    if (limit !== null && (s.lowestLimit === null || limit < s.lowestLimit)) {
-      s.lowestLimit = limit;
+    if (limit !== null) {
+      // half the provider's limit, and only ever downward: a higher limit later changes nothing
       const cap = Math.min(METHOD_TABLE[out.method].capPer10s, Math.floor(limit / 2));
       if (cap < s.cap) {
         s.cap = cap;

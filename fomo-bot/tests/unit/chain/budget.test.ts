@@ -116,6 +116,16 @@ describe('the windows: per method, in all, data and connections', () => {
     granted(w.gov.acquire('getMultipleAccounts', 'P2'));
   });
 
+  it('a data denial says when to try again: never for a method bigger than the whole budget, soon when only requests in flight hold it', () => {
+    const small = world({ dataCapBytes: MIB, dataP0ReserveBytes: 0 });
+    assert.equal(denied(small.gov.acquire('getProgramAccounts', 'P1'), 'data-cap'), Number.POSITIVE_INFINITY); // 2 MiB never fits in 1 MiB
+    const w = world({ dataCapBytes: 4 * MIB, dataP0ReserveBytes: MIB });
+    for (let i = 0; i < 3; i += 1) {
+      granted(w.gov.acquire('getMultipleAccounts', 'P2')); // 3 MiB reserved, nothing settled
+    }
+    assert.equal(denied(w.gov.acquire('getMultipleAccounts', 'P2'), 'data-cap'), w.now() + 1_000);
+  });
+
   it('the stream\'s bytes count after receipt, for 30 s', () => {
     const w = world({ dataCapBytes: 4 * MIB, dataP0ReserveBytes: MIB });
     w.gov.chargeStream(3 * MIB);
@@ -173,7 +183,8 @@ describe('what the provider says: Retry-After, 403, the header limits', () => {
     denied(w.gov.acquire('getMultipleAccounts', 'P2'), 'blocked'); // only a P0 probe after the block
     const probe = granted(w.gov.acquire('getSlot', 'P0'));
     denied(w.gov.acquire('getSlot', 'P0'), 'blocked'); // one probe at a time
-    w.gov.settle(probe, { decodedBytes: 20, status: 503, rate: null }); // neither: another probe may go
+    w.gov.settle(probe, { decodedBytes: 20, status: 503, rate: null }); // neither: still blocked, another probe may go
+    denied(w.gov.acquire('getMultipleAccounts', 'P2'), 'blocked');
     const probe2 = granted(w.gov.acquire('getSlot', 'P0'));
     w.gov.settle(probe2, { decodedBytes: 20, status: 403, rate: null }); // blocked again
     const until2 = w.now() + 900_000;
@@ -296,11 +307,12 @@ describe('shedding and the P0 path', () => {
     assert.equal(w.gov.shedLevel(), 2, 'no longer busy, and no new step');
     w.advance(240_000); // 5 minutes after the last trigger
     assert.equal(w.gov.shedLevel(), 1);
-    // risk A's 2 s slot polling uses 5 of getSlot's 6 (all P0) for good: never a reason to shed
+    // slot polling that keeps 5 or 6 of getSlot's 6 (all P0) in every window, for 3 minutes: never a reason to shed
     const p = world();
-    for (let s = 0; s < 180; s += 2) {
+    for (let t = 0; t < 180_000; t += 1_700) {
       use(p, 'getSlot', 'P0');
-      p.advance(2_000);
+      assert.ok((p.gov.usage().find((u) => u.bucket === 'getSlot')?.used ?? 0) >= 5 || t < 8_500, 'the polling keeps getSlot over 80%');
+      p.advance(1_700);
     }
     assert.equal(p.gov.shedLevel(), 0);
     assert.ok(!p.codes().includes('chain-budget-80'));
@@ -348,11 +360,20 @@ describe('refusals, tickets, the clock and the sink', () => {
   it('a monotonic clock that steps back is held at its last reading, so no grant ages out early', () => {
     const w = world();
     use(w, 'getSlot', 'P0', 6);
-    w.set(START + 9_000);
     w.set(START - 50_000);
     assert.equal(denied(w.gov.acquire('getSlot', 'P0'), 'method-cap'), START + 10_000);
     w.set(START + 10_000);
     granted(w.gov.acquire('getSlot', 'P0'));
+    // grants made while the clock is behind are dated at the held reading, so they do not age out 20 s early
+    const v = world();
+    v.set(START + 20_000);
+    assert.equal(v.gov.shedLevel(), 0); // the governor has read START + 20 s
+    v.set(START); // the clock steps back 20 s
+    use(v, 'getSlot', 'P0', 6); // dated START + 20 s
+    v.set(START + 15_000);
+    denied(v.gov.acquire('getSlot', 'P0'), 'method-cap'); // still in their window
+    v.set(START + 30_000);
+    granted(v.gov.acquire('getSlot', 'P0'));
   });
 
   it('a sink that throws never stops the governor', () => {

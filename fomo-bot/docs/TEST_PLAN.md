@@ -579,6 +579,33 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      equivalent (base64's character and length checks, which its final re-encoding also enforces). Final:
      49, 47 caught, 2 equivalent, each with its reason in the script.
 
+   Done in step 7b (the budget governor, CHAIN_DESIGN.md s.18; UNREVIEWED, on the unreviewed branch):
+   - The table pinned to s.5: each method's cap, P0 reserve, timeout, byte cap and most urgent priority;
+     the caps add to 49 and the reserves to 27; every cap at most half the method's header limit; the
+     refused getTokenLargestAccounts; the fixed numbers of s.6; all frozen.
+   - Windows: a method's cap over a sliding 10 s (the 7th getSlot refused with the time a slot frees,
+     granted exactly then; non-P0 never gets getSlot); non-P0 leaves each method's P0 reserve free; the
+     total with its reserve (tightened); data reserved at the byte cap and settled at the decoded bytes
+     for 30 s, with the P0 reserve; the stream's bytes; when to try again (never for an answer bigger
+     than the budget, soon when only requests in flight hold it); 6 in flight, 2 of them P0's.
+   - The provider: a 429's Retry-After (30 s, missing, not whole, negative, over 600 s, 0); a 403's
+     15-minute block, P0 included, then one P0 probe (a 5xx keeps it blocked, a 403 blocks again, a 200
+     reopens; a 200 from before the block does not); header limits only lowering the cap to half, 0
+     refusing the method for good; a remaining count of 0 or below closing it until its window empties.
+   - Shedding: levels 1 to 3 and what each sheds, P1 and P0 never, at most 3, one step down per 5 minutes
+     (also over a long quiet stretch); 80% for a minute raising it once a minute (connections held), and
+     slot polling that keeps a P0-only method over 80% never doing so; every P0 denial alerting.
+   - Refusals, tickets and inputs: unknown and refused methods and P0 on getProgramAccounts before any
+     count; a second or forged settle alerting and changing nothing; impossible byte counts, statuses,
+     stream bytes and priorities as TypeErrors; a clock stepping back held (grants made then dated at the
+     held reading); a throwing sink ignored; `usage()` for all 14 buckets; tightening only downward.
+   - Property (300 runs each, with and without learning, with and without tightening): random acquires
+     of every method and priority, settles with random statuses and headers, clock steps: after every
+     grant no window over its cap, the total, data and in-flight caps held; P0 never shed; a P0 refused
+     for a full window had its whole reserve.
+   - Planted bugs (scratchpad `mut/run42.py`): 46 in the first run, 38 caught, 2 equivalent; three weak
+     tests fixed and a second guard that hid the first removed. Final: 46, 43 caught, 3 equivalent.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |
