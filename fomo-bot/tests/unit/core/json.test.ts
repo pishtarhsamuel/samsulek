@@ -13,7 +13,16 @@ describe('parseLossless: integers exactly, as bigints, only from plain digits', 
     assert.notEqual(BigInt(JSON.parse('9007199254740993') as number), 9_007_199_254_740_993n, 'the plain parse rounds it');
     assert.equal(parseLossless('0'), 0n);
     assert.equal(parseLossless('-32016'), -32_016n); // a node error code is an integer like any other
-    assert.equal(parseLossless('123456789012345678901234567890'), 123_456_789_012_345_678_901_234_567_890n);
+  });
+
+  it('a run of more than 20 digits stays a JS number: a u64 needs at most 20, so a huge digit string costs nothing (review X, security 4)', () => {
+    assert.equal(parseLossless('99999999999999999999'), 99_999_999_999_999_999_999n); // 20 digits: read
+    assert.equal(parseLossless('-99999999999999999999'), -99_999_999_999_999_999_999n);
+    assert.equal(typeof parseLossless('123456789012345678901'), 'number'); // 21 digits
+    assert.equal(typeof parseLossless('-123456789012345678901'), 'number');
+    const started = performance.now();
+    assert.equal(typeof parseLossless('9'.repeat(1_000_000)), 'number');
+    assert.ok(performance.now() - started < 1_000, 'a million digits are not turned into a bigint');
   });
 
   it('keeps every other number spelling a JS number (no integer field accepts one), -0 included', () => {
@@ -90,7 +99,7 @@ describe('stringifyLossless: bigints as digits, nothing JSON would write silentl
   });
 
   it('refuses NaN, the infinities, undefined, functions, symbols and nesting past the limit (JSON.stringify would drop or rewrite them)', () => {
-    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, undefined, () => 1, Symbol('s')] as unknown[]) {
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -0, undefined, () => 1, Symbol('s')] as unknown[]) {
       assert.throws(() => stringifyLossless(bad as Json), TypeError);
       assert.throws(() => stringifyLossless([bad] as unknown as Json), TypeError);
       assert.throws(() => stringifyLossless({ k: bad } as unknown as Json), TypeError);

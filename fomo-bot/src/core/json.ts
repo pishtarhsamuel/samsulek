@@ -10,8 +10,12 @@ export type Json = null | boolean | string | number | bigint | readonly Json[] |
 /** The deepest nesting either function takes: an RPC answer nests about ten deep. */
 export const JSON_MAX_DEPTH = 64;
 
-/** Plain digits: what becomes a bigint ("-0" is excluded separately: it is a float's sign). */
-const CANONICAL_INTEGER = /^-?(?:0|[1-9][0-9]*)$/;
+/**
+ * Plain digits, at most 20 (a u64 needs no more): what becomes a bigint. A longer run stays a JS number,
+ * which no integer field accepts, so a huge digit string costs nothing (review X, security 4). "-0" is
+ * excluded separately: it is a float's sign.
+ */
+const CANONICAL_INTEGER = /^-?(?:0|[1-9][0-9]{0,19})$/;
 
 const QUOTE = 0x22;
 const BACKSLASH = 0x5c;
@@ -80,8 +84,8 @@ function write(v: unknown, depth: number): string {
     case 'bigint':
       return v.toString();
     case 'number':
-      if (!Number.isFinite(v)) {
-        throw new TypeError('JSON has no NaN or infinity (JSON.stringify would write null)');
+      if (!Number.isFinite(v) || Object.is(v, -0)) {
+        throw new TypeError('JSON has no NaN, infinity or -0 here (JSON.stringify would write null or 0; review X, security 5)');
       }
       return JSON.stringify(v);
     case 'string':

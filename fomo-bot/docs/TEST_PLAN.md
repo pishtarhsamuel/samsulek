@@ -627,6 +627,35 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      outcome naming the URL or the key, a redirect's error included.
    - Planted bugs (scratchpad `mut/run43.py`): 30, 29 caught on the first run, 1 equivalent.
 
+   Done in step 7d (the JSON-RPC layer and the strict decoders, CHAIN_DESIGN.md s.20; UNREVIEWED):
+   - Requests: the exact request text for each Phase 2 method, bigints as digits; getTransaction's
+     version 1 written over the caller's; a sending, refused, inherited or unknown method, a bad id and
+     params that are not a list refused. The builders: commitment `confirmed` and encoding `base64` on
+     the wire, `minContextSlot` always sent; 0 or 101 keys, a key twice, a key that is not an address,
+     a slice or size outside 10 MiB refused; a full batch of 100 fits the request cap; all frozen.
+   - Envelope: every transport outcome to its kind; 429 with Retry-After (10 s, missing, over 600 s),
+     403, 400/405/413/415 and other statuses; bad JSON; 15 malformed envelopes; a wrong, missing, text,
+     float or null id (null accepted only with -32700 and -32600); every code row of s.4's table to its
+     kind, -32016 with and without a valid slot; a body 429; codes at and past the 32-bit edges; no
+     failure carrying the node's message; everything frozen.
+   - Decoders: the genesis hash, slots and block heights at 0 and 2^63 - 1 and past them, respelled
+     integers refused; rent at 0 and u64 max, the formula at 0, 165, 170 bytes and 10 MiB; accounts in
+     request order with null for a missing one, data a fresh copy, u64 lamports above 2^53 exact; the
+     count against the keys; 18 malformed tops and contexts and 30 malformed accounts (each key missing,
+     an extra one, floats, 1e3, strings, negatives, past u64, owner not 32 bytes, data not exactly
+     `[base64, "base64"]` or not canonical, its length off by one); with a slice, the length
+     `min(length, max(0, space - offset))` at the start, the tail, the end and past it, off by one either
+     way, and the size bounds on their own; fees: 150 in reverse order sorted, 151 refused, a slot twice,
+     12 malformed entries.
+   - Property tests (1,000 cases each): random valid batches and fee lists decode to exactly their
+     values; a random structural mutation (a key removed, added or renamed, another JSON type, an
+     integer respelled as 1e0, 1.0, 1.00, 1E+0 or a string) is always refused. core/json.ts: a run of
+     more than 20 digits stays a JS number (a million digits under a second); stringify refuses -0.
+   - The fixture scan: no 32- or 64-byte base58 literal in src/ or tests/ outside its allowlist of
+     eight; a canary built from bytes (found once however often it appears; 33 bytes and joined runs not
+     found).
+   - Planted bugs (scratchpad `mut/run44.py`): 106, 102 caught, 4 equivalent.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

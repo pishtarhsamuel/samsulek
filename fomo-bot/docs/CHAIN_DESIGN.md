@@ -706,3 +706,57 @@ Differences from s.3, s.4 and s.9:
 Tests: TEST_PLAN.md s.3, "Done in step 7c". Planted bugs (scratchpad `mut/run43.py`): 30, 29 caught on
 the first run and 1 equivalent (an already-aborted signal makes fetch refuse without sending, so the
 early return only saves the call). Coverage: every line and branch of the two files.
+
+## 20. As built in step 7d (the JSON-RPC layer and the strict decoders), and what changed
+
+Status: UNREVIEWED, on the unreviewed branch.
+
+Built, tests first: chain/rpc.ts (`encodeRequest`, `readEnvelope`, the `calls` builders, `ChainFailure`,
+`ChainResult`, `Envelope`, `RpcCall`, `DataSlice`, `COMMITMENT`, `MAX_KEYS` = 100, `MAX_ACCOUNT_BYTES` =
+10 MiB), chain/decode.ts (`decodeGenesisHash`, `decodeSlot`, `decodeBlockHeight`, `decodeAccounts`,
+`decodePriorityFees`, `decodeRent`, `rentFormula`, `Decoded`, `RpcContext`, `Account`, `FeeEntry`,
+`MAX_FEE_ENTRIES` = 150), the fixture scan (tests/architecture/fixture-scan.test.ts), and review X's
+security 4 and 5 in core/json.ts (s.17: a plain-digit source of more than 20 digits stays a JS number;
+`stringifyLossless` refuses -0).
+
+Differences from s.3, s.4 and s.5:
+- `readEnvelope(outcome, id, monoNowMs)` returns `{ok, result}` or a failure. `retryAtMs` of
+  `rate-limited` is on the monotonic clock, as the governor's denials are, and Retry-After is read as the
+  governor reads it (missing: 60 s; over 600 s: 600 s).
+- `"id": null` is accepted only with -32700 or -32600 (JSON-RPC 2.0: the node could not read our id);
+  with any other error, and with a result, it is `id`. A 200 without text (the transport gives none) is
+  `json`.
+- The error object is exactly `{code, message, data?}`; the code an integer from -2^31 to 2^31 - 1 (so
+  it survives as a JS number), the message a string of at most 1,024 characters (never kept). Anything
+  else is `envelope`. -32016's `nodeSlot` is `data.contextSlot` only when it is a slot, else null.
+- A body error code 429 is `rate-limited` only inside a valid envelope (the recorded limiter answer is
+  HTTP 429, whose body the transport drops). The client (7e) must settle it with the governor as status
+  429, so the method closes as it does for the status.
+- The `calls` builders write each method's params (s.5's table), so a caller passes only values: the
+  commitment `confirmed` and the encoding `base64` are fixed there, `minContextSlot` is always sent (the
+  client passes 0 before it has a mark), keys are 1 to 100 distinct Address values, a slice is exactly
+  `{offset, length}` within 10 MiB, a rent size within 10 MiB. Everything they build is frozen. The
+  `finalized` reads (s.5) and getBlockTime come with chainTime in 7g; the 7h methods with 7h.
+- `encodeRequest` refuses a getTransaction call with no signature or more than two params, and a config
+  that is not a plain object; it writes `maxSupportedTransactionVersion: 1` over whatever was passed.
+- The decoders return `{ok, value, context}` (context only for getMultipleAccounts) or `{ok: false,
+  code: 'shape' | 'count'}`. `went-back` and `stale` are the client's (7e). `apiVersion` is any text of 1
+  to 64 characters (events take it only in its plain `x.y.z` form, s.3). An empty fee list is accepted.
+- The rent formula is exported (`rentFormula`, 5,080 lamports per byte with 128 bytes of overhead,
+  VERIFIED_FACTS s.3); the client compares and fires `chain-rent-formula` (7e). The chain's value wins.
+- The fixture scan reads every .ts file in src/ and tests/ (any other file there fails it) and allows
+  eight values, each with its reason: the system program, a synthetic all-0xff vector, the mainnet,
+  devnet and testnet genesis hashes, the wSOL mint, the SPL Token program and the upgradeable loader.
+  What it cannot see: an address written as hex, base64 or a byte list, or one joined to other base58
+  text in a single run (read as one value); reviewers check fixtures for those.
+
+Due in 7e from this step: settle a body 429 as status 429; the request-size check (48 KiB in UTF-8 bytes)
+before `acquire`, as `our-bug` 413; the rent comparison and its event; 'chain-shape' on `shape` and
+`count`.
+
+Tests: TEST_PLAN.md s.3, "Done in step 7d". Planted bugs (scratchpad `mut/run44.py`): 106, 102 caught and
+4 equivalent, each with its reason in the script (the refused-method list behind the method table, the
+result-or-error rule behind the three-key rule, an array never holding named keys, and a renamed key
+reading as missing, which every field check refuses). Two weak tests were found while choosing them and
+fixed first (the 10 MiB and negative `space` bounds were reached only together with a length mismatch).
+Coverage: every line and branch of the two files and of core/json.ts.
