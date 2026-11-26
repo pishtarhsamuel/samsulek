@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-11-20
+Updated: 2026-11-26
 
 **Phase 2 (foundations, tests first): in progress.** Paper-only building blocks; nothing
 can trade, and no key or account exists anywhere.
@@ -340,16 +340,41 @@ can trade, and no key or account exists anywhere.
   selling included (fixed in the design before part 7e); the start command will refuse settings that
   switch off the internet connection's certificate checks or reroute it; and a huge message on the live
   block feed is a crash risk, guarded by the memory limit.
-- Next: parts 7b to 7g (the request budget, the internet connection, reading the answers, the live block
-  feed, the clock check). One question for you is due before part 7g (the clock thresholds).
+- Parts 7b to 7d were reviewed together (Nov 26, REVIEWS.md Y). The risk reviewer approved with notes.
+  The security reviewer stopped the merge over one fault: when the bot stopped reading an answer that was
+  too big, the connection stayed open and kept downloading until its time limit. That is fixed, with a
+  test; the security reviewer confirmed the fix the same day, and the three parts joined the main work. The
+  other notes are written into the design (CHAIN_DESIGN.md s.21), each with the part it is due by; the
+  main one: data from the live block feed must never use up the room kept for selling (due in part 7f).
+- Part 7b is built (tests first) on the separate branch: the request budget. Every
+  request to the free Solana server asks it first, so the bot stays well under the server's limits; room
+  is always kept for selling and price checks, and the least important work is cut back first when it
+  gets busy. If the server says "slow down" it waits as told; if it blocks the bot, nothing is sent for
+  15 minutes and buying stops. 46 deliberate bugs were planted: 43 caught, 3 cannot change anything
+  (each reason written down); three weak tests were found and fixed.
+- Part 7c is built (tests first) on the separate branch: the internet connection
+  itself, the only place in the bot allowed to talk to the internet. It only uses secure connections,
+  refuses to be redirected, never reads more than each answer may be (a small compressed answer that
+  would unpack to gigabytes is stopped at the limit), refuses anything that is not proper text, gives
+  up on an answer that hangs, and never lets the server's address (which may one day hold a key) into a
+  message or a log. 30 deliberate bugs were planted: 29 caught, 1 cannot change anything.
+- Part 7d is built (tests first) on the separate branch: writing the questions to the
+  Solana server and reading its answers. Every answer is checked field by field; anything missing,
+  extra, of the wrong kind or out of range is refused, never guessed or rounded (large amounts stay
+  exact). Each kind of server error is sorted (our mistake, server behind, slow down, data not there).
+  A new test makes sure no real person's wallet address can ever sit in the code or the tests. 106
+  deliberate bugs were planted: 102 caught, 4 cannot change anything (each reason written down); two
+  weak tests were found and fixed.
+- Next: part 7e (the read client, with the review notes due there). One question for you is due before
+  part 7g (the clock thresholds).
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
-- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 70% (settings,
+- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 76% (settings,
   accounting, risk engine, the storage files, the approval transactions, the start-up checks, the
   daily money check, the bot's settings step and your setting commands done, reviewed and in the
-  main work); the whole build about 33%. At the pace so far (Nov 4 to Nov 24),
+  main work); the whole build about 35%. At the pace so far (Nov 4 to Nov 26),
   building takes roughly 6 more weeks (5 to 9), and proving an edge on paper at least 1 to 3 weeks
   more: at least 50 closed paper trades over at least 7 days per strategy before any live decision.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.

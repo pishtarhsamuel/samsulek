@@ -1,12 +1,14 @@
 // The lossless reader against random numbers and spellings (docs/CHAIN_DESIGN.md s.13): a bigint comes
-// out exactly when the source is canonical digits, and its value then equals BigInt(source); any other
-// valid spelling stays a JS number. Inside arrays and objects too.
+// out exactly when the source is canonical digits, at most 20 of them (review X, security 4), and its
+// value then equals BigInt(source); any other valid spelling stays a JS number. Inside arrays and
+// objects too.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fc from 'fast-check';
 import { parseLossless } from '../../../src/core/json.ts';
 
-const CANONICAL = /^-?(0|[1-9][0-9]*)$/;
+/** Plain digits, at most 20 of them: what becomes a bigint. */
+const CANONICAL = /^-?(0|[1-9][0-9]{0,19})$/;
 
 // integers of every size around the u64 and i64 edges, and valid JSON spellings that are not plain digits
 const integerArb = fc.oneof(

@@ -579,6 +579,90 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      equivalent (base64's character and length checks, which its final re-encoding also enforces). Final:
      49, 47 caught, 2 equivalent, each with its reason in the script.
 
+   Done in step 7b (the budget governor, CHAIN_DESIGN.md s.18; UNREVIEWED, on the unreviewed branch):
+   - The table pinned to s.5: each method's cap, P0 reserve, timeout, byte cap and most urgent priority;
+     the caps add to 49 and the reserves to 27; every cap at most half the method's header limit; the
+     refused getTokenLargestAccounts; the fixed numbers of s.6; all frozen.
+   - Windows: a method's cap over a sliding 10 s (the 7th getSlot refused with the time a slot frees,
+     granted exactly then; non-P0 never gets getSlot); non-P0 leaves each method's P0 reserve free; the
+     total with its reserve (tightened); data reserved at the byte cap and settled at the decoded bytes
+     for 30 s, with the P0 reserve; the stream's bytes; when to try again (never for an answer bigger
+     than the budget, soon when only requests in flight hold it); 6 in flight, 2 of them P0's.
+   - The provider: a 429's Retry-After (30 s, missing, not whole, negative, over 600 s, 0); a 403's
+     15-minute block, P0 included, then one P0 probe (a 5xx keeps it blocked, a 403 blocks again, a 200
+     reopens; a 200 from before the block does not); header limits only lowering the cap to half, 0
+     refusing the method for good; a remaining count of 0 or below closing it until its window empties.
+   - Shedding: levels 1 to 3 and what each sheds, P1 and P0 never, at most 3, one step down per 5 minutes
+     (also over a long quiet stretch); 80% for a minute raising it once a minute (connections held), and
+     slot polling that keeps a P0-only method over 80% never doing so; every P0 denial alerting.
+   - Refusals, tickets and inputs: unknown and refused methods and P0 on getProgramAccounts before any
+     count; a second or forged settle alerting and changing nothing; impossible byte counts, statuses,
+     stream bytes and priorities as TypeErrors; a clock stepping back held (grants made then dated at the
+     held reading); a throwing sink ignored; `usage()` for all 14 buckets; tightening only downward.
+   - Property (300 runs each, with and without learning, with and without tightening): random acquires
+     of every method and priority, settles with random statuses and headers, clock steps: after every
+     grant no window over its cap, the total, data and in-flight caps held; P0 never shed; a P0 refused
+     for a full window had its whole reserve.
+   - Planted bugs (scratchpad `mut/run42.py`): 46 in the first run, 38 caught, 2 equivalent; three weak
+     tests fixed and a second guard that hid the first removed. Final: 46, 43 caught, 3 equivalent.
+
+   Done in step 7c (the providers and the fetch transport, CHAIN_DESIGN.md s.19; UNREVIEWED), against a
+   real in-process HTTP server on 127.0.0.1, never the network:
+   - A POST of the JSON body with JSON content type and accept headers; a 200's text and its rate
+     headers (a negative remaining count kept); the headers read from digits only (twelve malformed
+     forms, a date-form Retry-After among them, are missing).
+   - An error status (429, 403, 500) with its headers, its body dropped: unread when its content-length
+     is over 4 KiB, else stopped at the first chunk past it; a 204 with no body.
+   - Refusals: a redirect (its target never reached), a 200 that is not JSON (four types; the type is
+     case-insensitive), a content-length over the cap (unread), a gzip bomb (20 MiB of spaces in 20 KiB,
+     stopped past 64 KiB of decoded bytes), exactly the cap read and one byte more refused (with and
+     without a content-length), invalid UTF-8 inside the text and at its very end, a request over 48 KiB
+     in UTF-8 bytes (never sent; exactly 48 KiB goes).
+   - Ends: a stalled body as a timeout or as shutdown, no answer at all as a timeout, a refused
+     connection and the real fetch at a closed local port as transport failures, nothing sent once
+     stopping; impossible arguments as TypeErrors.
+   - The provider URL: the public endpoint pinned (https, no key, frozen) and the genesis hash a
+     canonical 32-byte value; another scheme, a user, a fragment, an unlisted query value or a too-short
+     secret refused without naming the URL; a key in the query registered as an own secret, and no
+     outcome naming the URL or the key, a redirect's error included.
+   - Planted bugs (scratchpad `mut/run43.py`): 30, 29 caught on the first run, 1 equivalent.
+
+   Done in step 7d (the JSON-RPC layer and the strict decoders, CHAIN_DESIGN.md s.20; UNREVIEWED):
+   - Requests: the exact request text for each Phase 2 method, bigints as digits; getTransaction's
+     version 1 written over the caller's; a sending, refused, inherited or unknown method, a bad id and
+     params that are not a list refused. The builders: commitment `confirmed` and encoding `base64` on
+     the wire, `minContextSlot` always sent; 0 or 101 keys, a key twice, a key that is not an address,
+     a slice or size outside 10 MiB refused; a full batch of 100 fits the request cap; all frozen.
+   - Envelope: every transport outcome to its kind; 429 with Retry-After (10 s, missing, over 600 s),
+     403, 400/405/413/415 and other statuses; bad JSON; 15 malformed envelopes; a wrong, missing, text,
+     float or null id (null accepted only with -32700 and -32600); every code row of s.4's table to its
+     kind, -32016 with and without a valid slot; a body 429; codes at and past the 32-bit edges; no
+     failure carrying the node's message; everything frozen.
+   - Decoders: the genesis hash, slots and block heights at 0 and 2^63 - 1 and past them, respelled
+     integers refused; rent at 0 and u64 max, the formula at 0, 165, 170 bytes and 10 MiB; accounts in
+     request order with null for a missing one, data a fresh copy, u64 lamports above 2^53 exact; the
+     count against the keys; 18 malformed tops and contexts and 30 malformed accounts (each key missing,
+     an extra one, floats, 1e3, strings, negatives, past u64, owner not 32 bytes, data not exactly
+     `[base64, "base64"]` or not canonical, its length off by one); with a slice, the length
+     `min(length, max(0, space - offset))` at the start, the tail, the end and past it, off by one either
+     way, and the size bounds on their own; fees: 150 in reverse order sorted, 151 refused, a slot twice,
+     12 malformed entries.
+   - Property tests (1,000 cases each): random valid batches and fee lists decode to exactly their
+     values; a random structural mutation (a key removed, added or renamed, another JSON type, an
+     integer respelled as 1e0, 1.0, 1.00, 1E+0 or a string) is always refused. core/json.ts: a run of
+     more than 20 digits stays a JS number (a million digits under a second); stringify refuses -0.
+   - The fixture scan: no 32- or 64-byte base58 literal in src/ or tests/ outside its allowlist of
+     eight; a canary built from bytes (found once however often it appears; 33 bytes and joined runs not
+     found).
+   - Planted bugs (scratchpad `mut/run44.py`): 106, 102 caught, 4 equivalent.
+
+   Done in the review Y fix (CHAIN_DESIGN.md s.21): past the byte cap the connection is released at once,
+   for a 200 and for an error body, against a server that never stops sending and timers that never fire;
+   a body whose cancel itself fails is let go on both release paths with no throw; prefixed content types
+   refused; a timeout above 2^31 - 1 ms and a byte cap above 16 MiB are TypeErrors
+   at once, and every method's limits fit inside them. Planted bugs (scratchpad `mut/run45.py`): 6, 6
+   caught.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

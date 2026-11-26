@@ -639,3 +639,176 @@ Conditions, each due by the sub-step or phase named:
     trusted RPC, or the owner accepts that risk explicitly.
 
 Kept as the reviewers accepted: R1 to R8 and R10 to R15; R9 waits for the owner.
+
+## 18. As built in step 7b (the budget governor), and what changed
+
+Status: UNREVIEWED, on the unreviewed branch.
+
+Built, tests first: chain/limits.ts (`METHOD_TABLE` as s.5, `REFUSED_METHODS`, `PRIORITIES`,
+`BUDGET_RULES` with the numbers of s.6), chain/events.ts (the `ChainEvent` types of s.3, in their own
+file because the governor, the client and the stream all produce them), chain/budget.ts
+(`createBudgetGovernor`).
+
+Differences from s.3 and s.6:
+- The 80% rule leaves out a method whose whole cap is its P0 reserve (getSlot, getBlockHeight,
+  getBlockTime, getGenesisHash, rent): risk A's 2 s slot polling keeps 5 of getSlot's 6 in every window
+  by design, and counting it would shed P2 to P4 for good. Those methods still count in the total, and
+  the total, data and connection buckets count every priority.
+- A remaining count at or below zero is reported as `retry-after` (the provider asked us to wait), not
+  `method-cap`, which stays our own count. So "P0 refused at method-cap" always means the window is full
+  of grants, at least the P0 reserve of them P0's.
+- Learning keeps no separate record of the lowest limit: a header limit can only lower the cap
+  (`min(table cap, floor(limit / 2))` is taken only when below the current cap).
+- `createBudgetGovernor` takes an optional `tighten` (total cap and reserve, data cap and reserve), each
+  only at or below `BUDGET_RULES` and a reserve never above its cap: the tests reach the total and data
+  caps with it (the method caps add up to 49 of 60, so the total cannot bind with the defaults). The
+  composition root passes none.
+- A denial's `retryAtMs` is exact for a full window, a Retry-After and a block; "never" (Infinity) for a
+  refused method, a method a priority may never use (non-P0 on getSlot) and an answer bigger than the
+  whole data budget; and a 1 s hint where only requests in flight stand in the way.
+- The blocked provider's probe is the first P0 request after the 15 minutes; a 200 reopens it, a 403
+  blocks it again, anything else (a timeout, a 5xx) frees the probe slot for the next P0 request. A 200
+  of a request that was already in flight when the 403 came reopens nothing.
+- The decay takes one step per 5 minutes without a trigger, also over a long quiet stretch (one call
+  after 15 minutes takes the level down three steps, each with its event).
+
+Tests: TEST_PLAN.md s.3, "Done in step 7b". Planted bugs (scratchpad `mut/run42.py`): 46 in the first
+run, 38 caught and 2 equivalent; the six left showed three weak tests (a grant while the clock is
+behind, a probe's 5xx against "unblocked", polling that was never busy for a whole minute), one second
+guard that hid the first (the lowest-limit record, removed), and one more equivalent. Final: 46, 43
+caught, 3 equivalent, each with its reason in the script. Coverage: every line and branch of the two
+files.
+
+## 19. As built in step 7c (the providers and the fetch transport), and what changed
+
+Status: UNREVIEWED, on the unreviewed branch.
+
+Built, tests first: chain/providers.ts (`ProviderEndpoint`, `PUBLIC_MAINNET`, `MAINNET_GENESIS_HASH`),
+chain/http.ts (`createHttpTransport`, `HttpOutcome`, `HttpTransport`, `MAX_REQUEST_BYTES` = 49,152).
+
+Differences from s.3, s.4 and s.9:
+- `HttpOutcome` has one more kind, `request-too-large`: the transport itself refuses a request over 48
+  KiB (counted in UTF-8 bytes) without sending it. The client (7d, 7e) still refuses it before
+  `acquire`, as s.4 says, so the budget is never spent on it; this is the second line.
+- `createHttpTransport` takes an optional `fetchImpl`. Production passes none (the global fetch); the
+  tests pass the real fetch pointed at a local server, so the https-only URL check stays exactly as in
+  production. chain/http.ts is still the only file that names `fetch`.
+- An error status's body is not read at all when its content-length is over 4 KiB; without one, reading
+  stops at the first chunk past 4 KiB. A body-less answer (204) comes back with its status and no text.
+- The rate headers are read from digits only (1 to 9 of them; the remaining count may be negative);
+  anything else, a date-form Retry-After included, is missing, and the governor then waits its default.
+- Nothing is sent once the shutdown signal has fired (`shutdown`, with no request).
+- The URL check runs once, when the transport is made: https, no user name, password or fragment, every
+  query value one of the secret parts, each registered as an own secret; its refusals never name the
+  URL. The WebSocket URL is checked by chain/ws-socket.ts (7f). The start command's refusal of TLS and
+  proxy variables (review X, security 1) is cli/'s, with Phase 7.
+
+Tests: TEST_PLAN.md s.3, "Done in step 7c". Planted bugs (scratchpad `mut/run43.py`): 30, 29 caught on
+the first run and 1 equivalent (an already-aborted signal makes fetch refuse without sending, so the
+early return only saves the call). Coverage: every line and branch of the two files.
+
+## 20. As built in step 7d (the JSON-RPC layer and the strict decoders), and what changed
+
+Status: UNREVIEWED, on the unreviewed branch.
+
+Built, tests first: chain/rpc.ts (`encodeRequest`, `readEnvelope`, the `calls` builders, `ChainFailure`,
+`ChainResult`, `Envelope`, `RpcCall`, `DataSlice`, `COMMITMENT`, `MAX_KEYS` = 100, `MAX_ACCOUNT_BYTES` =
+10 MiB), chain/decode.ts (`decodeGenesisHash`, `decodeSlot`, `decodeBlockHeight`, `decodeAccounts`,
+`decodePriorityFees`, `decodeRent`, `rentFormula`, `Decoded`, `RpcContext`, `Account`, `FeeEntry`,
+`MAX_FEE_ENTRIES` = 150), the fixture scan (tests/architecture/fixture-scan.test.ts), and review X's
+security 4 and 5 in core/json.ts (s.17: a plain-digit source of more than 20 digits stays a JS number;
+`stringifyLossless` refuses -0).
+
+Differences from s.3, s.4 and s.5:
+- `readEnvelope(outcome, id, monoNowMs)` returns `{ok, result}` or a failure. `retryAtMs` of
+  `rate-limited` is on the monotonic clock, as the governor's denials are, and Retry-After is read as the
+  governor reads it (missing: 60 s; over 600 s: 600 s).
+- `"id": null` is accepted only with -32700 or -32600 (JSON-RPC 2.0: the node could not read our id);
+  with any other error, and with a result, it is `id`. A 200 without text (the transport gives none) is
+  `json`.
+- The error object is exactly `{code, message, data?}`; the code an integer from -2^31 to 2^31 - 1 (so
+  it survives as a JS number), the message a string of at most 1,024 characters (never kept). Anything
+  else is `envelope`. -32016's `nodeSlot` is `data.contextSlot` only when it is a slot, else null.
+- A body error code 429 is `rate-limited` only inside a valid envelope (the recorded limiter answer is
+  HTTP 429, whose body the transport drops). The client (7e) must settle it with the governor as status
+  429, so the method closes as it does for the status.
+- The `calls` builders write each method's params (s.5's table), so a caller passes only values: the
+  commitment `confirmed` and the encoding `base64` are fixed there, `minContextSlot` is always sent (the
+  client passes 0 before it has a mark), keys are 1 to 100 distinct Address values, a slice is exactly
+  `{offset, length}` within 10 MiB, a rent size within 10 MiB. Everything they build is frozen. The
+  `finalized` reads (s.5) and getBlockTime come with chainTime in 7g; the 7h methods with 7h.
+- `encodeRequest` refuses a getTransaction call with no signature or more than two params, and a config
+  that is not a plain object; it writes `maxSupportedTransactionVersion: 1` over whatever was passed.
+- The decoders return `{ok, value, context}` (context only for getMultipleAccounts) or `{ok: false,
+  code: 'shape' | 'count'}`. `went-back` and `stale` are the client's (7e). `apiVersion` is any text of 1
+  to 64 characters (events take it only in its plain `x.y.z` form, s.3). An empty fee list is accepted.
+- The rent formula is exported (`rentFormula`, 5,080 lamports per byte with 128 bytes of overhead,
+  VERIFIED_FACTS s.3); the client compares and fires `chain-rent-formula` (7e). The chain's value wins.
+- The fixture scan reads every .ts file in src/ and tests/ (any other file there fails it) and allows
+  eight values, each with its reason: the system program, a synthetic all-0xff vector, the mainnet,
+  devnet and testnet genesis hashes, the wSOL mint, the SPL Token program and the upgradeable loader.
+  What it cannot see: an address written as hex, base64 or a byte list, or one joined to other base58
+  text in a single run (read as one value); reviewers check fixtures for those.
+
+Due in 7e from this step: settle a body 429 as status 429; the request-size check (48 KiB in UTF-8 bytes)
+before `acquire`, as `our-bug` 413; the rent comparison and its event; 'chain-shape' on `shape` and
+`count`.
+
+Tests: TEST_PLAN.md s.3, "Done in step 7d". Planted bugs (scratchpad `mut/run44.py`): 106, 102 caught and
+4 equivalent, each with its reason in the script (the refused-method list behind the method table, the
+result-or-error rule behind the three-key rule, an array never holding named keys, and a renamed key
+reading as missing, which every field check refuses). Two weak tests were found while choosing them and
+fixed first (the 10 MiB and negative `space` bounds were reached only together with a length mismatch).
+Coverage: every line and branch of the two files and of core/json.ts.
+
+## 21. Review Y (7b to 7d): the fix, and the conditions for later sub-steps
+
+Review Y (REVIEWS.md Y), of 7b, 7c and 7d at b1979b2, by fresh reviewers: risk-guardian APPROVED WITH
+NOTES; security-auditor BLOCKED on one narrow defect, to lift once it is fixed with a test. On re-check
+of the fix (a418264) security CONFIRMED: the block lifts, and review Y stands as APPROVED WITH NOTES; 7b
+to 7d join the working branch.
+
+Fixed now (the review Y fix, chain/http.ts and its test):
+- Security 1 (MEDIUM): past the byte cap in the middle of a body, the transport called `res.body.cancel()`
+  on a stream its own reader had locked; that call rejects, the rejection was swallowed, and the socket
+  stayed open and kept receiving (uncharged) until the timeout. Now the reader cancels it
+  (`reader.cancel()`), which closes the socket at once. The test: a server that never stops sending,
+  timers that never fire, for a 200 over its cap and a 500 over 4 KiB: the socket closes within a second
+  (about 20 ms) and little more is sent. s.4's "every body is consumed or cancelled" is now true.
+- Security 2 (LOW): content types with a prefix (`x-application/json`) added to the refused list, so the
+  regex's `^` is tested.
+- Security 4 (LOW): `post()` refuses a timeout above 2^31 - 1 ms and a byte cap above 16 MiB
+  (`MAX_RESPONSE_BYTES`, above every method's cap) as a TypeError at once; before, the timers threw
+  inside the async run and `post()` rejected.
+- Planted bugs (scratchpad `mut/run45.py`): 6, 6 caught (the old cancel among them).
+
+Conditions, each due by the sub-step named:
+- 7e:
+  - Risk 2: a learned cap of 0 that refuses a P0 method (exits blind until a restart) raises an owner
+    alert, not only `chain-limit-learned`.
+  - Risk 3: one unit test each for the shed timer at level 3, the 80% hold reset, `floor` in learning,
+    the exact `retryAtMs` of a full window, and -32016's `nodeSlot` null when out of range.
+  - Risk 4: a 429 with Retry-After 0 closes the method for a minimum wait.
+  - Risk 5: only methods whose table cap equals their table reserve leave the 80% rule.
+  - Risk 7: the governor denies until its clock has given a finite reading.
+  - Risk 8: an empty fee list or a null account reaches consumers as "no reading" or "missing", never
+    0; every failure kind has a named breaker or entries-off rule; a probe answered too-large,
+    content-type or utf8 settles with no status and leaves the provider blocked (written down); a
+    getSlot result below the `minContextSlot` sent is `went-back`.
+  - Risk 9: the budget property tests run 1,000 cases, or the exception is recorded.
+  - Security 5: duplicate keys in an answer are refused, or the accepted behaviour (the last one wins)
+    is written down.
+  - Security 6: a 2 MiB answer can take about 1 s to parse: lower P0 byte caps, or the risk is recorded.
+  - Security 7: before the first recorded fixture, long base64 literals are flagged by the fixture scan
+    or recorded answers go through a scrubber.
+  - Security 8: the apiVersion form rule is enforced where the event is made.
+  - Still due from s.17 and s.20: the feed-bounded minContextSlot mark (review X, risk 1), a body 429
+    settled as status 429, the request-size check before `acquire`, the rent event, `chain-shape`.
+- 7f:
+  - Risk 1 (MEDIUM): stream bytes never take P0's data reserve (for example, `chargeStream` reports when
+    the stream is over its share and the stream client drops its logs subscriptions), with a test that a
+    P0 read of its full byte cap fits after any stream charge.
+  - Risk 6: the budget property test settles up to the cap plus one chunk, charges stream bytes, and
+    its comment is corrected.
+- Before a second keyed provider (with review X, security 6): security 3, the URL check covers the path
+  and query names, registers percent-encoded forms, and is tested with two secret parts.
