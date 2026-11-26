@@ -343,7 +343,7 @@ can trade, and no key or account exists anywhere.
 - Parts 7b to 7d were reviewed together (Nov 26, REVIEWS.md Y). The risk reviewer approved with notes.
   The security reviewer stopped the merge over one fault: when the bot stopped reading an answer that was
   too big, the connection stayed open and kept downloading until its time limit. That is fixed, with a
-  test, and waits for the security reviewer's re-check before the three parts join the main work. The
+  test; the security reviewer confirmed the fix the same day, and the three parts joined the main work. The
   other notes are written into the design (CHAIN_DESIGN.md s.21), each with the part it is due by; the
   main one: data from the live block feed must never use up the room kept for selling (due in part 7f).
 - Part 7b is built (tests first) on the separate branch: the request budget. Every
@@ -365,8 +365,8 @@ can trade, and no key or account exists anywhere.
   A new test makes sure no real person's wallet address can ever sit in the code or the tests. 106
   deliberate bugs were planted: 102 caught, 4 cannot change anything (each reason written down); two
   weak tests were found and fixed.
-- Next: the security re-check of the fix, then part 7e (the read client, with the review notes due
-  there). One question for you is due before part 7g (the clock thresholds).
+- Next: part 7e (the read client, with the review notes due there). One question for you is due before
+  part 7g (the clock thresholds).
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;

@@ -764,7 +764,9 @@ Coverage: every line and branch of the two files and of core/json.ts.
 ## 21. Review Y (7b to 7d): the fix, and the conditions for later sub-steps
 
 Review Y (REVIEWS.md Y), of 7b, 7c and 7d at b1979b2, by fresh reviewers: risk-guardian APPROVED WITH
-NOTES; security-auditor BLOCKED on one narrow defect, to lift once it is fixed with a test.
+NOTES; security-auditor BLOCKED on one narrow defect, to lift once it is fixed with a test. On re-check
+of the fix (a418264) security CONFIRMED: the block lifts, and review Y stands as APPROVED WITH NOTES; 7b
+to 7d join the working branch.
 
 Fixed now (the review Y fix, chain/http.ts and its test):
 - Security 1 (MEDIUM): past the byte cap in the middle of a body, the transport called `res.body.cancel()`
