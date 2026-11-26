@@ -656,6 +656,13 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      found).
    - Planted bugs (scratchpad `mut/run44.py`): 106, 102 caught, 4 equivalent.
 
+   Done in the review Y fix (CHAIN_DESIGN.md s.21): past the byte cap the connection is released at once,
+   for a 200 and for an error body, against a server that never stops sending and timers that never fire;
+   a body whose cancel itself fails is let go on both release paths with no throw; prefixed content types
+   refused; a timeout above 2^31 - 1 ms and a byte cap above 16 MiB are TypeErrors
+   at once, and every method's limits fit inside them. Planted bugs (scratchpad `mut/run45.py`): 6, 6
+   caught.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

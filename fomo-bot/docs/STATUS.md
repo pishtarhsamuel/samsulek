@@ -340,27 +340,33 @@ can trade, and no key or account exists anywhere.
   selling included (fixed in the design before part 7e); the start command will refuse settings that
   switch off the internet connection's certificate checks or reroute it; and a huge message on the live
   block feed is a crash risk, guarded by the memory limit.
-- Part 7b is built (tests first), NOT YET REVIEWED, on the separate branch: the request budget. Every
+- Parts 7b to 7d were reviewed together (Nov 26, REVIEWS.md Y). The risk reviewer approved with notes.
+  The security reviewer stopped the merge over one fault: when the bot stopped reading an answer that was
+  too big, the connection stayed open and kept downloading until its time limit. That is fixed, with a
+  test, and waits for the security reviewer's re-check before the three parts join the main work. The
+  other notes are written into the design (CHAIN_DESIGN.md s.21), each with the part it is due by; the
+  main one: data from the live block feed must never use up the room kept for selling (due in part 7f).
+- Part 7b is built (tests first) on the separate branch: the request budget. Every
   request to the free Solana server asks it first, so the bot stays well under the server's limits; room
   is always kept for selling and price checks, and the least important work is cut back first when it
   gets busy. If the server says "slow down" it waits as told; if it blocks the bot, nothing is sent for
   15 minutes and buying stops. 46 deliberate bugs were planted: 43 caught, 3 cannot change anything
   (each reason written down); three weak tests were found and fixed.
-- Part 7c is built (tests first), NOT YET REVIEWED, on the separate branch: the internet connection
+- Part 7c is built (tests first) on the separate branch: the internet connection
   itself, the only place in the bot allowed to talk to the internet. It only uses secure connections,
   refuses to be redirected, never reads more than each answer may be (a small compressed answer that
   would unpack to gigabytes is stopped at the limit), refuses anything that is not proper text, gives
   up on an answer that hangs, and never lets the server's address (which may one day hold a key) into a
   message or a log. 30 deliberate bugs were planted: 29 caught, 1 cannot change anything.
-- Part 7d is built (tests first), NOT YET REVIEWED, on the separate branch: writing the questions to the
+- Part 7d is built (tests first) on the separate branch: writing the questions to the
   Solana server and reading its answers. Every answer is checked field by field; anything missing,
   extra, of the wrong kind or out of range is refused, never guessed or rounded (large amounts stay
   exact). Each kind of server error is sorted (our mistake, server behind, slow down, data not there).
   A new test makes sure no real person's wallet address can ever sit in the code or the tests. 106
   deliberate bugs were planted: 102 caught, 4 cannot change anything (each reason written down); two
   weak tests were found and fixed.
-- Next: both reviewers check 7b to 7d together, then part 7e (the read client). One question for you is
-  due before part 7g (the clock thresholds).
+- Next: the security re-check of the fix, then part 7e (the read client, with the review notes due
+  there). One question for you is due before part 7g (the clock thresholds).
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;

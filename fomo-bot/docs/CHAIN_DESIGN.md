@@ -760,3 +760,53 @@ result-or-error rule behind the three-key rule, an array never holding named key
 reading as missing, which every field check refuses). Two weak tests were found while choosing them and
 fixed first (the 10 MiB and negative `space` bounds were reached only together with a length mismatch).
 Coverage: every line and branch of the two files and of core/json.ts.
+
+## 21. Review Y (7b to 7d): the fix, and the conditions for later sub-steps
+
+Review Y (REVIEWS.md Y), of 7b, 7c and 7d at b1979b2, by fresh reviewers: risk-guardian APPROVED WITH
+NOTES; security-auditor BLOCKED on one narrow defect, to lift once it is fixed with a test.
+
+Fixed now (the review Y fix, chain/http.ts and its test):
+- Security 1 (MEDIUM): past the byte cap in the middle of a body, the transport called `res.body.cancel()`
+  on a stream its own reader had locked; that call rejects, the rejection was swallowed, and the socket
+  stayed open and kept receiving (uncharged) until the timeout. Now the reader cancels it
+  (`reader.cancel()`), which closes the socket at once. The test: a server that never stops sending,
+  timers that never fire, for a 200 over its cap and a 500 over 4 KiB: the socket closes within a second
+  (about 20 ms) and little more is sent. s.4's "every body is consumed or cancelled" is now true.
+- Security 2 (LOW): content types with a prefix (`x-application/json`) added to the refused list, so the
+  regex's `^` is tested.
+- Security 4 (LOW): `post()` refuses a timeout above 2^31 - 1 ms and a byte cap above 16 MiB
+  (`MAX_RESPONSE_BYTES`, above every method's cap) as a TypeError at once; before, the timers threw
+  inside the async run and `post()` rejected.
+- Planted bugs (scratchpad `mut/run45.py`): 6, 6 caught (the old cancel among them).
+
+Conditions, each due by the sub-step named:
+- 7e:
+  - Risk 2: a learned cap of 0 that refuses a P0 method (exits blind until a restart) raises an owner
+    alert, not only `chain-limit-learned`.
+  - Risk 3: one unit test each for the shed timer at level 3, the 80% hold reset, `floor` in learning,
+    the exact `retryAtMs` of a full window, and -32016's `nodeSlot` null when out of range.
+  - Risk 4: a 429 with Retry-After 0 closes the method for a minimum wait.
+  - Risk 5: only methods whose table cap equals their table reserve leave the 80% rule.
+  - Risk 7: the governor denies until its clock has given a finite reading.
+  - Risk 8: an empty fee list or a null account reaches consumers as "no reading" or "missing", never
+    0; every failure kind has a named breaker or entries-off rule; a probe answered too-large,
+    content-type or utf8 settles with no status and leaves the provider blocked (written down); a
+    getSlot result below the `minContextSlot` sent is `went-back`.
+  - Risk 9: the budget property tests run 1,000 cases, or the exception is recorded.
+  - Security 5: duplicate keys in an answer are refused, or the accepted behaviour (the last one wins)
+    is written down.
+  - Security 6: a 2 MiB answer can take about 1 s to parse: lower P0 byte caps, or the risk is recorded.
+  - Security 7: before the first recorded fixture, long base64 literals are flagged by the fixture scan
+    or recorded answers go through a scrubber.
+  - Security 8: the apiVersion form rule is enforced where the event is made.
+  - Still due from s.17 and s.20: the feed-bounded minContextSlot mark (review X, risk 1), a body 429
+    settled as status 429, the request-size check before `acquire`, the rent event, `chain-shape`.
+- 7f:
+  - Risk 1 (MEDIUM): stream bytes never take P0's data reserve (for example, `chargeStream` reports when
+    the stream is over its share and the stream client drops its logs subscriptions), with a test that a
+    P0 read of its full byte cap fits after any stream charge.
+  - Risk 6: the budget property test settles up to the cap plus one chunk, charges stream bytes, and
+    its comment is corrected.
+- Before a second keyed provider (with review X, security 6): security 3, the URL check covers the path
+  and query names, registers percent-encoded forms, and is tested with two secret parts.

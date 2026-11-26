@@ -22,6 +22,10 @@ import type { ProviderEndpoint } from './providers.ts';
 export const MAX_REQUEST_BYTES = 49_152;
 /** The most of an error body ever read (it is dropped). */
 const ERROR_BODY_MAX_BYTES = 4_096;
+/** The longest timeout the timers take (Node fires a longer one at once; core/clock.ts refuses it). */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+/** No method's cap is above this (the largest, getProgramAccounts, is 2 MiB: chain/limits.ts). */
+export const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 export type HttpOutcome =
   /** bodyText: the text of a 200 with a JSON type; null for any other status. */
@@ -144,7 +148,10 @@ export function createHttpTransport(o: { readonly endpoint: ProviderEndpoint; re
           }
           bytes += value.byteLength;
           if (bytes > limit) {
-            await discard(res);
+            // the reader holds the stream's lock, so only the reader can cancel it; that closes the
+            // socket at once, where res.body.cancel() would fail on the lock and leave it open, still
+            // receiving, until the timeout (review Y, security 1)
+            await reader.cancel().catch(() => undefined);
             return ok ? Object.freeze({ kind: 'too-large', bytes }) : dropped();
           }
           if (ok) {
@@ -175,11 +182,12 @@ export function createHttpTransport(o: { readonly endpoint: ProviderEndpoint; re
     if (typeof r.bodyText !== 'string') {
       throw new TypeError('the request body is JSON text');
     }
-    if (!Number.isInteger(r.timeoutMs) || r.timeoutMs < 1) {
-      throw new TypeError('a timeout is whole milliseconds from 1');
+    // checked here, so a bad call is a TypeError at once and never a rejected promise (review Y, security 4)
+    if (!Number.isInteger(r.timeoutMs) || r.timeoutMs < 1 || r.timeoutMs > MAX_TIMEOUT_MS) {
+      throw new TypeError(`a timeout is whole milliseconds from 1 to ${MAX_TIMEOUT_MS}`);
     }
-    if (!Number.isInteger(r.maxBytes) || r.maxBytes < 1) {
-      throw new TypeError('a byte cap is a whole number from 1');
+    if (!Number.isInteger(r.maxBytes) || r.maxBytes < 1 || r.maxBytes > MAX_RESPONSE_BYTES) {
+      throw new TypeError(`a byte cap is a whole number from 1 to ${MAX_RESPONSE_BYTES}`);
     }
     return run(r);
   };

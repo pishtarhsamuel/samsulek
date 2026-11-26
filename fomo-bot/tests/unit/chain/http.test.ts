@@ -10,7 +10,8 @@ import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { gzipSync } from 'node:zlib';
-import { createHttpTransport, MAX_REQUEST_BYTES, type HttpOutcome } from '../../../src/chain/http.ts';
+import { createHttpTransport, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, type FetchLike, type HttpOutcome } from '../../../src/chain/http.ts';
+import { METHOD_TABLE } from '../../../src/chain/limits.ts';
 import { MAINNET_GENESIS_HASH, PUBLIC_MAINNET, type ProviderEndpoint } from '../../../src/chain/providers.ts';
 import type { Timers } from '../../../src/core/clock.ts';
 import { assertNoSecrets } from '../../../src/core/redact.ts';
@@ -134,7 +135,7 @@ describe('the fetch transport refuses what it must not read', () => {
   });
 
   it('a 200 that is not JSON is refused unread', async () => {
-    for (const type of ['text/html', 'application/jsonp', 'text/plain; charset=utf-8', '']) {
+    for (const type of ['text/html', 'application/jsonp', 'text/plain; charset=utf-8', '', 'x-application/json', 'text/application/json; charset=utf-8']) {
       handler = (_req, _body, res) => {
         res.writeHead(200, type === '' ? {} : { 'content-type': type });
         res.end('<html>hello</html>');
@@ -163,6 +164,63 @@ describe('the fetch transport refuses what it must not read', () => {
     const o = await post(transport(), 64 * 1024);
     assert.equal(o.kind, 'too-large');
     assert.ok(o.bytes > 64 * 1024 && o.bytes < 2 * 1024 * 1024, `decoded ${o.bytes} bytes before stopping`);
+  });
+
+  it('stopping past the cap releases the connection at once, for a 200 and for an error body (review Y, security 1)', { timeout: 10_000 }, async () => {
+    // a server that never stops sending; the hand timers never fire, so only the transport can end it
+    const endless = (status: number): { closed: Promise<void>; sentAfter: () => number; mark: () => void } => {
+      let sent = 0;
+      let marked = -1;
+      let onClosed = (): void => undefined;
+      const closed = new Promise<void>((r) => {
+        onClosed = r;
+      });
+      handler = (req, _body, res) => {
+        res.writeHead(status, { 'content-type': 'application/json' });
+        const timer = setInterval(() => {
+          sent += 16_384;
+          res.write('x'.repeat(16_384));
+        }, 2);
+        req.socket.on('close', () => {
+          clearInterval(timer);
+          onClosed();
+        });
+      };
+      return { closed, mark: () => (marked = sent), sentAfter: () => sent - marked };
+    };
+    const within = (ms: number, p: Promise<void>): Promise<boolean> =>
+      new Promise((resolve) => {
+        const t = setTimeout(() => resolve(false), ms);
+        void p.then(() => {
+          clearTimeout(t);
+          resolve(true);
+        });
+      });
+    for (const [status, cap, kind] of [[200, 64 * 1024, 'too-large'], [500, 1024 * 1024, 'response']] as const) {
+      const s = endless(status);
+      const o = await post(transport(), cap);
+      s.mark();
+      assert.equal(o.kind, kind, String(status));
+      assert.ok(await within(1_000, s.closed), `the socket of the ${status} closed once reading stopped`);
+      assert.ok(s.sentAfter() <= 4 * 16_384, `little was sent after the outcome (${s.sentAfter()} bytes)`);
+    }
+  });
+
+  it('a body whose release itself fails is still let go, with no throw and no rejection', async () => {
+    // a body that cannot be cancelled (its connection already gone): both release paths swallow that
+    const broken = (type: string): FetchLike => async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull: (c) => c.enqueue(new Uint8Array(2_048).fill(0x20)),
+          cancel: () => {
+            throw new Error('the socket is already gone');
+          },
+        }),
+        { status: 200, headers: { 'content-type': type } },
+      );
+    const via = (fetchImpl: FetchLike) => createHttpTransport({ endpoint: PUBLIC_MAINNET, timers: handTimers(), shutdown: new AbortController().signal, fetchImpl });
+    assert.deepEqual(await via(broken('text/html')).post({ bodyText: BODY, timeoutMs: 5_000, maxBytes: 1_024 }), { kind: 'content-type', bytes: 0 }, 'released before reading');
+    assert.deepEqual(await via(broken('application/json')).post({ bodyText: BODY, timeoutMs: 5_000, maxBytes: 1_024 }), { kind: 'too-large', bytes: 2_048 }, 'released by the reader past the cap');
   });
 
   it('a body of exactly the cap is read; one byte more is too large', async () => {
@@ -262,8 +320,20 @@ describe('the fetch transport ends what hangs', () => {
 
   it('a call that cannot be right is a TypeError, before anything is sent', () => {
     const t = transport();
-    for (const bad of [{ bodyText: 1, timeoutMs: 5_000, maxBytes: 1 }, { bodyText: BODY, timeoutMs: 0, maxBytes: 1 }, { bodyText: BODY, timeoutMs: 1.5, maxBytes: 1 }, { bodyText: BODY, timeoutMs: 5_000, maxBytes: 0 }, { bodyText: BODY, timeoutMs: 5_000, maxBytes: -1 }]) {
+    for (const bad of [
+      { bodyText: 1, timeoutMs: 5_000, maxBytes: 1 },
+      { bodyText: BODY, timeoutMs: 0, maxBytes: 1 },
+      { bodyText: BODY, timeoutMs: 1.5, maxBytes: 1 },
+      { bodyText: BODY, timeoutMs: 2_147_483_648, maxBytes: 1 }, // past the timers' range: a TypeError now, never a rejection later (review Y, security 4)
+      { bodyText: BODY, timeoutMs: 5_000, maxBytes: 0 },
+      { bodyText: BODY, timeoutMs: 5_000, maxBytes: -1 },
+      { bodyText: BODY, timeoutMs: 5_000, maxBytes: MAX_RESPONSE_BYTES + 1 },
+    ]) {
       assert.throws(() => t.post(bad as unknown as Parameters<typeof t.post>[0]), TypeError, JSON.stringify(bad));
+    }
+    assert.equal(MAX_RESPONSE_BYTES, 16 * 1024 * 1024);
+    for (const [method, rule] of Object.entries(METHOD_TABLE)) {
+      assert.ok(rule.maxResponseBytes <= MAX_RESPONSE_BYTES && rule.timeoutMs <= 2_147_483_647, method);
     }
   });
 });
