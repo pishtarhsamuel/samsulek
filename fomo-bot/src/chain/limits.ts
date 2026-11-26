@@ -82,8 +82,11 @@ export const BUDGET_RULES = Object.freeze({
   /** The shed level falls by one after this long without a trigger; it never passes maxShed. */
   shedDecayMs: 300_000,
   maxShed: 3,
-  /** A 429's wait when its Retry-After is missing or unreadable, and the longest wait honoured. */
+  /** A 429's wait when its Retry-After is missing or unreadable, the shortest (one window, even for
+   *  Retry-After 0: a limiter that keeps saying 0 is never hammered into a 403; review Y, risk 4), and
+   *  the longest wait honoured. */
   retryAfterDefaultMs: 60_000,
+  retryAfterMinMs: 10_000,
   retryAfterMaxMs: 600_000,
   /** How long a 403 blocks the provider before one P0 probe. */
   blockMs: 900_000,

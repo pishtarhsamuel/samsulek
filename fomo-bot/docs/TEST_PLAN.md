@@ -599,8 +599,8 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      count; a second or forged settle alerting and changing nothing; impossible byte counts, statuses,
      stream bytes and priorities as TypeErrors; a clock stepping back held (grants made then dated at the
      held reading); a throwing sink ignored; `usage()` for all 14 buckets; tightening only downward.
-   - Property (300 runs each, with and without learning, with and without tightening): random acquires
-     of every method and priority, settles with random statuses and headers, clock steps: after every
+   - Property (1,000 runs each since review Y, risk 9, 300 before; with and without learning, with and
+     without tightening): random acquires of every method and priority, settles with random statuses and headers, clock steps: after every
      grant no window over its cap, the total, data and in-flight caps held; P0 never shed; a P0 refused
      for a full window had its whole reserve.
    - Planted bugs (scratchpad `mut/run42.py`): 46 in the first run, 38 caught, 2 equivalent; three weak

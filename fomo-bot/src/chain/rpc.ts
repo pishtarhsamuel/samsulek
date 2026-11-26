@@ -109,10 +109,13 @@ const frozen = <T extends object>(o: T): T => Object.freeze(o);
 const fail = (failure: ChainFailure): Envelope => frozen({ ok: false, failure: frozen(failure) });
 const bad = (code: BadResponseCode): Envelope => fail({ kind: 'bad-response', code });
 
-/** As the governor reads Retry-After (chain/budget.ts): missing gives 60 s, more than 600 s gives 600 s. */
+/** As the governor reads Retry-After (chain/budget.ts): missing gives 60 s, under 10 s gives 10 s, more than 600 s gives 600 s. */
 function rateLimited(rate: RateHeaders, monoNowMs: number): ChainFailure {
   const after = rate.retryAfterSec;
-  const waitMs = typeof after === 'number' && Number.isInteger(after) && after >= 0 ? Math.min(after * 1_000, BUDGET_RULES.retryAfterMaxMs) : BUDGET_RULES.retryAfterDefaultMs;
+  const waitMs =
+    typeof after === 'number' && Number.isInteger(after) && after >= 0
+      ? Math.min(Math.max(after * 1_000, BUDGET_RULES.retryAfterMinMs), BUDGET_RULES.retryAfterMaxMs)
+      : BUDGET_RULES.retryAfterDefaultMs;
   return { kind: 'rate-limited', retryAtMs: monoNowMs + waitMs };
 }
 

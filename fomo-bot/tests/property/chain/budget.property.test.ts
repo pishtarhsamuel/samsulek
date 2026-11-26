@@ -102,10 +102,10 @@ function check(ops: readonly Op[], tighten: Parameters<typeof createBudgetGovern
 
 describe('the budget governor under random load', () => {
   it('with learning: no window over its cap, the data and connection caps held, P0 never shed', () => {
-    fc.assert(fc.property(fc.array(opArb(true), { minLength: 20, maxLength: 250 }), tightenArb, (ops, tighten) => check(ops, tighten, true)), { numRuns: 300 });
+    fc.assert(fc.property(fc.array(opArb(true), { minLength: 20, maxLength: 250 }), tightenArb, (ops, tighten) => check(ops, tighten, true)), { numRuns: 1_000 });
   });
 
   it('without learning: the same, and a P0 refused for a full window had its whole reserve', () => {
-    fc.assert(fc.property(fc.array(opArb(false), { minLength: 20, maxLength: 250 }), tightenArb, (ops, tighten) => check(ops, tighten, false)), { numRuns: 300 });
+    fc.assert(fc.property(fc.array(opArb(false), { minLength: 20, maxLength: 250 }), tightenArb, (ops, tighten) => check(ops, tighten, false)), { numRuns: 1_000 });
   });
 });

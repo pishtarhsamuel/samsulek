@@ -13,6 +13,8 @@ export type ChainEventCode =
   | 'chain-budget-80'
   | 'chain-p0-denied'
   | 'chain-limit-learned'
+  /** A learned limit refused a method P0 reads through: exits are blind to it until a restart (review Y, risk 2). */
+  | 'chain-p0-blind'
   | 'chain-wrong-cluster'
   | 'chain-api-version'
   | 'chain-shape'
