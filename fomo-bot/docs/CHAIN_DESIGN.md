@@ -814,3 +814,68 @@ Conditions, each due by the sub-step named:
     its comment is corrected.
 - Before a second keyed provider (with review X, security 6): security 3, the URL check covers the path
   and query names, registers percent-encoded forms, and is tested with two secret parts.
+
+## 22. As built in step 7e (the governor conditions and the read client), and what changed
+
+Status: UNREVIEWED, on the unreviewed branch.
+
+Built, tests first: 7e-1 (98e6570), review Y's governor conditions (risk 2, 3, 4, 5, 7 and 9 of s.21:
+`BUDGET_RULES.retryAfterMinMs` = 10 s, the `chain-p0-blind` event, the deny reason `clock`). 7e-2:
+chain/client.ts (`createReadClient`, `ReadClient`, `CallOpts`, `FEATURES`, `SlotReporter`, `SlotView`,
+`STALE_SLOTS` = 150, `FAILURE_RULES`), the fixture scan's base64 rule (security 7), the duplicate-key
+behaviour written down (security 5), the parse cost measured and recorded (security 6).
+
+Differences from s.3, s.5 and s.8:
+- `ReadClient` has `needsClusterCheck()`: true before the lock opens and from an hour after the last good
+  check, false once latched. The client never re-checks by itself: the app calls `verifyCluster()` when
+  it says so, and after `chain-unblocked`. A re-check that cannot run (a timeout) leaves reads open, so
+  exits go on; only another hash latches `wrong-cluster`. A hash that is not 32 bytes of base58 is
+  `shape`, not a latch.
+- `createReadClient` takes no wall clock yet (chainTime is 7g's), and an optional
+  `tighten.maxRequestBytes`, only lower: the tests reach the size check with it, because no Phase 2
+  request comes near 48 KiB (a full batch of 100 keys is about 4.8 KB). finalizedBlockHeight and
+  chainTime come with 7g.
+- getSlot's result is the answer's slot: checked against the minContextSlot sent (`went-back`, review Y
+  risk 8d) and against the feed (`stale`), reported on 'http', returned as `contextSlot`, and used for the
+  mark. getBlockHeight, fees and rent carry no slot: nothing is checked or reported for them.
+- An answer that is `went-back` or `stale` is never reported and never moves the mark. The mark is raised
+  after the report to `min(the answer's slot, feed.currentSlot())`, only upward, and never while the feed
+  has no slot. Before the first reading it is 0, sent as `minContextSlot: 0`.
+- Events: `chain-shape` for every bad response of the envelope or a decoder; `chain-stale` for
+  `went-back` and `stale`; `chain-our-bug` for our bug, the size check included; `chain-wrong-cluster`
+  once, at the latch; `chain-api-version` once per change after the first version seen, the version
+  only in its plain form (security 8); `chain-rent-formula` when the chain's rent differs from the
+  formula. A node behind, a missing block, a timeout and the other failures send no event: the app counts
+  them by `FAILURE_RULES`.
+- `FAILURE_RULES` (risk 8b) gives every failure kind its rule, so a new kind cannot be added without
+  one: RPC_ERRORS (timeout, transport, too-large, denied (P0 only, as RISK_POLICY s.8 counts it),
+  rate-limited, http, bad-response, not-readable, rpc), DATA_STALE (node-behind, stale), PROVIDER_BLOCKED
+  (blocked), CLUSTER (unverified, wrong-cluster), BUG (our-bug: the entry latch 'bug' until a restart),
+  STOPPING (shutdown). The app applies them with its breakers (Phase 3).
+- A transport that throws or rejects (a bug: `post` never rejects) is still settled in `finally`, and the
+  error goes on to the caller.
+- Rent, getSlot, getBlockHeight and getGenesisHash are P0 only (their whole caps are P0 reserves, s.5), so
+  rent is read at P0 and kept by its caller.
+- Security 5: duplicate keys are accepted, the last one winning as in JSON.parse; written down in
+  core/json.ts, with a test. A node already controls every value of its answer.
+- Security 6, measured in this sandbox (Node 26.13.0, the test flags; scratchpad `parse-cost.ts`): an
+  exit-marks answer (100 accounts of 300 bytes, 56 KB) parses and decodes in about 9 ms; 100 accounts of
+  7,500 bytes (1 MiB, getMultipleAccounts's cap) in about 97 ms; 0.94 MB of small integers in about
+  142 ms (the reviewer measured about 560 ms in its setup). Accepted for paper: the exit loop's tick is
+  2 s or more. Phase 7's soak measures real sizes and times on the VPS; P0 byte caps are lowered there if
+  a parse ever passes 250 ms.
+- Security 7: the fixture scan also refuses any run of 64 or more base64 characters that is not hex,
+  outside an allowlist of one (the base64 alphabet in core/encode.ts). A hyphen or an underscore ends a
+  run rather than hiding it. Both allowlists are checked by one function, which the canaries call too.
+
+Noted for 7g: s.8 says the app halts on both skews; D16 makes wall against monotonic over 2 s entries off
+(clearing itself) and over 10 s a halt, and against block time over 60 s a halt. 7g follows D16.
+
+Still due (s.21, not part of 7e): risk 1 and 6 in 7f; security 3 before a second keyed provider. The
+app's side comes with Phase 3: mapping the events to alerts (`chain-p0-blind` is risk 2's "exits blind"
+alert), applying `FAILURE_RULES`, and consumers that treat an empty fee list as no reading and a null
+account as missing (risk 8a).
+
+Tests: TEST_PLAN.md s.3, "Done in step 7e". Planted bugs: 7e-1 (scratchpad `mut/run46.py`) 15, 15
+caught; 7e-2 (`mut/run47.py`) 51, 50 caught on the first run (no canary sat at the 64-character
+threshold; added), final 51, 51 caught. Coverage: every line and branch of client.ts and budget.ts.

@@ -4,6 +4,9 @@
 // source-text reviver (Node 26.13.0, verified in the research). Any other spelling of a number (1e3,
 // 1.50, -0) stays a JS number, which no integer field of a decoder accepts: never a guess. Nesting
 // deeper than JSON_MAX_DEPTH is refused before the parse. Everything parsed is frozen. Pure.
+// Duplicate keys are accepted, the last one winning (JSON.parse's rule), so `{"id":8,"id":7}` reads as
+// id 7: accepted and written down (review Y, security 5), because a node that answers already controls
+// every value of its answer; a duplicate gives it nothing more. The decoders still see exact key sets.
 
 export type Json = null | boolean | string | number | bigint | readonly Json[] | { readonly [key: string]: Json };
 
