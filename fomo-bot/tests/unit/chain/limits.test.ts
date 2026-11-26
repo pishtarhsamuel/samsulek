@@ -70,6 +70,7 @@ describe('the governor\'s fixed numbers (CHAIN_DESIGN s.6)', () => {
       shedDecayMs: 300_000,
       maxShed: 3,
       retryAfterDefaultMs: 60_000,
+      retryAfterMinMs: 10_000,
       retryAfterMaxMs: 600_000,
       blockMs: 900_000,
     });

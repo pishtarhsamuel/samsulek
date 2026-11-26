@@ -72,8 +72,12 @@ describe('readEnvelope: what the transport and the status say', () => {
 
   it('429 is rate-limited until its Retry-After (60 s missing, 600 s at most); 403 is blocked; 400, 405, 413 and 415 are our bug; any other status is http', () => {
     assert.deepEqual(failure(status(429, 10)), { kind: 'rate-limited', retryAtMs: NOW + 10_000 });
+    assert.deepEqual(failure(status(429, 30)), { kind: 'rate-limited', retryAtMs: NOW + 30_000 });
     assert.deepEqual(failure(status(429)), { kind: 'rate-limited', retryAtMs: NOW + 60_000 });
     assert.deepEqual(failure(status(429, 5_000)), { kind: 'rate-limited', retryAtMs: NOW + 600_000 });
+    // at least one window, as the governor waits (review Y, risk 4)
+    assert.deepEqual(failure(status(429, 0)), { kind: 'rate-limited', retryAtMs: NOW + 10_000 });
+    assert.deepEqual(failure(status(429, 3)), { kind: 'rate-limited', retryAtMs: NOW + 10_000 });
     assert.deepEqual(failure(status(403)), { kind: 'blocked' });
     for (const s of [400, 405, 413, 415]) {
       assert.deepEqual(failure(status(s)), { kind: 'our-bug', code: s });
@@ -128,6 +132,10 @@ describe('readEnvelope: the node\'s error codes (s.4\'s table)', () => {
     assert.deepEqual(failure(ok200(nodeError(-32016, '{"contextSlot":385000000}'))), { kind: 'node-behind', code: -32016, nodeSlot: 385_000_000n });
     assert.deepEqual(failure(ok200(nodeError(-32016))), { kind: 'node-behind', code: -32016, nodeSlot: null });
     assert.deepEqual(failure(ok200(nodeError(-32016, '{"contextSlot":-1}'))), { kind: 'node-behind', code: -32016, nodeSlot: null }); // not a slot: none
+    for (const bad of ['9223372036854775808', '18446744073709551615', '"5"', '5.0', 'null']) {
+      assert.deepEqual(failure(ok200(nodeError(-32016, `{"contextSlot":${bad}}`))), { kind: 'node-behind', code: -32016, nodeSlot: null }, `never clamped or converted: ${bad} (review Y, risk 3e)`);
+    }
+    assert.deepEqual(failure(ok200(nodeError(-32016, '{"contextSlot":9223372036854775807}'))), { kind: 'node-behind', code: -32016, nodeSlot: 9_223_372_036_854_775_807n });
     assert.deepEqual(failure(ok200(nodeError(-32005, '{"numSlotsBehind":42}'))), { kind: 'node-behind', code: -32005, nodeSlot: null });
     for (const code of [-32004, -32014, -32001, -32011, -32019]) {
       assert.deepEqual(failure(ok200(nodeError(code))), { kind: 'not-readable', code, permanent: false });

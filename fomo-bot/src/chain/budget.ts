@@ -13,7 +13,7 @@ import type { ChainEvent, ChainEventCode, ChainEvents } from './events.ts';
 import { BUDGET_RULES, METHOD_TABLE, PRIORITIES, REFUSED_METHODS, type Priority, type ProviderId, type ReadMethod } from './limits.ts';
 
 export type ShedLevel = 0 | 1 | 2 | 3;
-export type DenyReason = 'refused-method' | 'shed' | 'method-cap' | 'total-cap' | 'data-cap' | 'connections' | 'retry-after' | 'blocked';
+export type DenyReason = 'refused-method' | 'shed' | 'method-cap' | 'total-cap' | 'data-cap' | 'connections' | 'retry-after' | 'blocked' | 'clock';
 
 /** Opaque and single use: only the governor that gave it can settle it. */
 export interface Ticket {
@@ -174,10 +174,12 @@ export function createBudgetGovernor(o: { readonly provider: ProviderId; readonl
     }
     prune(total, now, R.windowMs);
     let busy = total.length > R.busyRatio * limits.totalCap || dataUsed(now) > R.busyRatio * limits.dataCapBytes || outstanding.size > R.busyRatio * R.maxInFlight;
-    for (const s of methods.values()) {
+    for (const [m, s] of methods) {
       prune(s.log, now, R.windowMs);
-      // a method whose whole cap is P0's (getSlot's 2 s polling, risk A) is busy by design: never a reason to shed
-      busy ||= s.cap > s.reserve && s.log.length > R.busyRatio * s.cap;
+      // a method whose whole table cap is P0's (getSlot's 2 s polling, risk A) is busy by design: never a
+      // reason to shed; one learned down to its reserve still counts (review Y, risk 5)
+      const rule = METHOD_TABLE[m];
+      busy ||= rule.capPer10s > rule.p0Reserve && s.log.length > R.busyRatio * s.cap;
     }
     if (!busy) {
       busySince = null;
@@ -224,6 +226,10 @@ export function createBudgetGovernor(o: { readonly provider: ProviderId; readonl
       throw new TypeError('a priority is P0 to P4');
     }
     const now = tick();
+    if (!Number.isFinite(now)) {
+      // no finite reading yet: no window can be counted, so nothing is granted (review Y, risk 7)
+      return deny('clock', Number.POSITIVE_INFINITY, method, p);
+    }
     housekeep(now);
     const s = Object.hasOwn(METHOD_TABLE, method) && !REFUSED_METHODS.includes(method) ? methods.get(method) : undefined;
     if (s === undefined || RANK[p] < RANK[METHOD_TABLE[method].mostUrgent] || s.cap === 0) {
@@ -301,6 +307,9 @@ export function createBudgetGovernor(o: { readonly provider: ProviderId; readonl
         s.cap = cap;
         s.reserve = Math.min(s.reserve, cap);
         emit('chain-limit-learned', { method: out.method });
+        if (cap === 0 && METHOD_TABLE[out.method].mostUrgent === 'P0') {
+          emit('chain-p0-blind', { method: out.method });
+        }
       }
     }
     const remaining = st.rate?.methodRemaining;
@@ -310,7 +319,7 @@ export function createBudgetGovernor(o: { readonly provider: ProviderId; readonl
     }
     if (st.status === 429) {
       const after = wholeFrom(st.rate?.retryAfterSec, 0);
-      const waitMs = after === null ? R.retryAfterDefaultMs : Math.min(after * 1_000, R.retryAfterMaxMs);
+      const waitMs = after === null ? R.retryAfterDefaultMs : Math.min(Math.max(after * 1_000, R.retryAfterMinMs), R.retryAfterMaxMs);
       s.closedUntil = Math.max(s.closedUntil, now + waitMs);
       emit('chain-429', { method: out.method });
       raise(now);

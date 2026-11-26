@@ -52,6 +52,10 @@ describe('parseLossless: integers exactly, as bigints, only from plain digits', 
     assert.equal(parseLossless('null'), null);
   });
 
+  it('a duplicate key: the last one wins, as JSON.parse does (accepted, review Y, security 5)', () => {
+    assert.deepEqual(parseLossless('{"id":8,"result":1,"id":7}'), { id: 7n, result: 1n });
+  });
+
   it('a "__proto__" key is an own property, never the prototype', () => {
     const v = parseLossless('{"__proto__":{"polluted":1},"a":1}') as Record<string, Json>;
     assert.equal(Object.getPrototypeOf(v), Object.prototype);

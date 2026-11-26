@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { base58Exact, base58Of } from '../../src/core/encode.ts';
+import { base58Exact, base58Of, base64Of } from '../../src/core/encode.ts';
 
 const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..', '..');
 
@@ -27,6 +27,20 @@ const ALLOWED: Readonly<Record<string, string>> = Object.freeze({
 
 /** A run of base58 characters that is not part of a longer one. */
 const CANDIDATE = /(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,88}(?![1-9A-HJ-NP-Za-km-z])/g;
+
+/**
+ * A run of 64 or more base64 characters (padding included): a pasted live answer's account data holds raw
+ * public keys, which no base58 scan can see (review Y, security 7). Hex (a hash) is not base64 data.
+ */
+const BASE64_RUN = /(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{64,}={0,2}(?![A-Za-z0-9+/=])/g;
+const HEX = /^(?:[0-9a-f]+|[0-9A-F]+)$/;
+const ALLOWED_BASE64: Readonly<Record<string, string>> = Object.freeze({
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/': 'the base64 alphabet itself (core/encode.ts)',
+});
+
+function base64Runs(text: string): string[] {
+  return [...new Set([...text.matchAll(BASE64_RUN)].map((m) => m[0]).filter((t) => !HEX.test(t)))];
+}
 
 /** Every .ts file under the folder; any other file there fails the scan (a fixture in another format would hide). */
 function files(dir: string, out: string[], others: string[]): void {
@@ -53,23 +67,48 @@ function base58Literals(text: string): string[] {
   return [...found];
 }
 
-describe('the fixture scan: only allowlisted addresses, hashes and signatures in src/ and tests/', () => {
-  it('every 32- or 64-byte base58 literal is on the allowlist', () => {
+/** What a text holds that neither allowlist names: base58 addresses, hashes and signatures, and long base64 runs. */
+function unknownLiterals(text: string): string[] {
+  const base58 = base58Literals(text).filter((t) => !Object.hasOwn(ALLOWED, t));
+  const base64 = base64Runs(text).filter((t) => !Object.hasOwn(ALLOWED_BASE64, t));
+  return [...base58, ...base64];
+}
+
+describe('the fixture scan: only allowlisted addresses, hashes, signatures and base64 in src/ and tests/', () => {
+  it('every 32- or 64-byte base58 literal and every run of 64 or more base64 characters is on its allowlist (review Y, security 7)', () => {
     const all: string[] = [];
     const others: string[] = [];
     files(join(ROOT, 'src'), all, others);
     files(join(ROOT, 'tests'), all, others);
     assert.deepEqual(others, [], 'only .ts files in src/ and tests/');
     assert.ok(all.length > 100, 'the scan sees the tree');
-    const unknown: string[] = [];
-    for (const f of all) {
-      for (const t of base58Literals(readFileSync(f, 'utf8'))) {
-        if (!Object.hasOwn(ALLOWED, t)) {
-          unknown.push(`${relative(ROOT, f)}: ${t}`);
-        }
-      }
+    const unknown = all.flatMap((f) => unknownLiterals(readFileSync(f, 'utf8')).map((t) => `${relative(ROOT, f)}: ${t.slice(0, 24)}... (${t.length} characters)`));
+    assert.deepEqual(unknown, [], 'use synthetic keys and bytes built at run time (base58Of, base64Of); add a real value only if it is a public program, mint or cluster hash, with its reason; never paste a recorded answer');
+  });
+
+  it('CANARY: the allowlists let their own entries through and nothing else', () => {
+    const user = base58Of(Uint8Array.from({ length: 32 }, (_v, i) => 200 - i));
+    const data = base64Of(Uint8Array.from({ length: 82 }, (_v, i) => (i * 37) & 255));
+    for (const allowed of [...Object.keys(ALLOWED), ...Object.keys(ALLOWED_BASE64)]) {
+      assert.deepEqual(unknownLiterals(`x = '${allowed}';`), [], allowed);
     }
-    assert.deepEqual(unknown, [], 'add a real account only if it is a public program, mint or cluster hash, with its reason; use synthetic keys otherwise');
+    assert.deepEqual(unknownLiterals(`{"owner":"${user}","data":["${data}","base64"]}`), [user, data]);
+    assert.deepEqual(unknownLiterals(`So11111111111111111111111111111111111111112 ${user}`), [user]);
+  });
+
+  it('CANARY: the base64 scan finds account data however it is written, and leaves hex hashes and short runs alone', () => {
+    const data = base64Of(Uint8Array.from({ length: 82 }, (_v, i) => (i * 37) & 255)); // 112 characters
+    assert.deepEqual(base64Runs(`data: ["${data}","base64"]`), [data]);
+    assert.deepEqual(base64Runs(`'${data}' + '${data}'`), [data], 'once');
+    const unpadded = data.replace(/=+$/, '');
+    assert.deepEqual(base64Runs(unpadded), [unpadded], 'without its padding too');
+    const exact64 = base64Of(new Uint8Array(48).fill(0xab)); // 48 bytes: exactly 64 characters
+    assert.equal(exact64.length, 64);
+    assert.deepEqual(base64Runs(exact64), [exact64], 'from 64 characters');
+    assert.deepEqual(base64Runs('a'.repeat(63)), []);
+    assert.deepEqual(base64Runs('0123456789abcdef'.repeat(4)), [], 'a sha256 in hex');
+    assert.deepEqual(base64Runs('0123456789ABCDEF'.repeat(4)), []);
+    assert.deepEqual(base64Runs(`x-${data}_y`), [data], 'a hyphen or an underscore ends a run, it does not hide one');
   });
 
   it('every allowlist entry is itself 32 bytes of canonical base58', () => {

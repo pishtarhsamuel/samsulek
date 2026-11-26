@@ -368,15 +368,29 @@ can trade, and no key or account exists anywhere.
 - Your answer of Nov 26 is recorded as D16: against the blockchain's clock the bot halts only beyond 60
   seconds of difference; against the computer's own timer, over 2 seconds stops new buys (clearing by
   itself) and over 10 seconds halts. Built in part 7g.
-- Next: part 7e (the read client, with the review notes due there). No question is open.
+- Part 7e is built (tests first) and REVIEWED (Nov 26, REVIEWS.md Z): both reviewers approved with notes,
+  and it joined the main work. Their fixes were small and are in: two network checks that overlap can no
+  longer undo the "wrong network" lock, and new tests prove the bot's request priorities, the server's
+  limits and the size of every answer reach the request budget. Their main note for part 7f: if a lying
+  server fools the bot right at start-up, before the live block feed exists, the reader must be able to
+  recover without a restart. The read client is the one piece the paper bot will use to read the chain
+  (it has no way to send). Nothing is read until the server has
+  proved it is the real Solana network; the wrong network stops it for good until a restart. An answer
+  older than what the bot already saw, or far behind the latest block, is refused. One wild answer can
+  no longer make every honest server look behind (the reviewers' main note before this part). Every kind
+  of failure now has a named rule for what the bot does with it. The request budget's notes from the
+  review are in too: after "slow down" it waits at least 10 seconds, and it warns you if a limit ever
+  leaves it unable to read prices for selling. 66 deliberate bugs were planted: all 66 caught (one weak
+  test was found and fixed on the way).
+- Next: part 7f (the live block feed), starting with the review notes due there. No question is open.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
-- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 76% (settings,
+- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 80% (settings,
   accounting, risk engine, the storage files, the approval transactions, the start-up checks, the
   daily money check, the bot's settings step and your setting commands done, reviewed and in the
-  main work); the whole build about 35%. At the pace so far (Nov 4 to Nov 26),
+  main work); the whole build about 36%. At the pace so far (Nov 4 to Nov 26),
   building takes roughly 6 more weeks (5 to 9), and proving an edge on paper at least 1 to 3 weeks
   more: at least 50 closed paper trades over at least 7 days per strategy before any live decision.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.

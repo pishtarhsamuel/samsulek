@@ -599,8 +599,8 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
      count; a second or forged settle alerting and changing nothing; impossible byte counts, statuses,
      stream bytes and priorities as TypeErrors; a clock stepping back held (grants made then dated at the
      held reading); a throwing sink ignored; `usage()` for all 14 buckets; tightening only downward.
-   - Property (300 runs each, with and without learning, with and without tightening): random acquires
-     of every method and priority, settles with random statuses and headers, clock steps: after every
+   - Property (1,000 runs each since review Y, risk 9, 300 before; with and without learning, with and
+     without tightening): random acquires of every method and priority, settles with random statuses and headers, clock steps: after every
      grant no window over its cap, the total, data and in-flight caps held; P0 never shed; a P0 refused
      for a full window had its whole reserve.
    - Planted bugs (scratchpad `mut/run42.py`): 46 in the first run, 38 caught, 2 equivalent; three weak
@@ -662,6 +662,47 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    refused; a timeout above 2^31 - 1 ms and a byte cap above 16 MiB are TypeErrors
    at once, and every method's limits fit inside them. Planted bugs (scratchpad `mut/run45.py`): 6, 6
    caught.
+
+   Done in step 7e (the governor conditions and the read client, CHAIN_DESIGN.md s.22; UNREVIEWED):
+   - Governor (review Y, risk 2 to 9): a 429 closes its method for at least 10 s, Retry-After 0, 3 and 10
+     included (and the envelope dates it the same way); a learned limit of 0 or 1 refuses the method and,
+     for a method P0 uses, fires `chain-p0-blind` (getProgramAccounts does not); half the limit rounds
+     down (13 gives 6); a method learned down to its P0 reserve counts for the 80% rule again; nothing
+     granted before a finite clock reading (`clock`); the shed timer refreshed at level 3, the 80% hold
+     reset below 80%, a full window's exact retry time, -32016's slot never clamped; the property tests
+     at 1,000 runs.
+   - The genesis lock: every call `unverified` and nothing sent (not even the budget asked) until the hash
+     is mainnet-beta; a failed check leaves it unverified; another hash latches `wrong-cluster` (one
+     event, no more requests, a right answer later changes nothing); a hash of the wrong shape is `shape`;
+     due again after exactly one hour; a failed re-check keeps reads open; a wrong re-check latches.
+   - The wire: the exact request text of each method (commitment `confirmed`, encoding `base64`,
+     minContextSlot always), each method's timeout and byte cap, a fresh id each time; bad call options
+     refused before anything is sent.
+   - The mark (review X, risk 1): one wild context slot raises it only to the feed's slot, so the next
+     honest read succeeds; it does not move while the feed has no slot, and rises with the feed.
+     `went-back` for a context and for getSlot below the slot sent (equal is fine); `stale` past 150
+     slots behind the feed (exactly 150 is fresh; no feed slot, no judgement); neither is reported.
+     Reports go to 'http' only, for slot() and context slots, never for the other reads.
+   - The budget: a request over the (tightened) size cap is our bug before the budget is asked, with its
+     event; a denial comes back as `denied` with its reason and time and nothing sent; a body 429 closes
+     the method like a status 429; a throwing or rejecting transport is settled (the connection comes
+     back); latency on the monotonic clock.
+   - Answers: accounts in key order with null for a missing one; fees sorted and an empty list empty;
+     rent from the chain even off the formula (with its event); shape, count and id refusals with
+     `chain-shape`; our bug with `chain-our-bug`; node-behind, timeouts and the rest with no event;
+     apiVersion events once per change, the version only in plain form; a throwing sink ignored;
+     everything frozen; `FAILURE_RULES` pinned for all 16 kinds; the type has no send, sign or rpc member
+     (`@ts-expect-error`, `Extract` checks) and exactly its eight members.
+   - JSON: a duplicate key, the last one wins (written down). The fixture scan: base64 runs of 64 or more
+     characters refused outside their allowlist, hex left alone, a hyphen ending a run; both allowlists
+     checked by one function the canaries call.
+   - Planted bugs: scratchpad `mut/run46.py` (7e-1) 15, 15 caught; `mut/run47.py` (7e-2) 51, 50 caught on
+     the first run, the 64-character canary added, final 51, 51 caught.
+
+   Done in the review Z fixes (CHAIN_DESIGN.md s.23): two cluster checks in flight, the wrong hash first:
+   the lock holds; the caller's priority reaches the governor (P2 cannot take P0's reserve, P4 shed); the
+   rate headers do (a learned limit, remaining 0); every answer's bytes do (good, too-large, timeout); a
+   sliced read end to end. Planted bugs (scratchpad `mut/run48.py`): 7, 7 caught after one check added.
 
 ## 4. Property-based tests (fast-check)
 

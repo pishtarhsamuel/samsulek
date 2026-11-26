@@ -154,12 +154,12 @@ describe('the windows: per method, in all, data and connections', () => {
 
 describe('what the provider says: Retry-After, 403, the header limits', () => {
   it('a 429 closes its method for its Retry-After (60 s when missing or not whole, at most 600 s), raises the shed level and alerts; other methods stay open', () => {
-    for (const [after, waitMs] of [[30, 30_000], [null, 60_000], [1.5, 60_000], [-5, 60_000], [5_000, 600_000], [0, 0]] as const) {
+    // at least one window even when the provider says 0 or a few seconds (review Y, risk 4): a limiter that
+    // keeps answering "0" is never hammered into a 403
+    for (const [after, waitMs] of [[30, 30_000], [null, 60_000], [1.5, 60_000], [-5, 60_000], [5_000, 600_000], [0, 10_000], [3, 10_000], [10, 10_000], [11, 11_000]] as const) {
       const w = world();
       w.gov.settle(granted(w.gov.acquire('getMultipleAccounts', 'P0')), { decodedBytes: 80, status: 429, rate: rate({ retryAfterSec: after }) });
-      if (waitMs > 0) {
-        assert.equal(denied(w.gov.acquire('getMultipleAccounts', 'P0'), 'retry-after'), w.now() + waitMs, `Retry-After ${after}`);
-      }
+      assert.equal(denied(w.gov.acquire('getMultipleAccounts', 'P0'), 'retry-after'), w.now() + waitMs, `Retry-After ${after}`);
       granted(w.gov.acquire('getSlot', 'P0'));
       assert.equal(w.gov.shedLevel(), 1);
       assert.deepEqual(w.codes().filter((c) => c === 'chain-429' || c === 'chain-shed-up').sort(), ['chain-429', 'chain-shed-up']);
@@ -221,11 +221,28 @@ describe('what the provider says: Retry-After, 403, the header limits', () => {
     assert.equal(cap(), 5);
     denied(w.gov.acquire('getMultipleAccounts', 'P2'), 'method-cap');
     w.advance(10_000);
+    assert.ok(!w.codes().includes('chain-p0-blind'));
     learn(0);
     assert.equal(denied(w.gov.acquire('getMultipleAccounts', 'P0'), 'refused-method'), Number.POSITIVE_INFINITY);
     w.advance(3_600_000);
     denied(w.gov.acquire('getMultipleAccounts', 'P0'), 'refused-method'); // for the rest of the process
     granted(w.gov.acquire('getSlot', 'P0'));
+    // exits read through this method: the owner hears that P0 is blind until a restart (review Y, risk 2)
+    assert.deepEqual(w.seen.filter((e) => e.code === 'chain-p0-blind'), [{ code: 'chain-p0-blind', provider: 'public-mainnet', method: 'getMultipleAccounts' }]);
+  });
+
+  it('half the limit rounds down (13 gives 6), and a limit of 1 rounds to 0: refused, and P0 blind is alerted; a method P0 never uses is not', () => {
+    const w = world();
+    const learn = (m: ReadMethod, p: Priority, limit: number): void => w.gov.settle(granted(w.gov.acquire(m, p)), { decodedBytes: 80, status: 200, rate: rate({ methodLimit: limit }) });
+    const cap = (m: ReadMethod): number | undefined => w.gov.usage().find((u) => u.bucket === m)?.cap;
+    learn('getMultipleAccounts', 'P0', 13);
+    assert.equal(cap('getMultipleAccounts'), 6, 'floor(6.5), never 7');
+    learn('getRecentPrioritizationFees', 'P0', 1);
+    assert.equal(cap('getRecentPrioritizationFees'), 0);
+    denied(w.gov.acquire('getRecentPrioritizationFees', 'P0'), 'refused-method');
+    learn('getProgramAccounts', 'P1', 1);
+    assert.equal(cap('getProgramAccounts'), 0);
+    assert.deepEqual(w.seen.filter((e) => e.code === 'chain-p0-blind').map((e) => e.method), ['getRecentPrioritizationFees'], 'getProgramAccounts is never P0');
   });
 
   it('a remaining count at or below zero closes the method until its window empties', () => {
@@ -259,10 +276,13 @@ describe('shedding and the P0 path', () => {
     assert.equal(denied(w.gov.acquire('getSignaturesForAddress', 'P2'), 'shed'), lastTrigger + 300_000);
     w.gov.settle(granted(w.gov.acquire('getProgramAccounts', 'P1')), OK); // P1: never shed
     use(w, 'getSlot', 'P0'); // P0: never shed
-    too429('getTransaction'); // a fourth: still 3, and the decay starts again
+    w.advance(100_000);
+    too429('getTransaction'); // a fourth, 100 s later: still 3, and the decay starts again from it
     assert.equal(w.gov.shedLevel(), 3);
     assert.equal(w.codes().filter((c) => c === 'chain-shed-up').length, 3);
-    w.advance(300_000);
+    w.advance(200_000); // 5 minutes after the third: the fourth holds the level (review Y, risk 3a)
+    assert.equal(w.gov.shedLevel(), 3);
+    w.advance(100_000);
     assert.equal(w.gov.shedLevel(), 2);
     use(w, 'getSignaturesForAddress', 'P2');
     denied(w.gov.acquire('getSignaturesForAddress', 'P3'), 'shed');
@@ -316,6 +336,53 @@ describe('shedding and the P0 path', () => {
     }
     assert.equal(p.gov.shedLevel(), 0);
     assert.ok(!p.codes().includes('chain-budget-80'));
+  });
+
+  it('the 80% hold starts again when a bucket drops below 80% (review Y, risk 3b)', () => {
+    const w = world();
+    // the governor samples its buckets when it is called, so each stretch is observed as it starts
+    const held = [0, 1, 2, 3, 4].map(() => granted(w.gov.acquire('getMultipleAccounts', 'P0'))); // 5 of 6 in flight
+    assert.equal(w.gov.shedLevel(), 0); // busy from now
+    w.advance(50_000);
+    assert.equal(w.gov.shedLevel(), 0);
+    w.gov.settle(held[0] as Ticket, OK); // 4 of 6: below 80%, the hold resets
+    held[0] = granted(w.gov.acquire('getMultipleAccounts', 'P0'));
+    assert.equal(w.gov.shedLevel(), 0); // busy again, from now
+    w.advance(50_000);
+    assert.equal(w.gov.shedLevel(), 0, '100 s busy in all, but never 60 s in one stretch');
+    w.advance(10_000);
+    assert.equal(w.gov.shedLevel(), 1);
+    for (const t of held) {
+      w.gov.settle(t, OK);
+    }
+  });
+
+  it('a method learned down to its P0 reserve still counts for the 80% rule; only a table cap that is all P0\'s is left out (review Y, risk 5)', () => {
+    const w = world();
+    // a header limit of 12 makes getMultipleAccounts 6 of 6 for P0 (its table: 20, 8 of them P0's)
+    w.gov.settle(granted(w.gov.acquire('getMultipleAccounts', 'P0')), { decodedBytes: 80, status: 200, rate: rate({ methodLimit: 12 }) });
+    w.advance(10_000);
+    for (let t = 0; t < 70_000; t += 1_000) {
+      if ((w.gov.usage().find((u) => u.bucket === 'getMultipleAccounts')?.used ?? 0) < 6) {
+        // kept full: one aging out leaves 5 of 6, still over 80% at every look
+        use(w, 'getMultipleAccounts', 'P0');
+      }
+      w.advance(1_000);
+    }
+    assert.ok(w.codes().includes('chain-budget-80'), 'near its limit on the exit path: the owner hears it');
+    assert.equal(w.gov.shedLevel(), 1);
+  });
+
+  it('a full window\'s retry time is when enough of the newest grants age out, not the oldest (review Y, risk 3d)', () => {
+    const w = world();
+    const t0 = w.now();
+    for (let i = 0; i < 12; i += 1) {
+      use(w, 'getMultipleAccounts', 'P2'); // the 12 of the 20 that are not P0's, at t0, t0 + 100, ...
+      w.advance(100);
+    }
+    use(w, 'getMultipleAccounts', 'P0', 2); // P0 may go past them, to 14 in the window
+    // a 13th P2 grant needs the window at 11, so 3 must age out: the third oldest, at t0 + 200
+    assert.equal(denied(w.gov.acquire('getMultipleAccounts', 'P2'), 'method-cap'), t0 + 200 + 10_000);
   });
 
   it('every P0 denial alerts, with the method and the priority', () => {
@@ -374,6 +441,18 @@ describe('refusals, tickets, the clock and the sink', () => {
     denied(v.gov.acquire('getSlot', 'P0'), 'method-cap'); // still in their window
     v.set(START + 30_000);
     granted(v.gov.acquire('getSlot', 'P0'));
+  });
+
+  it('nothing is granted before the clock has given one finite reading (review Y, risk 7)', () => {
+    let now = Number.NaN;
+    const gov = createBudgetGovernor({ provider: 'public-mainnet', mono: { nowMs: () => now }, events: { event: () => undefined } });
+    assert.equal(denied(gov.acquire('getSlot', 'P0'), 'clock'), Number.POSITIVE_INFINITY);
+    now = Number.POSITIVE_INFINITY;
+    denied(gov.acquire('getSlot', 'P0'), 'clock');
+    now = START;
+    granted(gov.acquire('getSlot', 'P0'));
+    now = Number.NaN; // after a finite reading, a bad one is held at the last (the clock rule above)
+    granted(gov.acquire('getSlot', 'P0'));
   });
 
   it('a sink that throws never stops the governor', () => {
