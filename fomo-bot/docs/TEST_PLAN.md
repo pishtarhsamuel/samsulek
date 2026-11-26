@@ -699,6 +699,11 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    - Planted bugs: scratchpad `mut/run46.py` (7e-1) 15, 15 caught; `mut/run47.py` (7e-2) 51, 50 caught on
      the first run, the 64-character canary added, final 51, 51 caught.
 
+   Done in the review Z fixes (CHAIN_DESIGN.md s.23): two cluster checks in flight, the wrong hash first:
+   the lock holds; the caller's priority reaches the governor (P2 cannot take P0's reserve, P4 shed); the
+   rate headers do (a learned limit, remaining 0); every answer's bytes do (good, too-large, timeout); a
+   sliced read end to end. Planted bugs (scratchpad `mut/run48.py`): 7, 7 caught after one check added.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

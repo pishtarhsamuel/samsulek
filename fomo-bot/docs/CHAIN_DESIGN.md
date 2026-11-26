@@ -879,3 +879,45 @@ account as missing (risk 8a).
 Tests: TEST_PLAN.md s.3, "Done in step 7e". Planted bugs: 7e-1 (scratchpad `mut/run46.py`) 15, 15
 caught; 7e-2 (`mut/run47.py`) 51, 50 caught on the first run (no canary sat at the 64-character
 threshold; added), final 51, 51 caught. Coverage: every line and branch of client.ts and budget.ts.
+
+## 23. Review Z (7e): the fixes, and the conditions for later sub-steps
+
+Review Z (REVIEWS.md Z), of 7e at 114692a, by the review Y reviewers (resumed): both APPROVED WITH NOTES.
+Nothing blocks; 7e and the fixes below join the working branch. The fixes are re-checked with 7f.
+
+Fixed now:
+- Security 1 (754354a): `verifyCluster` looks at the wrong-cluster lock again after its request, so a
+  check that lands after another check latched cannot undo it. Test: two checks in flight through a
+  budget that always grants, the wrong hash first, the right one second: still `wrong-cluster`, no read
+  sent, one event.
+- Risk 1, 2 and 6 (tests only): the caller's priority reaches the governor (12 P2 reads, the 13th refused
+  while P0 still reads; P4 shed at level 1); the rate headers do (a header limit learned, remaining 0
+  closing the method); every answer's bytes do (a good answer, a too-large and a timeout); a sliced read
+  end to end (the slice sent, its bytes back, space the full length, the whole account refused where a
+  slice was asked). Planted bugs (scratchpad `mut/run48.py`): 7, 6 caught on the first run (a good
+  answer's bytes uncharged survived; a check added), final 7, 7 caught.
+
+Conditions, each due by the sub-step or phase named:
+- 7f:
+  - Risk 3 (MEDIUM): the mark recovers from a wrongly anchored feed. At a cold start with only HTTP, one
+    wild node answering getSlot twice can anchor the feed (its documented one-channel limit) and the
+    mark; every honest getSlot then fails -32016 and nothing recovers until a restart. Send min(mark,
+    the feed's slot) when the feed knows one, lower the mark when the feed falls below it or goes back to
+    its cold start, with a test: a wrong anchor, the feed recovers, honest reads succeed.
+  - Risk 4 (or Phase 3's exit loop at the latest): an answer far ahead of the feed comes back ok; refuse
+    one more than 150 slots above a known feed slot (with `chain-stale`), or Phase 3 treats a negative
+    age as invalid.
+  - Review Y risk 1 and 6 still stand (stream bytes never take P0's data reserve; the property test).
+- 7g: getBlockTime's skipped slots (`not-readable`) are mapped so they do not trip RPC_ERRORS (risk 7).
+- Phase 3:
+  - Risk 5: entries off (CLUSTER) when a cluster check has been due for more than about 10 minutes, and
+    after `chain-unblocked` until a re-check; exits continue.
+  - Risk 7: rent read once per size and cached (it is P0 only, 1 per 10 s); getBlockHeight polling within
+    2 per 10 s; a test.
+  - Security 2: `chain-api-version` alerts once per distinct version per hour, or the alert rate limit
+    absorbs a load-balanced endpoint's mixed versions; written down where the events are mapped.
+- Phase 7 (with the cli/ wiring), security 3: an architecture rule that only tests/ pass `tighten` to the
+  client or the governor.
+- Noted: the fixture scan cannot see a key in hex, base64url, base64 split into short lines, or one key
+  in base64 (security 4; reviewers check fixtures); one other genesis hash latches `wrong-cluster`
+  until a restart, exits included, by design and alerted (risk 8; the second provider is the remedy).

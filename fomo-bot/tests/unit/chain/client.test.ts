@@ -68,6 +68,7 @@ interface World {
   answer: Answer;
   codes(): string[];
   usage(bucket: string): number | undefined;
+  cap(bucket: string): number | undefined;
 }
 
 /** The fixture answers, method by method, at the world's context slot. */
@@ -132,6 +133,7 @@ function world(o: { tighten?: { maxRequestBytes?: number }; throwingSink?: boole
   });
   w.codes = () => w.events.map((e) => e.code);
   w.usage = (bucket) => budget.usage().find((u) => u.bucket === bucket)?.used;
+  w.cap = (bucket) => budget.usage().find((u) => u.bucket === bucket)?.cap;
   return w;
 }
 
@@ -379,6 +381,57 @@ describe('the budget: asked first, always settled', () => {
     assert.ok((await w.client.slot(P0)).ok);
   });
 
+  it("the caller's priority reaches the governor: P2 cannot take P0's reserve, and a shed level refuses P4 (review Z, risk 1)", async () => {
+    const w = await verified();
+    const p2: CallOpts = { priority: 'P2', feature: 'crowdflow' };
+    for (let i = 0; i < 12; i += 1) {
+      assert.ok((await w.client.accounts([key(1)], p2)).ok, `P2 read ${i + 1} of the 12 that are not P0's`);
+    }
+    const f = failed(await w.client.accounts([key(1)], p2));
+    assert.ok(f.kind === 'denied' && f.reason === 'method-cap', 'the 13th P2 read is refused');
+    assert.ok((await w.client.accounts([key(1)], P0)).ok, "P0's reserve is still there for exits");
+    // a 429 on another method raises the shed level to 1, which refuses P4
+    w.answer = (s) => (s.method === 'getRecentPrioritizationFees' ? { kind: 'response', status: 429, rate: { ...NO_RATE, retryAfterSec: 30 }, bodyText: null, bytes: 0 } : fixtures(s, w));
+    assert.equal(failed(await w.client.priorityFees(key(2), p2)).kind, 'rate-limited');
+    w.mono += 10_000;
+    const shed = failed(await w.client.accounts([key(1)], { priority: 'P4', feature: 'momentum' }));
+    assert.ok(shed.kind === 'denied' && shed.reason === 'shed');
+    assert.ok((await w.client.accounts([key(1)], p2)).ok, 'P2 is not shed at level 1');
+  });
+
+  it("the provider's rate headers and the bytes of every answer reach the governor, failed answers included (review Z, risk 2)", async () => {
+    const w = await verified();
+    const withRate = (s: Sent, rate: { methodLimit?: number; methodRemaining?: number }): HttpOutcome => {
+      const o = fixtures(s, w) as HttpOutcome & { kind: 'response' };
+      return { ...o, rate: { ...NO_RATE, ...rate } };
+    };
+    const d0 = w.usage('data') as number;
+    let bytes = 0;
+    w.answer = (s) => {
+      const o = fixtures(s, w) as HttpOutcome & { kind: 'response' };
+      bytes = o.bytes;
+      return o;
+    };
+    assert.ok((await w.client.accounts([key(1)], P0)).ok);
+    assert.ok(bytes > 0);
+    assert.equal((w.usage('data') as number) - d0, bytes, 'a good answer is charged its bytes');
+    assert.equal(w.cap('getMultipleAccounts'), 20);
+    w.answer = (s) => withRate(s, { methodLimit: 12 });
+    assert.ok((await w.client.accounts([key(1)], P0)).ok);
+    assert.equal(w.cap('getMultipleAccounts'), 6, 'the header limit was learned: half of 12');
+    w.answer = (s) => withRate(s, { methodRemaining: 0 });
+    assert.ok((await w.client.accounts([key(1)], P0)).ok);
+    const closed = failed(await w.client.accounts([key(1)], P0));
+    assert.ok(closed.kind === 'denied' && closed.reason === 'retry-after', 'remaining 0 closed the method');
+    const before = w.usage('data') as number;
+    w.answer = () => ({ kind: 'too-large', bytes: 2_000_000 });
+    assert.deepEqual(failed(await w.client.blockHeight(P0)), { kind: 'too-large' });
+    assert.ok((w.usage('data') as number) >= before + 2_000_000, 'a stopped gzip bomb is charged what was read');
+    w.answer = () => ({ kind: 'timeout', bytes: 300_000 });
+    assert.deepEqual(failed(await w.client.blockHeight(P0)), { kind: 'timeout' });
+    assert.ok((w.usage('data') as number) >= before + 2_300_000, 'a timeout is charged what it had read');
+  });
+
   it('latency is the monotonic time the request took', async () => {
     const w = await verified();
     w.answer = (s) => {
@@ -400,6 +453,23 @@ describe('answers: values exactly, failures with their events', () => {
     assert.equal(r.value[1], null);
     assert.equal(r.value[0]?.lamports, 1_461_600n);
     assert.deepEqual([...(r.value[2]?.data ?? [])], [...ACCOUNT_DATA]);
+  });
+
+  it('a sliced read end to end: the slice is sent, its bytes come back, and space stays the full length (review Z, risk 6)', async () => {
+    const w = await verified();
+    w.answer = (s) => {
+      const config = s.params[1] as { readonly dataSlice?: { readonly offset: bigint; readonly length: bigint } };
+      const slice = config.dataSlice;
+      assert.ok(slice !== undefined, 'the slice was sent');
+      const bytes = ACCOUNT_DATA.slice(Number(slice.offset), Number(slice.offset + slice.length));
+      return result(s, { context: { apiVersion: '4.4.0', slot: FEED }, value: [{ ...(accountJson() as Record<string, Json>), data: [base64Of(bytes), 'base64'] }] });
+    };
+    const r = await w.client.accounts([key(1)], { ...P0, slice: { offset: 40, length: 8 } });
+    assert.ok(r.ok);
+    assert.equal(r.value[0]?.space, 82);
+    assert.deepEqual([...(r.value[0]?.data ?? [])], [...ACCOUNT_DATA.slice(40, 48)]);
+    w.answer = (s) => result(s, { context: { apiVersion: '4.4.0', slot: FEED }, value: [accountJson()] }); // the whole account, where a slice was asked
+    assert.deepEqual(failed(await w.client.accounts([key(1)], { ...P0, slice: { offset: 40, length: 8 } })), { kind: 'bad-response', code: 'shape' });
   });
 
   it('an empty fee list comes back empty, never as a fee of 0 (review Y, risk 8a); fees come back sorted', async () => {

@@ -368,8 +368,13 @@ can trade, and no key or account exists anywhere.
 - Your answer of Nov 26 is recorded as D16: against the blockchain's clock the bot halts only beyond 60
   seconds of difference; against the computer's own timer, over 2 seconds stops new buys (clearing by
   itself) and over 10 seconds halts. Built in part 7g.
-- Part 7e is built (tests first), NOT YET REVIEWED, on the separate branch: the read client, the one piece
-  the paper bot will use to read the chain (it has no way to send). Nothing is read until the server has
+- Part 7e is built (tests first) and REVIEWED (Nov 26, REVIEWS.md Z): both reviewers approved with notes,
+  and it joined the main work. Their fixes were small and are in: two network checks that overlap can no
+  longer undo the "wrong network" lock, and new tests prove the bot's request priorities, the server's
+  limits and the size of every answer reach the request budget. Their main note for part 7f: if a lying
+  server fools the bot right at start-up, before the live block feed exists, the reader must be able to
+  recover without a restart. The read client is the one piece the paper bot will use to read the chain
+  (it has no way to send). Nothing is read until the server has
   proved it is the real Solana network; the wrong network stops it for good until a restart. An answer
   older than what the bot already saw, or far behind the latest block, is refused. One wild answer can
   no longer make every honest server look behind (the reviewers' main note before this part). Every kind
@@ -377,7 +382,7 @@ can trade, and no key or account exists anywhere.
   review are in too: after "slow down" it waits at least 10 seconds, and it warns you if a limit ever
   leaves it unable to read prices for selling. 66 deliberate bugs were planted: all 66 caught (one weak
   test was found and fixed on the way).
-- Next: both reviewers check part 7e, then part 7f (the live block feed). No question is open.
+- Next: part 7f (the live block feed), starting with the review notes due there. No question is open.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
