@@ -678,3 +678,31 @@ behind, a probe's 5xx against "unblocked", polling that was never busy for a who
 guard that hid the first (the lowest-limit record, removed), and one more equivalent. Final: 46, 43
 caught, 3 equivalent, each with its reason in the script. Coverage: every line and branch of the two
 files.
+
+## 19. As built in step 7c (the providers and the fetch transport), and what changed
+
+Status: UNREVIEWED, on the unreviewed branch.
+
+Built, tests first: chain/providers.ts (`ProviderEndpoint`, `PUBLIC_MAINNET`, `MAINNET_GENESIS_HASH`),
+chain/http.ts (`createHttpTransport`, `HttpOutcome`, `HttpTransport`, `MAX_REQUEST_BYTES` = 49,152).
+
+Differences from s.3, s.4 and s.9:
+- `HttpOutcome` has one more kind, `request-too-large`: the transport itself refuses a request over 48
+  KiB (counted in UTF-8 bytes) without sending it. The client (7d, 7e) still refuses it before
+  `acquire`, as s.4 says, so the budget is never spent on it; this is the second line.
+- `createHttpTransport` takes an optional `fetchImpl`. Production passes none (the global fetch); the
+  tests pass the real fetch pointed at a local server, so the https-only URL check stays exactly as in
+  production. chain/http.ts is still the only file that names `fetch`.
+- An error status's body is not read at all when its content-length is over 4 KiB; without one, reading
+  stops at the first chunk past 4 KiB. A body-less answer (204) comes back with its status and no text.
+- The rate headers are read from digits only (1 to 9 of them; the remaining count may be negative);
+  anything else, a date-form Retry-After included, is missing, and the governor then waits its default.
+- Nothing is sent once the shutdown signal has fired (`shutdown`, with no request).
+- The URL check runs once, when the transport is made: https, no user name, password or fragment, every
+  query value one of the secret parts, each registered as an own secret; its refusals never name the
+  URL. The WebSocket URL is checked by chain/ws-socket.ts (7f). The start command's refusal of TLS and
+  proxy variables (review X, security 1) is cli/'s, with Phase 7.
+
+Tests: TEST_PLAN.md s.3, "Done in step 7c". Planted bugs (scratchpad `mut/run43.py`): 30, 29 caught on
+the first run and 1 equivalent (an already-aborted signal makes fetch refuse without sending, so the
+early return only saves the call). Coverage: every line and branch of the two files.

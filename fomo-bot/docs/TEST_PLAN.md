@@ -606,6 +606,27 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    - Planted bugs (scratchpad `mut/run42.py`): 46 in the first run, 38 caught, 2 equivalent; three weak
      tests fixed and a second guard that hid the first removed. Final: 46, 43 caught, 3 equivalent.
 
+   Done in step 7c (the providers and the fetch transport, CHAIN_DESIGN.md s.19; UNREVIEWED), against a
+   real in-process HTTP server on 127.0.0.1, never the network:
+   - A POST of the JSON body with JSON content type and accept headers; a 200's text and its rate
+     headers (a negative remaining count kept); the headers read from digits only (twelve malformed
+     forms, a date-form Retry-After among them, are missing).
+   - An error status (429, 403, 500) with its headers, its body dropped: unread when its content-length
+     is over 4 KiB, else stopped at the first chunk past it; a 204 with no body.
+   - Refusals: a redirect (its target never reached), a 200 that is not JSON (four types; the type is
+     case-insensitive), a content-length over the cap (unread), a gzip bomb (20 MiB of spaces in 20 KiB,
+     stopped past 64 KiB of decoded bytes), exactly the cap read and one byte more refused (with and
+     without a content-length), invalid UTF-8 inside the text and at its very end, a request over 48 KiB
+     in UTF-8 bytes (never sent; exactly 48 KiB goes).
+   - Ends: a stalled body as a timeout or as shutdown, no answer at all as a timeout, a refused
+     connection and the real fetch at a closed local port as transport failures, nothing sent once
+     stopping; impossible arguments as TypeErrors.
+   - The provider URL: the public endpoint pinned (https, no key, frozen) and the genesis hash a
+     canonical 32-byte value; another scheme, a user, a fragment, an unlisted query value or a too-short
+     secret refused without naming the URL; a key in the query registered as an own secret, and no
+     outcome naming the URL or the key, a redirect's error included.
+   - Planted bugs (scratchpad `mut/run43.py`): 30, 29 caught on the first run, 1 equivalent.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

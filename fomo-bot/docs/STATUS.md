@@ -346,8 +346,14 @@ can trade, and no key or account exists anywhere.
   gets busy. If the server says "slow down" it waits as told; if it blocks the bot, nothing is sent for
   15 minutes and buying stops. 46 deliberate bugs were planted: 43 caught, 3 cannot change anything
   (each reason written down); three weak tests were found and fixed.
-- Next: parts 7c (the internet connection) and 7d (reading the answers), then both reviewers check 7b to
-  7d together. One question for you is due before part 7g (the clock thresholds).
+- Part 7c is built (tests first), NOT YET REVIEWED, on the separate branch: the internet connection
+  itself, the only place in the bot allowed to talk to the internet. It only uses secure connections,
+  refuses to be redirected, never reads more than each answer may be (a small compressed answer that
+  would unpack to gigabytes is stopped at the limit), refuses anything that is not proper text, gives
+  up on an answer that hangs, and never lets the server's address (which may one day hold a key) into a
+  message or a log. 30 deliberate bugs were planted: 29 caught, 1 cannot change anything.
+- Next: part 7d (reading the answers), then both reviewers check 7b to 7d together. One question for you
+  is due before part 7g (the clock thresholds).
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
