@@ -993,7 +993,10 @@ budget.ts.
 
 Review AA (REVIEWS.md AA), of 7f at a69171e with a re-check of the review Z fixes: risk-guardian APPROVED
 WITH NOTES; security-auditor BLOCKED on one narrow defect, to lift once it is fixed with a test. Both
-confirmed the review Z fixes.
+confirmed the review Z fixes. The fix (d2d6681) was re-checked by a fresh security-auditor on 2026-11-27:
+"CONFIRMED: every wait that ws.ts gives to a timer is now a whole number of milliseconds, and the tests
+fail if Math.floor is removed, so the block on review AA security finding 1 lifts." So 7f joins the
+working branch.
 
 Fixed now (the review AA fix):
 - Security 1 (MEDIUM): the backoff wait is whole milliseconds (`Math.floor`); before, a fractional jitter
