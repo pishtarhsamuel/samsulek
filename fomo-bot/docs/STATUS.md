@@ -2,6 +2,42 @@
 
 Updated: 2026-11-27
 
+## Handoff for the next session (written 2026-11-27, read this first)
+
+The owner starts fresh sessions to save tokens (D17: no progress messages; a short summary only when
+asked; still ask when a decision is needed, and before anything that touches money).
+
+- Branches: reviewed work is on `claude/exciting-hamilton-2d7lto` (head 4164abb, step 7e merged). The
+  newest work is on `claude/exciting-hamilton-2d7lto-6d2-unreviewed` (head: the commit after d2d6681, this
+  note): step 7f (48dcb51, d944a9b, a69171e) and the review AA fix (d2d6681). Work on the unreviewed
+  branch; merge into the working branch only after the reviews (`--no-ff`), then fast-forward the
+  unreviewed branch to the merge.
+- Next, in order:
+  1. Full checks at the unreviewed head (the owner stopped the last full run): from fomo-bot/,
+     `npm run -s typecheck`, `npm run -s check:lockfile`, `npm run -s test:coverage`; from the repo root,
+     `uv run --offline pytest -p no:cacheprovider -q`, `uv run --offline ruff check src tests`,
+     `uv run --offline mypy`.
+  2. A narrow re-check of review AA security 1 by a fresh security-auditor (give it only REVIEWS.md AA's
+     security row and `git diff a69171e..d2d6681 -- fomo-bot`). Record its verdict verbatim in REVIEWS.md
+     AA (security row) and in CHAIN_DESIGN.md s.25's first paragraph; then merge 7f into the working branch.
+  3. Step 7g (CHAIN_DESIGN.md s.8, s.14): chain/time.ts (`chainTime`), chain/expiry.ts (`provablyExpired`),
+     app/time-guard.ts with D16's thresholds (wall against monotonic: over 2 s entries off, clearing itself;
+     over 10 s halt; against block time: over 60 s halt; s.8's "halts on both skews" is superseded by D16),
+     `GuardedClock` in slots.ts and day-tx.ts deps, rule 6 of s.10. With it, the conditions due in 7g:
+     CHAIN_DESIGN.md s.25 (review AA risk 1, the stream on a lagging node; risk 3's three tests) and s.23
+     (getBlockTime's skipped slots must not trip RPC_ERRORS).
+- How we work (D14): tests first; full checks; a planted-bug run per sub-step (a Python script that applies
+  one mutation at a time to a source file, runs that file's tests, restores it and checks its hash; the
+  old ones are in the session scratchpad `mut/`, which may be gone: write a new one); then the docs
+  (CHAIN_DESIGN "as built" section, TEST_PLAN s.3, this file). Review every two sub-steps with fresh
+  risk-guardian and security-auditor agents, given only the diff and the open conditions (cheaper than
+  resumed ones). Commit messages via `git commit -F <file>`, ending with the session's attribution lines.
+- Tools: Node 26.13.0 exactly (VERIFIED_FACTS s.8); if the session has none, fetch the official
+  linux-x64 build of 26.13.0 from nodejs.org/dist and check it against that release's SHASUMS256 before
+  use. The guard hook blocks shell commands that contain words like halt, kill, stop, state or a bare
+  `*`, and recursive grep: put scripts in a file with the Write tool, and use the Grep tool on narrow
+  paths. Never read .env or key files.
+
 **Phase 2 (foundations, tests first): in progress.** Paper-only building blocks; nothing
 can trade, and no key or account exists anywhere.
 
@@ -382,7 +418,11 @@ can trade, and no key or account exists anywhere.
   review are in too: after "slow down" it waits at least 10 seconds, and it warns you if a limit ever
   leaves it unable to read prices for selling. 66 deliberate bugs were planted: all 66 caught (one weak
   test was found and fixed on the way).
-- Part 7f is built (tests first), NOT YET REVIEWED, on the separate branch: the live block feed, one
+- Part 7f was reviewed (Nov 27, REVIEWS.md AA): the risk reviewer approved with notes; the security
+  reviewer stopped the merge over one fault (the reconnect wait was a fraction of a millisecond, which the
+  real timers refuse, so the first disconnect would have crashed the bot). It is fixed with tests and
+  waits for the security re-check before joining the main work. The other notes are in CHAIN_DESIGN.md
+  s.25 with the part each is due by. The live block feed is one
   connection to the Solana server that tells the bot each new block as it happens. If the feed goes
   quiet for 5 seconds the bot drops the connection and reconnects, waiting a little longer each time (at
   most a minute); anything odd it receives is dropped and counted. The reviewers' notes due here are in:
