@@ -704,6 +704,38 @@ RISK_POLICY.md section 15. Failure modes refer to ARCHITECTURE.md section 12.
    rate headers do (a learned limit, remaining 0); every answer's bytes do (good, too-large, timeout); a
    sliced read end to end. Planted bugs (scratchpad `mut/run48.py`): 7, 7 caught after one check added.
 
+   Done in step 7f (the live block feed and the review conditions, CHAIN_DESIGN.md s.24; UNREVIEWED):
+   - The client (review Z risk 3, 4): the mark sent never above the feed, following it down, 0 while the
+     feed has none (for slot, block height and accounts); with the real slot feed, a wild cold-start anchor
+     and recovery without a restart; answers more than 150 above a known feed refused 'ahead' (exactly
+     150 fine), never reported, the mark unmoved.
+   - The governor (review Y risk 1, 6): after a 60 MB stream charge P0 still reads nine 1 MiB answers and
+     only its own bytes refuse the tenth; non-P0 and the stream share one part; `chargeStream` says when
+     the shared part is over its share; a P0 retry time follows its own bytes; the property test with
+     random stream charges, settles up to one chunk past the cap, and P0's reserve as an invariant.
+   - The stream (fake socket, hand timers): slotSubscribe first on open; the ack makes it live; open and
+     ack timeouts; refusals, errors, closes, refused sends, throwing sends, terminates and factories; the
+     watchdog at 5 s (a notification in time keeps it); a socket whose close never fires left behind, its
+     late events ignored; a new generation subscribing again and the old id unknown; oversize dropped,
+     binary ending the socket; every message charged in UTF-8 bytes (oversize at three a character,
+     binary by length) and over-share counted; 13 malformed messages; backoff 2, 4, 8, 16, 32, 60, 60 s at
+     jitter just under 1, 1 s at jitter 0, reset after 60 s live, a bad jitter read as the longest wait;
+     flapping once per crossing, again after aging out; stop() final with no timer left; our bug at the
+     4,000-byte edge stopping the stream; a throwing sink ignored; the rules pinned.
+   - The WebSocket door, against an RFC 6455 server inside the test process: a message sent intact; text
+     as strings, binary as ArrayBuffers; after terminate() no handler runs, a close frame without the TCP
+     close included; a refused connection reaching the error or closed handler; the default opener at a
+     closed local wss port; the real stream client end to end (subscribed, live, a slot reported,
+     stopped); the URL checks (wss only, no user, password or fragment, unlisted query values refused
+     without naming the URL, a key registered, no other URL opened).
+   - The jitter: `unitFromBytes` exact at 0, 1/2^48, 0.5 and just under 1; wrong inputs refused;
+     `unitInterval` in [0, 1) and spread over 1,000 draws.
+   - Property (1,000 runs): random opens, acks, notifications, junk, errors and closes on the current and
+     older sockets, and clock steps: slots only from the current, subscribed socket; slotSubscribe first
+     and alone before the ack; nothing sent on an ended socket; live on one socket at most.
+   - Planted bugs: scratchpad `mut/run49.py` (7f-1) 17, 16 caught, 1 equivalent; `mut/run50.py` (7f-2) 48,
+     47 caught, 1 equivalent.
+
 ## 4. Property-based tests (fast-check)
 
 | Invariant | Generators | Property |

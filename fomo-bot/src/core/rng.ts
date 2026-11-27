@@ -1,5 +1,7 @@
 // Randomness, in one audited place (ARCHITECTURE.md s.2; STORAGE_DESIGN.md s.16.7.1): the per-boot
-// approval key and the random ids of tokens, positions and orders. Only randomBytes is used. Ids
+// approval key, the random ids of tokens, positions and orders, and the stream's reconnect jitter
+// (unitInterval, CHAIN_DESIGN R14: chain/ cannot import this file, so cli/ hands it in). Only
+// randomBytes is used. Ids
 // come from their own random bytes, so they are independent of the key and of every MAC; each is a
 // prefix and 32 lower-case hex characters (35 in all: the secret filter refuses runs of 64), drawn
 // again while the filter refuses it (a registered own secret inside it), at most 8 times, then the
@@ -94,6 +96,26 @@ export function drawId(kind: IdKind, nextBytes: () => Uint8Array): string {
 /** A random id of this kind. */
 export function newId(kind: IdKind): string {
   return drawId(kind, () => randomBytes(ID_BYTES));
+}
+
+const UNIT_BYTES = 6;
+const UNIT_SCALE = 2 ** 48;
+
+/** Exactly 6 bytes, big-endian, as a fraction of 2^48: from 0 up to just under 1. */
+export function unitFromBytes(bytes: Uint8Array): number {
+  if (!(bytes instanceof Uint8Array) || bytes.length !== UNIT_BYTES) {
+    throw new RngError('rng-bad-bytes', 'exactly 6 bytes for a number in [0, 1)');
+  }
+  let v = 0;
+  for (const b of bytes) {
+    v = v * 256 + b; // at most 2^48 - 1: exact in a double
+  }
+  return v / UNIT_SCALE;
+}
+
+/** A random number in [0, 1): the reconnect jitter of chain/ws.ts, handed in by cli/. */
+export function unitInterval(): number {
+  return unitFromBytes(randomBytes(UNIT_BYTES));
 }
 
 /** The process's own randomness: only cli/ passes it on. */

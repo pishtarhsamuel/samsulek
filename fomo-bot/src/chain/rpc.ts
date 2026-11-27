@@ -27,7 +27,8 @@ const I32_MIN = -(2n ** 31n);
 const I32_MAX = 2n ** 31n - 1n;
 const I63_MAX = (1n << 63n) - 1n;
 
-export type BadResponseCode = 'content-type' | 'utf8' | 'json' | 'envelope' | 'id' | 'shape' | 'count' | 'went-back';
+/** 'went-back' and 'ahead' are the read client's (an answer below the slot sent, or far above the feed). */
+export type BadResponseCode = 'content-type' | 'utf8' | 'json' | 'envelope' | 'id' | 'shape' | 'count' | 'went-back' | 'ahead';
 export type NotReadableCode = -32001 | -32004 | -32007 | -32009 | -32011 | -32014 | -32019;
 
 export type ChainFailure =

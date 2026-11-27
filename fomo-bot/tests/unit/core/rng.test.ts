@@ -10,7 +10,7 @@ import { base58Of, base64UrlOf, hexOf } from '../../../src/core/encode.ts';
 import { isIdText } from '../../../src/core/ids.ts';
 import { registerOwnSecret } from '../../../src/core/redact.ts';
 import * as rngFile from '../../../src/core/rng.ts';
-import { RngError, drawId, drawKey, idFromBytes, keyFromBytes, newApprovalKey, newId, systemRng, type IdKind } from '../../../src/core/rng.ts';
+import { RngError, drawId, drawKey, idFromBytes, keyFromBytes, newApprovalKey, newId, systemRng, unitFromBytes, unitInterval, type IdKind } from '../../../src/core/rng.ts';
 
 const SHAPE: Readonly<Record<IdKind, RegExp>> = { token: /^tk_[0-9a-f]{32}$/, position: /^ps_[0-9a-f]{32}$/, order: /^or_[0-9a-f]{32}$/ };
 
@@ -27,7 +27,27 @@ function rngError(fn: () => unknown, code: RngError['code']): void {
 
 describe('the randomness file: only what it may do', () => {
   it('exports the key and id makers, their test doors and the error, and nothing else', () => {
-    assert.deepEqual(Object.keys(rngFile).sort(), ['RngError', 'drawId', 'drawKey', 'idFromBytes', 'keyFromBytes', 'newApprovalKey', 'newId', 'systemRng']);
+    assert.deepEqual(Object.keys(rngFile).sort(), ['RngError', 'drawId', 'drawKey', 'idFromBytes', 'keyFromBytes', 'newApprovalKey', 'newId', 'systemRng', 'unitFromBytes', 'unitInterval']);
+  });
+});
+
+describe('unitInterval: the stream reconnect jitter (CHAIN_DESIGN R14, step 7f)', () => {
+  it('unitFromBytes: exactly 6 bytes as a fraction of 2^48, from 0 up to just under 1', () => {
+    assert.equal(unitFromBytes(new Uint8Array(6)), 0);
+    assert.equal(unitFromBytes(new Uint8Array(6).fill(255)), (2 ** 48 - 1) / 2 ** 48);
+    assert.ok(unitFromBytes(new Uint8Array(6).fill(255)) < 1);
+    assert.equal(unitFromBytes(Uint8Array.from([128, 0, 0, 0, 0, 0])), 0.5);
+    assert.equal(unitFromBytes(Uint8Array.from([0, 0, 0, 0, 0, 1])), 1 / 2 ** 48);
+    for (const bad of [new Uint8Array(5), new Uint8Array(7), [0, 0, 0, 0, 0, 0], null] as unknown[]) {
+      rngError(() => unitFromBytes(bad as Uint8Array), 'rng-bad-bytes');
+    }
+  });
+
+  it('unitInterval: random numbers in [0, 1), spread out', () => {
+    const draws = Array.from({ length: 1_000 }, () => unitInterval());
+    assert.ok(draws.every((x) => x >= 0 && x < 1));
+    assert.ok(new Set(draws).size > 990, 'practically all different');
+    assert.ok(draws.some((x) => x < 0.1) && draws.some((x) => x > 0.9), 'both ends reached');
   });
 });
 

@@ -27,6 +27,12 @@ import { calls, encodeRequest, readEnvelope, type ChainFailure, type ChainResult
 
 /** A context this many slots behind the feed is stale (ARCHITECTURE s.12; plans keep their own 25). */
 export const STALE_SLOTS = 150n;
+/**
+ * An answer this many slots above a known feed slot is refused: a fresh feed is within a few slots of the
+ * chain, so it is a wild node, and its slot would give a negative age (review Z, risk 4). The feed's own
+ * agreeSlots is the same 150.
+ */
+export const AHEAD_SLOTS = 150n;
 /** The cluster check is due again after this long (s.8). */
 const CLUSTER_RECHECK_MS = 3_600_000;
 /** apiVersion goes into an event only in this form (s.3; review Y, security 8). */
@@ -243,6 +249,10 @@ export function createReadClient(o: ReadClientOptions): ReadClient {
         emit('chain-stale', method);
         return fail({ kind: 'stale', contextSlot: s });
       }
+      if (feed !== null && s > feed + AHEAD_SLOTS) {
+        emit('chain-stale', method);
+        return fail({ kind: 'bad-response', code: 'ahead' }); // a wild node: never used or reported
+      }
       o.slots.report('http', s);
       // the mark rises only as far as the feed has accepted (review X, risk 1)
       const accepted = o.slots.currentSlot();
@@ -266,6 +276,21 @@ export function createReadClient(o: ReadClientOptions): ReadClient {
     }
     const c = decoded.context as RpcContext; // the decoders that take a context always return one
     return { value: decoded.value, slot: c.slot, apiVersion: c.apiVersion };
+  };
+
+  /**
+   * The minContextSlot to send now: never above the feed's slot, and 0 while the feed has none, so a mark
+   * raised on a wrongly anchored feed comes down with the feed and honest nodes are never kept looking
+   * behind (review Z, risk 3). The mark means something only next to a feed that knows the slot.
+   */
+  const markNow = (): Slot => {
+    const feed = o.slots.currentSlot();
+    if (feed === null) {
+      mark = 0n as Slot;
+    } else if (feed < mark) {
+      mark = feed as Slot;
+    }
+    return mark;
   };
 
   const gate = <T>(opts: unknown): ChainResult<T> | null => {
@@ -316,20 +341,20 @@ export function createReadClient(o: ReadClientOptions): ReadClient {
       if (closed !== null) {
         return closed;
       }
-      const sent = mark;
+      const sent = markNow();
       return run(calls.slot(sent), opts, (x) => {
         const d = decodeSlot(x);
         return d.ok ? { value: d.value, slot: d.value, apiVersion: null } : d;
       }, sent);
     },
-    blockHeight: async (opts) => gate<BlockHeight>(opts) ?? run(calls.blockHeight(mark), opts, (x) => bare(decodeBlockHeight(x)), null),
+    blockHeight: async (opts) => gate<BlockHeight>(opts) ?? run(calls.blockHeight(markNow()), opts, (x) => bare(decodeBlockHeight(x)), null),
     accounts: async (keys, opts) => {
       const closed = gate<readonly (Account | null)[]>(opts);
       if (closed !== null) {
         return closed;
       }
       const slice = opts.slice ?? null;
-      const sent = mark;
+      const sent = markNow();
       return run(calls.accounts(keys, slice, sent), opts, (x) => withContext(decodeAccounts(x, keys.length, slice)), sent);
     },
     priorityFees: async (writable, opts) => gate<readonly FeeEntry[]>(opts) ?? run(calls.priorityFees(writable), opts, (x) => bare(decodePriorityFees(x)), null),
