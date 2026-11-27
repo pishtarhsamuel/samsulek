@@ -988,3 +988,45 @@ equivalent (error and close end the socket alike). Before it, two redundant guar
 ws-socket.ts (nulling the handlers, which the flag already covers; the flag in `send`, which the OPEN
 check already covers). Coverage: every line and branch of ws.ts, ws-socket.ts, rng.ts, client.ts and
 budget.ts.
+
+## 25. Review AA (7f): the fix, and the conditions for later sub-steps
+
+Review AA (REVIEWS.md AA), of 7f at a69171e with a re-check of the review Z fixes: risk-guardian APPROVED
+WITH NOTES; security-auditor BLOCKED on one narrow defect, to lift once it is fixed with a test. Both
+confirmed the review Z fixes.
+
+Fixed now (the review AA fix):
+- Security 1 (MEDIUM): the backoff wait is whole milliseconds (`Math.floor`); before, a fractional jitter
+  gave a fractional wait, which the real timers refuse with a TypeError, thrown from a socket or timer
+  handler. The hand timers of ws.test.ts now refuse fractional waits as the real ones do; a 0.123456789
+  jitter waits 1,123 ms; the property test runs random jitters and checks every wait; the real-timer test
+  goes through a disconnect, a backoff and a reconnect with a fractional jitter.
+- The record of review X security 3: Node 26.13.0's bundled undici caps one message at 128 MiB
+  (VERIFIED_FACTS s.9), so the cost of a hostile message is bounded; ws-socket.ts's header corrected.
+
+Conditions, each due by the sub-step or phase named:
+- 7g:
+  - Risk 1 (MEDIUM): a stream on a node more than 150 slots behind anchors the feed, and then every
+    honest read is refused 'ahead', exits included. Report an 'ahead' slot to the feed (never use it or
+    raise the mark) so the feed's agreement rule sees it, and reconnect the stream when HTTP stays ahead
+    (for example 3 'ahead' answers within 30 s), with a test on the real feed.
+  - Risk 3: tests for the watchdog fed only by our notifications (not junk or unmapped ones), the backoff
+    reset only after 60 s live (not any live moment), and `jsonrpc` checked on notifications.
+- 7h:
+  - Risk 4: only a logs subscription can pass the 4,000-byte cap: drop that one, keep slotSubscribe.
+  - Risk 5: shed the logs subscriptions when `chargeStream` says the shared part is over its share, with
+    a test (review Y risk 1's second half).
+- Before Phase 7's soak (or with 7h): security 2, sockets terminated but still open (undici has no close
+  timeout) are counted through an internal close listener; above a few, an event and the stream stops.
+- Phase 3:
+  - Risk 2: a result says whether the feed knew the slot; the exit loop treats such an age as unknown and
+    refuses a context slot lower than the last one used for that account.
+  - Risk 4: the app treats the stream's `chain-our-bug` as "stream stopped" (DATA_STALE, entries off,
+    alert).
+  - Security 4: `chain-ws-oversize` and `chain-ws-unknown-sub` fire once per message; the alert rate
+    limit absorbs it, or they fire once per generation.
+- Phase 7: a cgroup memory limit (systemd `MemoryMax`; ArrayBuffers live outside V8's heap) of the steady
+  memory plus about 640 MiB, about 1 GiB; `Restart=on-failure`, a start limit and an alert on every
+  restart (security, on review X note 3). Revisit the built-in WebSocket before Phase 8.
+- With review Y security 3 (before a second keyed provider): security 3, one shared URL check, comparing
+  normalised URLs (a URL without its trailing slash is refused on every connect today; fails closed).

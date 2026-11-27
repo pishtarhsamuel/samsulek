@@ -8,10 +8,12 @@
 // - the error event is dropped unread (its message can name the URL, and with it a key);
 // - terminate() detaches every handler first, then closes: after it nothing reaches the stream, even when
 //   the server sent a close frame and never closed the TCP connection (then `close` never fires).
-// Built on Node's own WebSocket (review X, security 3, decided in 7f): it buffers a whole frame before
-// chain/ws.ts can look at its size, so a huge frame is a crash risk, guarded by the ops memory limit and
-// the restart (Phase 7), not a drop; a hand-written frame reader would need its own network file and
-// review. Production passes no `open`; the tests point it at a local server.
+// Built on Node's own WebSocket (review X, security 3, decided in 7f): it buffers a whole message before
+// chain/ws.ts can look at its size. Its bundled undici caps one message at 128 MiB (closing with 1009
+// past it; review AA, VERIFIED_FACTS s.9), so a hostile message costs at most about 128 MiB, plus its
+// string and a copy: Phase 7's cgroup memory limit (about 1 GiB) and the restart guard that. A
+// hand-written frame reader would need its own network file and review; revisit before Phase 8.
+// Production passes no `open`; the tests point it at a local server.
 import { registerOwnSecret } from '../core/redact.ts';
 import type { ProviderEndpoint } from './providers.ts';
 import type { SocketFactory, SocketHandle } from './ws.ts';

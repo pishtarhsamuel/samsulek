@@ -190,7 +190,8 @@ export function createStreamClient(o: StreamClientOptions): StreamClient {
     const j = o.jitter();
     const f = typeof j === 'number' && j >= 0 && j < 1 ? j : 1; // a bad jitter waits the longest
     const top = Math.min(R.backoffMaxMs, 1_000 * 2 ** Math.min(attempt, 30));
-    return R.backoffMinMs + f * (top - R.backoffMinMs);
+    // whole milliseconds: the real timers refuse anything else (review AA, security 1)
+    return R.backoffMinMs + Math.floor(f * (top - R.backoffMinMs));
   };
 
   /** This generation's socket failed: end it, then back off (a late event of an older one does nothing). */

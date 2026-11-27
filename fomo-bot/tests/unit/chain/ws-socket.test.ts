@@ -202,7 +202,7 @@ describe('the real WebSocket factory against an in-process server', () => {
       socket: createWebSocketFactory({ endpoint: PUBLIC_MAINNET, open: local }),
       timers: systemTimers,
       mono: systemMono,
-      jitter: () => 0,
+      jitter: () => 0.123456789, // fractional, as unitInterval gives: the real timers must get whole milliseconds
       slots: { report: (c, slot) => reports.push([c, slot]) },
       budget: { chargeStream: () => false },
       events: { event: () => undefined },
@@ -211,9 +211,13 @@ describe('the real WebSocket factory against an in-process server', () => {
     await until('a slot', () => reports.length > 0);
     assert.deepEqual(reports, [['stream', 385_000_000n]]);
     assert.equal(stream.state(), 'live');
+    (peers[0] as Peer).socket.destroy(); // the server goes away: back off on the real timers, then reconnect
+    await until('a reconnect', () => peers.length >= 2 && reports.length >= 2, 4_000);
+    assert.equal(stream.state(), 'live');
+    assert.ok(stream.stats().generation >= 2);
     stream.stop();
     onPeer = () => undefined;
-    await until('the server sees the socket end', () => (peers[0] as Peer).closed || (peers[0] as Peer).received.some((r) => r.opcode === 8));
+    await until('the server sees the socket end', () => (peers[1] as Peer).closed || (peers[1] as Peer).received.some((r) => r.opcode === 8));
   });
 });
 

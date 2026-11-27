@@ -51,6 +51,10 @@ function world(o: { tighten?: { maxClientMessageBytes?: number }; throwingSink?:
   const t: Timers = {
     timeoutSignal: () => new AbortController().signal,
     after: (ms, fn) => {
+      // as the real timers (core/clock.ts): whole milliseconds only (review AA, security 1)
+      if (!Number.isInteger(ms) || ms < 0) {
+        throw new TypeError(`a timer of ${ms} ms`);
+      }
       const entry = { at: w.now + ms, fn, live: true };
       timers.push(entry);
       return () => {
@@ -355,6 +359,14 @@ describe('backoff, flapping and stop', () => {
     }
     w.last().h.error(); // after 60 s live: the backoff starts again from the first step
     assert.equal(waitFor(), 2_000);
+    const frac = world(); // a fractional jitter, as unitInterval gives almost every time
+    frac.jitter = 0.123456789;
+    frac.client.start();
+    frac.last().h.error();
+    frac.advance(1_122);
+    assert.equal(frac.sockets.length, 1);
+    frac.advance(1);
+    assert.equal(frac.sockets.length, 2, '1 s + floor(0.123456789 x 1 s) = 1,123 ms, a whole number');
     for (const bad of [Number.NaN, -0.5, 1, 7]) {
       const v = world();
       v.jitter = bad;

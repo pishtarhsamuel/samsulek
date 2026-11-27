@@ -3,7 +3,8 @@
 // close that never fired, events that come late), and clock steps. After every event: a reported slot
 // came from the current socket, live, on a subscription that socket's ack mapped; every socket that went
 // live sent slotSubscribe first and nothing else before its ack; nothing is sent on a terminated socket;
-// the stream is live on at most one socket.
+// the stream is live on at most one socket; every wait given to the timers is whole milliseconds, for any
+// jitter (review AA, security 1).
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fc from 'fast-check';
@@ -37,12 +38,13 @@ interface Sock {
   wentLive: boolean;
 }
 
-function run(events: readonly Ev[]): void {
+function run(events: readonly Ev[], jitter: number): void {
   let now = 1_000_000;
   let timers: { at: number; fn: () => void; live: boolean }[] = [];
   const t: Timers = {
     timeoutSignal: () => new AbortController().signal,
     after: (ms, fn) => {
+      assert.ok(Number.isInteger(ms) && ms >= 0, `every wait is whole milliseconds, as the real timers require: ${ms}`);
       const e = { at: now + ms, fn, live: true };
       timers.push(e);
       return () => {
@@ -86,7 +88,7 @@ function run(events: readonly Ev[]): void {
     },
     timers: t,
     mono: { nowMs: () => now },
-    jitter: () => 0.5,
+    jitter: () => jitter,
     slots: { report: (_c, slot) => reports.push(slot as bigint) },
     budget: { chargeStream: () => false },
     events: { event: () => undefined },
@@ -150,6 +152,7 @@ function run(events: readonly Ev[]): void {
 
 describe('the live block feed under random events', () => {
   it('slots only from the current, subscribed socket; slotSubscribe first; nothing sent on an ended socket; live on one socket at most', () => {
-    fc.assert(fc.property(fc.array(evArb, { minLength: 5, maxLength: 120 }), (events) => run(events)), { numRuns: 1_000 });
+    const jitterArb = fc.oneof(fc.double({ min: 0, max: 1, maxExcluded: true, noNaN: true }), fc.constantFrom(0, 0.5, 0.123456789));
+    fc.assert(fc.property(fc.array(evArb, { minLength: 5, maxLength: 120 }), jitterArb, (events, jitter) => run(events, jitter)), { numRuns: 1_000 });
   });
 });
