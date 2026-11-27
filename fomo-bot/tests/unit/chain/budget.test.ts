@@ -137,6 +137,45 @@ describe('the windows: per method, in all, data and connections', () => {
     assert.throws(() => w.gov.chargeStream(1.5), TypeError);
   });
 
+  it("the stream never takes P0's data reserve: after any stream charge a P0 read of its full byte cap fits (review Y, risk 1)", () => {
+    const w = world();
+    assert.equal(w.gov.chargeStream(1_000), false, 'within its share');
+    assert.equal(w.gov.chargeStream(60_000_000), true, 'over its share: the stream should shed (its logs subscriptions, 7h)');
+    denied(w.gov.acquire('getMultipleAccounts', 'P2'), 'data-cap'); // the shared part is gone
+    // P0 still has its whole 10 MB reserve: nine reads of 1 MiB each, settled at their full cap
+    for (let i = 0; i < 9; i += 1) {
+      w.gov.settle(granted(w.gov.acquire('getMultipleAccounts', 'P0')), { decodedBytes: MIB, status: 200, rate: null });
+      w.advance(1_200); // past the method's window rate
+    }
+    denied(w.gov.acquire('getMultipleAccounts', 'P0'), 'data-cap'); // only P0's own bytes fill its reserve
+    const u = w.gov.usage().find((b) => b.bucket === 'data');
+    assert.ok(u !== undefined && u.used > 60_000_000, 'the data row still shows everything received');
+    w.advance(30_000);
+    granted(w.gov.acquire('getMultipleAccounts', 'P2'));
+  });
+
+  it("non-P0 HTTP bytes and stream bytes share one part: together they never take P0's reserve either", () => {
+    const w = world({ dataCapBytes: 4 * MIB, dataP0ReserveBytes: MIB });
+    w.gov.settle(granted(w.gov.acquire('getProgramAccounts', 'P1')), { decodedBytes: 2 * MIB, status: 200, rate: null });
+    assert.equal(w.gov.chargeStream(512 * 1024), false, '2.5 of the shared 3 MiB');
+    assert.equal(w.gov.chargeStream(10 * MIB), true);
+    denied(w.gov.acquire('getMultipleAccounts', 'P2'), 'data-cap');
+    granted(w.gov.acquire('getMultipleAccounts', 'P0')); // 0 of its own + the shared part capped at 3 MiB + 1 MiB = the 4 MiB cap
+    denied(w.gov.acquire('getMultipleAccounts', 'P0'), 'data-cap'); // its own reserved 1 MiB used it up
+  });
+
+  it("a P0 data denial's retry time is when P0's own bytes age out, however much the stream sent after them", () => {
+    const w = world({ dataCapBytes: 4 * MIB, dataP0ReserveBytes: MIB });
+    const t0 = w.now();
+    w.gov.settle(granted(w.gov.acquire('getMultipleAccounts', 'P0')), { decodedBytes: MIB, status: 200, rate: null });
+    w.advance(5_000);
+    w.gov.chargeStream(10 * MIB); // far over the shared part, after P0's own MiB
+    // 1 MiB of its own + the shared part counted at 3 MiB + 1 MiB needed = 5 MiB: refused until its own MiB ages out
+    assert.equal(denied(w.gov.acquire('getMultipleAccounts', 'P0'), 'data-cap'), t0 + 30_000, 'not when the stream ages out (t0 + 35 s)');
+    w.set(t0 + 30_000);
+    granted(w.gov.acquire('getMultipleAccounts', 'P0'));
+  });
+
   it('connections: at most 6 requests in flight, the last 2 only for P0; a settle frees one', () => {
     const w = world();
     const p2 = [0, 1, 2, 3].map(() => granted(w.gov.acquire('getMultipleAccounts', 'P2')));

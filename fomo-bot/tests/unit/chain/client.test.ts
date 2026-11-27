@@ -8,12 +8,16 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createBudgetGovernor, type BudgetGovernor, type Ticket } from '../../../src/chain/budget.ts';
 import {
+  AHEAD_SLOTS,
   createReadClient,
   FAILURE_RULES,
   STALE_SLOTS,
   type CallOpts,
   type ReadClient,
+  type SlotReporter,
+  type SlotView,
 } from '../../../src/chain/client.ts';
+import { createSlotFeed, SLOT_FEED_DEFAULTS } from '../../../src/app/slots.ts';
 import { rentFormula } from '../../../src/chain/decode.ts';
 import type { ChainEvent } from '../../../src/chain/events.ts';
 import type { HttpOutcome, HttpRequest, HttpTransport } from '../../../src/chain/http.ts';
@@ -93,7 +97,7 @@ const fixtures: Answer = (s, w) => {
   }
 };
 
-function world(o: { tighten?: { maxRequestBytes?: number }; throwingSink?: boolean; budget?: BudgetGovernor } = {}): World {
+function world(o: { tighten?: { maxRequestBytes?: number }; throwingSink?: boolean; budget?: BudgetGovernor; slots?: SlotReporter & SlotView } = {}): World {
   const w = {
     sent: [] as Sent[],
     events: [] as ChainEvent[],
@@ -127,7 +131,7 @@ function world(o: { tighten?: { maxRequestBytes?: number }; throwingSink?: boole
     transport,
     budget,
     mono,
-    slots: { report: (channel, s) => w.reports.push([channel, s]), currentSlot: () => w.feed },
+    slots: o.slots ?? { report: (channel, s) => w.reports.push([channel, s]), currentSlot: () => w.feed },
     events: sink,
     ...(o.tighten === undefined ? {} : { tighten: o.tighten }),
   });
@@ -198,7 +202,7 @@ describe('the genesis lock (s.8)', () => {
     const always: BudgetGovernor = {
       acquire: () => Object.freeze({ ok: true, ticket: Object.freeze({ __ticket: 'budget-ticket' }) as Ticket }),
       settle: () => undefined,
-      chargeStream: () => undefined,
+      chargeStream: () => false,
       shedLevel: () => 0,
       usage: () => [],
     };
@@ -277,21 +281,102 @@ describe('the wire: fixed commitment, encoding and limits (R6)', () => {
 describe('reads never go backwards (s.5; review X, risk 1)', () => {
   it('the mark rises only with slots the feed accepts: one wild answer cannot make every honest node look behind', async () => {
     const w = await verified();
-    w.contextSlot = FEED + 1_000_000n; // a buggy, forked or lying node
+    w.contextSlot = FEED + 100n; // a node ahead of the feed, within reach
     assert.ok(value(await w.client.accounts([key(1)], P0)));
     w.contextSlot = FEED; // honest nodes, at the feed's slot
     assert.ok(value(await w.client.accounts([key(1)], P0)), 'an honest read still succeeds');
     assert.ok(w.sent[1]?.text.includes(`"minContextSlot":${FEED}}`), 'the mark stopped at the feed');
-    w.feed = null; // the feed lost the slot: the mark does not move at all
-    w.contextSlot = FEED + 50n;
-    await w.client.slot(P0);
-    await w.client.blockHeight(P0);
-    assert.ok(w.sent[3]?.text.includes(`"minContextSlot":${FEED}}`));
     w.feed = FEED + 60n; // the feed moved on: the next context slot raises the mark, up to it
     w.contextSlot = FEED + 55n;
     await w.client.slot(P0);
     await w.client.blockHeight(P0);
-    assert.ok(w.sent[5]?.text.includes(`"minContextSlot":${FEED + 55n}}`));
+    assert.ok(w.sent[3]?.text.includes(`"minContextSlot":${FEED + 55n}}`));
+  });
+
+  it('the mark is never above the feed: it follows the feed down, and is 0 while the feed has no slot (review Z, risk 3)', async () => {
+    const w = await verified();
+    await w.client.slot(P0); // mark: FEED
+    w.feed = FEED - 40n; // the feed was corrected downward
+    w.contextSlot = FEED - 40n;
+    assert.ok((await w.client.blockHeight(P0)).ok);
+    assert.ok(w.sent[1]?.text.includes(`"minContextSlot":${FEED - 40n}}`), 'sent at the feed, not above it');
+    assert.ok((await w.client.slot(P0)).ok, 'an honest node at the feed is not behind and not went-back');
+    w.feed = FEED - 45n; // down once more: account reads follow it too
+    w.contextSlot = FEED - 45n;
+    assert.ok((await w.client.accounts([key(1)], P0)).ok);
+    assert.ok(w.sent.at(-1)?.text.includes(`"minContextSlot":${FEED - 45n}}`), 'accounts sent at the feed');
+    w.sent.splice(3); // keep the indexes below as they were
+    w.feed = null; // the feed lost the slot (an outage, or back to its cold start)
+    w.contextSlot = FEED + 50n;
+    assert.ok((await w.client.slot(P0)).ok, 'nothing to judge against: the answer is used');
+    assert.ok(w.sent[3]?.text.includes('"minContextSlot":0}'), 'no mark without a feed slot');
+    await w.client.blockHeight(P0);
+    assert.ok(w.sent[4]?.text.includes('"minContextSlot":0}'), 'and it does not rise while the feed has none');
+  });
+
+  it(`an answer more than ${AHEAD_SLOTS} slots ahead of a known feed is refused, never used or reported (review Z, risk 4)`, async () => {
+    assert.equal(AHEAD_SLOTS, 150n);
+    const w = await verified();
+    w.contextSlot = FEED + 151n;
+    assert.deepEqual(failed(await w.client.accounts([key(1)], P0)), { kind: 'bad-response', code: 'ahead' });
+    assert.deepEqual(failed(await w.client.slot(P0)), { kind: 'bad-response', code: 'ahead' });
+    assert.deepEqual(w.reports, []);
+    assert.deepEqual(w.events.filter((e) => e.code === 'chain-stale').map((e) => e.method), ['getMultipleAccounts', 'getSlot']);
+    assert.ok(w.sent[1]?.text.includes('"minContextSlot":0}'), 'and the mark did not move');
+    w.contextSlot = FEED + 150n; // exactly 150 ahead: still within reach
+    assert.ok((await w.client.slot(P0)).ok);
+    w.feed = null;
+    w.contextSlot = FEED + 1_000_000n; // no feed slot: nothing to judge against
+    assert.ok((await w.client.slot(P0)).ok);
+  });
+
+  it('with the real slot feed: one wild node at a cold start anchors the feed, and honest reads recover without a restart (review Z, risk 3)', async () => {
+    const alerts: string[] = [];
+    let wall = 1_700_000_000_000;
+    const feed = createSlotFeed({ clock: { now: () => wall }, ...SLOT_FEED_DEFAULTS, alerts: { alert: (a) => alerts.push(a.code) } });
+    const w = world({ slots: feed });
+    let chain = 400_000_000n; // the honest nodes' confirmed slot
+    let wild: bigint | null = null;
+    let behind = 0;
+    w.answer = (s) => {
+      if (s.method === 'getGenesisHash') {
+        return result(s, MAINNET_GENESIS_HASH);
+      }
+      const min = (s.params[0] as { readonly minContextSlot: bigint }).minContextSlot;
+      if (wild !== null) {
+        return result(s, wild);
+      }
+      if (min > chain) {
+        behind += 1;
+        return nodeError(s, -32016, `,"data":{"contextSlot":${chain}}`);
+      }
+      return result(s, chain);
+    };
+    assert.ok((await w.client.verifyCluster()).ok);
+    const step = async (ms: number) => {
+      w.mono += ms;
+      wall += ms;
+      chain += BigInt(Math.round(ms / 400));
+      return w.client.slot(P0);
+    };
+    // a cold start with HTTP only: the same wild node answers twice, consistently (the feed's one-channel limit)
+    wild = chain + 1_000_000n;
+    await step(0);
+    wild += 3n;
+    await step(1_000);
+    wild += 3n;
+    await step(1_000);
+    assert.equal(feed.currentSlot(), wild, 'the feed anchored on the wild node');
+    wild = null; // from now on only honest nodes answer
+    const results: boolean[] = [];
+    for (let i = 0; i < 14; i += 1) {
+      results.push((await step(2_000)).ok);
+    }
+    assert.ok(results.slice(0, 2).includes(true), 'an honest read succeeds within two steps, as soon as the wild slot is not fresh');
+    assert.ok(results.slice(-4).every(Boolean), 'and honest reads keep succeeding');
+    const now = feed.currentSlot();
+    assert.ok(now !== null && now <= chain && now >= chain - 150n, `the feed recovered the honest slot (${now} against ${chain})`);
+    assert.ok(behind <= 1, `at most one honest node was asked for the wild slot (${behind})`);
   });
 
   it('an answer below the minContextSlot sent is went-back, for a context and for getSlot itself (review Y, risk 8d); it is not used or reported', async () => {

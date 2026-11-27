@@ -3,7 +3,11 @@
 // reconciliation (P0) always find room. Sliding-window logs, not token buckets (R2): no window of any
 // alignment holds more than its cap. Buckets: each method and the total per 10 s, decoded bytes per
 // 30 s (a grant reserves its method's byte cap until it settles, R12), and requests in flight (R13).
-// A non-P0 grant must leave every bucket's P0 reserve free; P0 may use the whole cap. What the provider
+// A non-P0 grant must leave every bucket's P0 reserve free; P0 may use the whole cap. Data has two parts:
+// P0's own bytes, and the shared part (non-P0 bytes and the stream's, which arrive unasked). For P0 the
+// shared part counts at most the cap minus P0's reserve, so no stream flood and no other priority can
+// ever take P0's reserve (review Y, risk 1); `chargeStream` says when the stream is over its share, so
+// the stream can shed. What the provider
 // says is learned only downward: header limits lower a cap, a 429 closes a method for its Retry-After
 // and raises the shed level, a 403 blocks the provider until one P0 probe succeeds. No timers: it reads
 // the injected monotonic clock on each call (held at its last reading if it ever steps back), so a test
@@ -49,8 +53,8 @@ export interface BudgetGovernor {
   /** One request: one connection slot, the method's byte cap reserved. */
   acquire(method: ReadMethod, p: Priority): Grant;
   settle(t: Ticket, s: Settlement): void;
-  /** WebSocket bytes, charged after receipt. */
-  chargeStream(bytes: number): void;
+  /** WebSocket bytes, charged after receipt; true when the shared part is over its share (the stream should shed). */
+  chargeStream(bytes: number): boolean;
   shedLevel(): ShedLevel;
   usage(): readonly BucketUsage[];
 }
@@ -107,6 +111,21 @@ interface Outstanding {
   readonly method: ReadMethod;
   readonly reserved: number;
   readonly probe: boolean;
+  /** Its bytes are P0's own (true) or the shared part's (false). */
+  readonly p0: boolean;
+}
+
+/** Settled or streamed bytes in the data window: P0's own, or the shared part's. */
+interface DataEntry {
+  readonly at: number;
+  readonly bytes: number;
+  readonly p0: boolean;
+}
+
+/** The data window's two parts, reservations included. */
+interface DataParts {
+  readonly p0: number;
+  readonly shared: number;
 }
 
 /** One governor per provider. */
@@ -117,8 +136,10 @@ export function createBudgetGovernor(o: { readonly provider: ProviderId; readonl
   );
   const total: number[] = [];
   /** Settled and streamed bytes in the data window, oldest first. */
-  const data: { at: number; bytes: number }[] = [];
-  let reservedBytes = 0;
+  const data: DataEntry[] = [];
+  const reserved = { p0: 0, shared: 0 };
+  /** The most the shared part may hold, and the most of it that counts against P0. */
+  const sharedLimit = limits.dataCapBytes - limits.dataP0ReserveBytes;
   const outstanding = new Map<Ticket, Outstanding>();
   let blockedUntil = 0;
   let blocked = false;
@@ -150,12 +171,29 @@ export function createBudgetGovernor(o: { readonly provider: ProviderId; readonl
     }
   };
 
-  const dataUsed = (now: number): number => {
-    while (data.length > 0 && (data[0] as { at: number }).at <= now - R.dataWindowMs) {
+  const dataParts = (now: number): DataParts => {
+    while (data.length > 0 && (data[0] as DataEntry).at <= now - R.dataWindowMs) {
       data.shift();
     }
-    return data.reduce((n, d) => n + d.bytes, 0) + reservedBytes;
+    let p0 = reserved.p0;
+    let shared = reserved.shared;
+    for (const d of data) {
+      if (d.p0) {
+        p0 += d.bytes;
+      } else {
+        shared += d.bytes;
+      }
+    }
+    return { p0, shared };
   };
+
+  const dataUsed = (now: number): number => {
+    const d = dataParts(now);
+    return d.p0 + d.shared;
+  };
+
+  /** What a grant at this priority sees as used: for P0, the shared part counts at most its share. */
+  const dataSeen = (d: DataParts, p0: boolean): number => (p0 ? d.p0 + Math.min(d.shared, sharedLimit) : d.p0 + d.shared);
 
   const raise = (now: number): void => {
     lastTriggerMs = now;
@@ -200,14 +238,19 @@ export function createBudgetGovernor(o: { readonly provider: ProviderId; readonl
     return (log[log.length - limit] as number) + R.windowMs;
   };
 
-  const dataRoomAt = (now: number, need: number, limit: number): number => {
+  /** When a grant of `need` bytes would fit: entries age out oldest first; never if it cannot fit at all. */
+  const dataRoomAt = (now: number, need: number, limit: number, p0: boolean): number => {
     if (need > limit) {
       return Number.POSITIVE_INFINITY;
     }
-    let excess = dataUsed(now) + need - limit;
+    const left = { ...dataParts(now) };
     for (const d of data) {
-      excess -= d.bytes;
-      if (excess <= 0) {
+      if (d.p0) {
+        left.p0 -= d.bytes;
+      } else {
+        left.shared -= d.bytes;
+      }
+      if (dataSeen(left, p0) + need <= limit) {
         return d.at + R.dataWindowMs;
       }
     }
@@ -261,9 +304,9 @@ export function createBudgetGovernor(o: { readonly provider: ProviderId; readonl
       return deny('total-cap', roomAt(total, totalLimit), method, p);
     }
     const need = METHOD_TABLE[method].maxResponseBytes;
-    const dataLimit = p0 ? limits.dataCapBytes : limits.dataCapBytes - limits.dataP0ReserveBytes;
-    if (dataUsed(now) + need > dataLimit) {
-      return deny('data-cap', dataRoomAt(now, need, dataLimit), method, p);
+    const dataLimit = p0 ? limits.dataCapBytes : sharedLimit;
+    if (dataSeen(dataParts(now), p0) + need > dataLimit) {
+      return deny('data-cap', dataRoomAt(now, need, dataLimit, p0), method, p);
     }
     const inFlightLimit = p0 ? R.maxInFlight : R.maxInFlight - R.inFlightP0Reserve;
     if (outstanding.size + 1 > inFlightLimit) {
@@ -271,12 +314,16 @@ export function createBudgetGovernor(o: { readonly provider: ProviderId; readonl
     }
     s.log.push(now);
     total.push(now);
-    reservedBytes += need;
+    if (p0) {
+      reserved.p0 += need;
+    } else {
+      reserved.shared += need;
+    }
     if (probe) {
       probeInFlight = true;
     }
     const ticket: Ticket = Object.freeze({ __ticket: 'budget-ticket' });
-    outstanding.set(ticket, Object.freeze({ method, reserved: need, probe }));
+    outstanding.set(ticket, Object.freeze({ method, reserved: need, probe, p0 }));
     return Object.freeze({ ok: true, ticket });
   };
 
@@ -296,8 +343,12 @@ export function createBudgetGovernor(o: { readonly provider: ProviderId; readonl
       return;
     }
     outstanding.delete(t);
-    reservedBytes -= out.reserved;
-    data.push({ at: now, bytes: st.decodedBytes });
+    if (out.p0) {
+      reserved.p0 -= out.reserved;
+    } else {
+      reserved.shared -= out.reserved;
+    }
+    data.push({ at: now, bytes: st.decodedBytes, p0: out.p0 });
     const s = methods.get(out.method) as MethodState;
     const limit = wholeFrom(st.rate?.methodLimit, 0);
     if (limit !== null) {
@@ -339,13 +390,14 @@ export function createBudgetGovernor(o: { readonly provider: ProviderId; readonl
     housekeep(now);
   };
 
-  const chargeStream = (bytes: number): void => {
+  const chargeStream = (bytes: number): boolean => {
     if (!Number.isInteger(bytes) || bytes < 0) {
       throw new TypeError('stream bytes are a whole number from 0');
     }
     const now = tick();
-    data.push({ at: now, bytes });
+    data.push({ at: now, bytes, p0: false }); // the shared part: never P0's reserve
     housekeep(now);
+    return dataParts(now).shared > sharedLimit;
   };
 
   const shedLevel = (): ShedLevel => {
