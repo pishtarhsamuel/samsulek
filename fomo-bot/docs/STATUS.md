@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-11-26
+Updated: 2026-11-27
 
 **Phase 2 (foundations, tests first): in progress.** Paper-only building blocks; nothing
 can trade, and no key or account exists anywhere.
@@ -382,15 +382,24 @@ can trade, and no key or account exists anywhere.
   review are in too: after "slow down" it waits at least 10 seconds, and it warns you if a limit ever
   leaves it unable to read prices for selling. 66 deliberate bugs were planted: all 66 caught (one weak
   test was found and fixed on the way).
-- Next: part 7f (the live block feed), starting with the review notes due there. No question is open.
+- Part 7f is built (tests first), NOT YET REVIEWED, on the separate branch: the live block feed, one
+  connection to the Solana server that tells the bot each new block as it happens. If the feed goes
+  quiet for 5 seconds the bot drops the connection and reconnects, waiting a little longer each time (at
+  most a minute); anything odd it receives is dropped and counted. The reviewers' notes due here are in:
+  a lying server at start-up can no longer stop the bot's reading until a restart, answers far ahead of
+  the real chain are refused, and the live feed's data can never use up the room kept for selling.
+  65 deliberate bugs were planted: 63 caught, 2 cannot change anything (each reason written down); the
+  planting also found two weak tests and three redundant checks, all fixed.
+- Next: both reviewers check part 7f, then part 7g (the clock check, with your D16 thresholds). No
+  question is open.
 - Before Phase 3: four guard-hook fixes (REVIEWS.md A). No lint script yet: eslint is
   deferred until it is reviewed.
 - For you to do: make the GitHub repository private; send the Helius email when you like;
   before Phase 7, turn on GitHub 2FA.
-- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 80% (settings,
+- Progress, roughly, by building effort: Phases 0 and 1 done; Phase 2 about 83% (settings,
   accounting, risk engine, the storage files, the approval transactions, the start-up checks, the
   daily money check, the bot's settings step and your setting commands done, reviewed and in the
-  main work); the whole build about 36%. At the pace so far (Nov 4 to Nov 26),
+  main work); the whole build about 37%. At the pace so far (Nov 4 to Nov 27),
   building takes roughly 6 more weeks (5 to 9), and proving an edge on paper at least 1 to 3 weeks
   more: at least 50 closed paper trades over at least 7 days per strategy before any live decision.
 - Unproven: whether any strategy makes money. Nothing has run on paper yet.

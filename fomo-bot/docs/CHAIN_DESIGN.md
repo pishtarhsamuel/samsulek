@@ -921,3 +921,70 @@ Conditions, each due by the sub-step or phase named:
 - Noted: the fixture scan cannot see a key in hex, base64url, base64 split into short lines, or one key
   in base64 (security 4; reviewers check fixtures); one other genesis hash latches `wrong-cluster`
   until a restart, exits included, by design and alerted (risk 8; the second provider is the remedy).
+
+## 24. As built in step 7f (the live block feed, and the review conditions due there), and what changed
+
+Status: UNREVIEWED, on the unreviewed branch.
+
+Built, tests first: 7f-1 (48dcb51), the conditions of s.21 and s.23 on the client and the governor;
+7f-2, chain/ws.ts (`createStreamClient`, `STREAM_RULES`, `SocketFactory`, `SocketHandlers`,
+`SocketHandle`, `StreamState`, `StreamStats`), chain/ws-socket.ts (`createWebSocketFactory`,
+`WebSocketOpener`), and `unitInterval` and `unitFromBytes` in core/rng.ts (R14).
+
+7f-1, the conditions:
+- Review Z risk 3: the minContextSlot sent is `min(mark, feed slot)`, and the mark is reset to 0 while the
+  feed has no slot: the mark means something only next to a feed that knows the slot. A test with the
+  real app/slots.ts feed: one wild node at a cold start (HTTP only) anchors the feed and the mark; honest
+  reads succeed within two steps, and the feed recovers the honest slot within its cold-reset time.
+- Review Z risk 4: an answer more than 150 slots above a known feed slot is `bad-response` code 'ahead'
+  (new), with `chain-stale`, never used or reported; exactly 150 is fine; no feed slot, no judgement.
+- Review Y risk 1: the data bucket has two parts: P0's own bytes, and the shared part (non-P0 bytes and
+  the stream's). P0's check counts the shared part at most at its share (the cap minus P0's reserve), so
+  no stream flood and no other priority can take P0's reserve; a P0 denial's retry time follows P0's own
+  bytes. `chargeStream` returns true when the shared part is over its share. `usage()` still shows all.
+- Review Y risk 6: the budget property test charges random stream bytes, settles up to one 64 KiB chunk
+  past a method's cap, checks each grant against its own limit, and checks that a P0 data denial only
+  ever comes from P0's own bytes; its comment corrected.
+
+7f-2, differences from s.7:
+- slotSubscribe is sent without params (`{"jsonrpc":"2.0","id":1,"method":"slotSubscribe"}`, as the
+  docs' example). Its answer must be the ack of id 1 with a u64 result; an error or any other answer to
+  id 1 ends the socket; an answer to another id is dropped as malformed.
+- A notification is read exactly (`jsonrpc`, `method`, `params` = `{result: {parent, root, slot},
+  subscription}`), every slot at most 2^63 - 1, `parent < slot`, `root <= slot`. One whose subscription
+  this generation's ack did not map is `chain-ws-unknown-sub`, before the ack too (the map is empty then).
+- Charging: the UTF-8 bytes of every text message up to 65,536 characters; three bytes a character for a
+  longer one (a huge string is never encoded); `byteLength` for binary. Over-share answers are counted in
+  `stats()`; the slot stream is small (about 145 bytes, 2.5 a second), and 7h's logs subscriptions are what
+  will shed then.
+- Our bug (a client message of 4,000 UTF-8 bytes or more) stops the stream (`stopped`, `chain-our-bug`):
+  reconnecting would only send it again. No 7f message comes near (slotSubscribe is 50 bytes); a test
+  reaches it through the test-only `tighten`, at the edge (50 refused, 51 sent).
+- Backoff: n counts the failures since the last 60 s live; the wait is 1 s + jitter x (min(60 s, 2^n s) -
+  1 s); a jitter outside [0, 1) is read as 1, the longest wait. Flapping: one event when the reconnects of
+  the last 10 minutes first exceed 6, and another only after the count has dropped back and crossed again.
+- `stop()` is final (a later `start()` does nothing) and sends no `chain-ws-down`; each time the stream
+  goes live it sends `chain-ws-up`.
+- ws-socket.ts checks its own URL as http.ts does (a shared helper would be a third file naming `URL`),
+  opens only that URL (a TypeError otherwise), sets `binaryType = 'arraybuffer'`, drops the error event
+  unread, sends only while the socket is OPEN, and `terminate()` sets a flag that every handler checks,
+  then closes. Production passes no `open`; the tests open a local socket.
+- Review X security 3, decided: Node's own WebSocket, with the ops memory limit and the restart (Phase 7)
+  as the guard: a huge frame is a crash, not a drop. A hand-written frame reader would need its own
+  network file and review; recorded in ws-socket.ts's header.
+- R14: `unitInterval()` is 6 random bytes over 2^48, in [0, 1), handed in by cli/ (Phase 7's wiring);
+  `unitFromBytes` lets the tests check it exactly.
+
+Not in 7f: logsSubscribe and its 5,000-message queue (7h), and dropping them when the stream is over its
+share (review Y risk 1's second half); the app's wiring of the events and the composition root (Phase 3
+and Phase 7). The review Z fixes (754354a, ef36aa6) are re-checked with this step.
+
+Tests: TEST_PLAN.md s.3, "Done in step 7f". Planted bugs: 7f-1 (scratchpad `mut/run49.py`) 17, 14 caught on
+the first run; two weak tests fixed (accounts after the feed came down, a P0 retry time with stream bytes
+after P0's own), one equivalent; final 17, 16 caught, 1 equivalent. 7f-2 (`mut/run50.py`): 49 on the first
+run, 45 caught, 1 equivalent; the three survivors led to a redundant check removed (a notification before
+the ack, which the empty map already refuses) and two stronger flapping tests; final 48, 47 caught, 1
+equivalent (error and close end the socket alike). Before it, two redundant guards were removed from
+ws-socket.ts (nulling the handlers, which the flag already covers; the flag in `send`, which the OPEN
+check already covers). Coverage: every line and branch of ws.ts, ws-socket.ts, rng.ts, client.ts and
+budget.ts.
